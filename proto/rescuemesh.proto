@@ -1,0 +1,24 @@
+// RescueMesh wire protocol (owner: P1).
+// v0 (Fri Oct 16): Heartbeat only, to prove the build and gRPC work.
+// v1 (Sat Oct 17): adds SubmitRequest, Bid, Replicate, FetchLog, FaultCommand.
+// Rule: every state-changing message carries request_id.
+// Rule: never change or reuse a field number once it is merged.
+syntax = "proto3";
+
+package rescuemesh.v1;
+
+// RPCs offered by every cloud node. Peers and clients both call it.
+service Node {
+  // Liveness probe, sent by each node to each peer every 500 ms.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+}
+
+message HeartbeatRequest {
+  uint32 from_node = 1;  // sender's node ID; 0 means a client (node IDs start at 1)
+  uint64 seq = 2;        // sender's counter, +1 per heartbeat
+}
+
+message HeartbeatReply {
+  uint32 node_id = 1;    // replier's ID, so the caller knows it reached the right node
+  uint64 seq = 2;        // echoes the request's seq
+}

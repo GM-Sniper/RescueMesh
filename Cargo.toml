@@ -1,3 +1,10 @@
 [workspace]
 resolver = "3"
-members = ["crates/client","crates/common", "crates/loadgen", "crates/node"]
+members = ["crates/client", "crates/common", "crates/loadgen", "crates/node"]
+
+[workspace.dependencies]
+tonic = "=0.14.6"
+tonic-prost = "=0.14.6"
+tonic-prost-build = "=0.14.6"
+prost = "=0.14.4"
+protox = "=0.10.0"
