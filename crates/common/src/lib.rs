@@ -1,14 +1,10 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
+//! Shared code for every RescueMesh program: the generated protocol types
+//! and, from Sat Oct 17, P2's domain types.
+
+/// Code generated from proto/rescuemesh.proto by build.rs.
+pub mod pb {
+    tonic::include_proto!("rescuemesh.v1");
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+/// Identifies a cloud node. IDs start at 1; 0 means "a client, not a node".
+pub type NodeId = u32;
