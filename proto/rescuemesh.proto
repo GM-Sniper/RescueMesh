@@ -12,6 +12,9 @@ service Node {
   // Liveness probe, sent by each node to each peer every 500 ms.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
 
+  // Client entry point: report an incident, get back a response plan.
+  rpc Submit(SubmitRequest) returns (SubmitReply);
+
   // The call the fault-injector CLI makes: send a FaultCommand to the node, get a FaultAck back.
   rpc InjectFault(FaultCommand) returns (FaultAck);
 }
@@ -24,6 +27,23 @@ message HeartbeatRequest {
 message HeartbeatReply {
   uint32 node_id = 1;    // replier's ID, so the caller knows it reached the right node
   uint64 seq = 2;        // echoes the request's seq
+}
+
+// ---- Client requests (owner: P1) ----
+
+message SubmitRequest {
+  string request_id = 1;    // client-generated Uuid; same ID on every retry
+  oneof kind {              // what the client is submitting
+    Incident incident = 2;  // Step A: the only kind
+    // Later kinds get NEW numbers, e.g. ResourceOffer offer = 3; ResourceRequest need = 4;
+  }
+}
+
+message SubmitReply {
+  string request_id = 1;     // echoes the request's ID, since replies can come from several nodes
+  uint32 executor_node = 2;  // node that ran the planner
+  Plan plan = 3;
+  bool duplicate = 4;        // true if this request_id was already processed and the stored plan was returned
 }
 
 // Failure simulation command.
