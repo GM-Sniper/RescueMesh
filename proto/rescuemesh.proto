@@ -11,6 +11,9 @@ package rescuemesh.v1;
 service Node {
   // Liveness probe, sent by each node to each peer every 500 ms.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+
+  // The call the fault-injector CLI makes: send a FaultCommand to the node, get a FaultAck back.
+  rpc InjectFault(FaultCommand) returns (FaultAck);
 }
 
 message HeartbeatRequest {
@@ -21,4 +24,21 @@ message HeartbeatRequest {
 message HeartbeatReply {
   uint32 node_id = 1;    // replier's ID, so the caller knows it reached the right node
   uint64 seq = 2;        // echoes the request's seq
+}
+
+// Failure simulation command.
+message FaultCommand {
+  string fault_id = 1;     // unique ID for this fail order
+  uint32 target_node = 2;  // which node must fail
+  uint64 duration_ms = 3;  // how long to stay unavailable; the node wakes itself when this expires
+  uint32 issuer_node = 4;  // who sent the fail order
+  uint64 term = 5;         // to be used later
+}
+
+// Reply to the fault injector ONLY.
+// Never sent to the other nodes: they must discover the failure on their own.
+message FaultAck {
+  string fault_id = 1;     // copies the order's ID, so the injector knows which fail order this reply is for
+  bool accepted = 2;       // true = the node will go silent now; false = the order was refused
+  string reason = 3;       // why it was refused (e.g. "duration over 20 s"); empty if accepted
 }
