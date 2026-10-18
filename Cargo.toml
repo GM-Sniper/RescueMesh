@@ -8,3 +8,6 @@ tonic-prost = "=0.14.6"
 tonic-prost-build = "=0.14.6"
 prost = "=0.14.4"
 protox = "=0.10.0"
+# Added by P6 (client):
+tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "time"] }  # async runtime: runs network calls, timers and many tasks at once
+uuid = { version = "=1.28.0", features = ["v4"] }                                  # request_id generator; "v4" = random UUIDs
