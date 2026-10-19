@@ -1,10 +1,14 @@
 //! State shared by every request handler and background task of one node.
 //! Shared as `Arc<NodeState>`: cheap to clone, all clones point to the same struct.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 
 use common::NodeId;
 use common::config::ClusterConfig;
+// tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
+use tokio::time::{Instant, sleep_until};
 
 use crate::peers::Peers;
 
@@ -16,7 +20,11 @@ pub struct NodeState {
     pub peers: Peers,
     /// Requests currently being processed. P3's load collector reads this as "queue length".
     in_flight: AtomicUsize,
-    // Added later: muted (task 4), failure detector (task 5), store (P4).
+    /// When the current mute ends; None = never muted (task 4).
+    /// An end time instead of an on/off flag: nothing has to switch it back off,
+    /// and overlapping mutes just keep the later end.
+    muted_until: Mutex<Option<Instant>>,
+    // Added later: failure detector (task 5), store (P4).
 }
 
 impl NodeState {
@@ -26,6 +34,7 @@ impl NodeState {
             config,
             peers,
             in_flight: AtomicUsize::new(0),
+            muted_until: Mutex::new(None),
         }
     }
 
@@ -40,6 +49,34 @@ impl NodeState {
     pub fn start_request(&self) -> InFlightGuard<'_> {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         InFlightGuard { state: self }
+    }
+
+    /// Go silent for `d` from now. An existing longer mute is kept, never shortened.
+    pub fn mute_for(&self, d: Duration) {
+        let until = Instant::now() + d;
+        let mut current = self.muted_until.lock().unwrap();
+        if current.is_none_or(|c| until > c) {
+            *current = Some(until);
+        }
+    }
+
+    /// True while a mute is running. Nobody switches it off: once the end time
+    /// has passed, it simply no longer applies.
+    pub fn is_muted(&self) -> bool {
+        matches!(*self.muted_until.lock().unwrap(), Some(u) if Instant::now() < u)
+    }
+
+    /// Returns at once if not muted; otherwise sleeps until the mute ends.
+    pub async fn wait_while_muted(&self) {
+        loop {
+            // Copy the end time out so the lock is released before sleeping.
+            let until = *self.muted_until.lock().unwrap();
+            match until {
+                Some(u) if Instant::now() < u => sleep_until(u).await,
+                _ => return,
+            }
+            // Loop: if the mute was extended while we slept, sleep again.
+        }
     }
 }
 
