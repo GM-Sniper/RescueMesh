@@ -5,6 +5,8 @@
 // (e.g. timeout()) are not called by anyone yet.
 #[allow(dead_code)]
 mod failure_detector;
+#[allow(dead_code)] // started from main in 5e
+mod heartbeat;
 mod peers;
 mod service;
 mod state;
