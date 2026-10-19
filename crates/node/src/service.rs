@@ -22,6 +22,17 @@ impl NodeService {
     pub fn new(state: Arc<NodeState>) -> Self {
         NodeService { state }
     }
+
+    /// Task 4's gate. Muted: hold the request until the mute ends, then drop it.
+    /// Held, not refused: a crashed machine never answers "I'm down"; callers only
+    /// notice when their own deadline runs out (and then cancel, which ends the wait).
+    async fn gate(&self) -> Result<(), Status> {
+        if !self.state.is_muted() {
+            return Ok(());
+        }
+        self.state.wait_while_muted().await;
+        Err(Status::unavailable("dropped: node was muted"))
+    }
 }
 
 #[tonic::async_trait]
@@ -30,22 +41,32 @@ impl Node for NodeService {
         &self,
         req: Request<HeartbeatRequest>,
     ) -> Result<Response<HeartbeatReply>, Status> {
+        self.gate().await?; // muted: arriving requests are held
         let hb = req.into_inner();
         // debug, not info: 2 peers x 2 per second would flood the log. Show with RUST_LOG=debug.
         tracing::debug!(from = hb.from_node, seq = hb.seq, "heartbeat received");
         // Task 5: tell the failure detector we heard from hb.from_node.
-        Ok(Response::new(HeartbeatReply {
+        let reply = HeartbeatReply {
             node_id: self.state.id,
             seq: hb.seq,
-        }))
+        };
+        self.gate().await?; // muted meanwhile: the reply never leaves
+        Ok(Response::new(reply))
     }
 
     async fn submit(&self, req: Request<SubmitRequest>) -> Result<Response<SubmitReply>, Status> {
+        self.gate().await?; // before counting: held requests are not work
         let _guard = self.state.start_request(); // P3's queue counter, until this returns
-        handle_submit(&self.state, req.into_inner()).await
+        let reply = handle_submit(&self.state, req.into_inner()).await?;
+        // Muted mid-request: drop the reply. The client retries with the same
+        // request_id and gets the stored plan (duplicate = true).
+        self.gate().await?;
+        Ok(reply)
     }
 
     async fn inject_fault(&self, req: Request<FaultCommand>) -> Result<Response<FaultAck>, Status> {
+        self.gate().await?; // a muted node ignores new fault orders too
+        // No gate before replying: this handler mutes the node itself and must still ack.
         handle_inject_fault(&self.state, req.into_inner()).await
     }
 }
