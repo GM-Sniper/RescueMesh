@@ -20,10 +20,18 @@ pub fn plan(incident: &Incident, snapshot: &Snapshot, w: &Weights, now: u64) -> 
         })
         .collect();
 
-    scored.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.resource_id.cmp(&b.resource_id)));
+    scored.sort_by(|a, b| {
+        b.score
+            .total_cmp(&a.score)
+            .then(a.resource_id.cmp(&b.resource_id))
+    });
     scored.truncate(1); // v1: one resource per incident
 
-    Plan { incident_id: incident.id, priority, assignments: scored }
+    Plan {
+        incident_id: incident.id,
+        priority,
+        assignments: scored,
+    }
 }
 
 fn is_free(r: &Resource, s: &Snapshot, now: u64) -> bool {
@@ -39,17 +47,38 @@ mod tests {
     use crate::generators::*;
 
     fn inc() -> Incident {
-        Incident { id: 1, owner: 1, category: Category::Medical, location: Zone::new(0, 0),
-            severity: 8, timestamp: 0, status: IncidentStatus::Open, ttl_secs: 600 }
+        Incident {
+            id: 1,
+            owner: 1,
+            category: Category::Medical,
+            location: Zone::new(0, 0),
+            severity: 8,
+            timestamp: 0,
+            status: IncidentStatus::Open,
+            ttl_secs: 600,
+        }
     }
     fn res(id: u64, t: ResourceType, x: u8, y: u8) -> Resource {
-        Resource { id, rtype: t, quantity: 1, available: true, location: Zone::new(x, y), lease_expiry: 0 }
+        Resource {
+            id,
+            rtype: t,
+            quantity: 1,
+            available: true,
+            location: Zone::new(x, y),
+            lease_expiry: 0,
+        }
     }
 
     #[test]
     fn worked_example() {
         // R1 match 1.0 dist 2 -> 0.10 ; R2 match 0.5 dist 1 -> 0.05
-        let s = Snapshot { resources: vec![res(1, ResourceType::Ambulance, 1, 1), res(2, ResourceType::RescueTeam, 1, 0)], ..Default::default() };
+        let s = Snapshot {
+            resources: vec![
+                res(1, ResourceType::Ambulance, 1, 1),
+                res(2, ResourceType::RescueTeam, 1, 0),
+            ],
+            ..Default::default()
+        };
         let p = plan(&inc(), &s, &Weights::default(), 5 * 60_000);
         assert!((p.priority - 6.8).abs() < 1e-9);
         assert_eq!(p.assignments[0].resource_id, 1);
@@ -60,16 +89,38 @@ mod tests {
     fn deterministic() {
         let s = generate_snapshot(42, 10, 20);
         let i = generate_incident(7);
-        assert_eq!(plan(&i, &s, &Weights::default(), 1_000), plan(&i, &s, &Weights::default(), 1_000));
+        assert_eq!(
+            plan(&i, &s, &Weights::default(), 1_000),
+            plan(&i, &s, &Weights::default(), 1_000)
+        );
     }
 
     #[test]
     fn ties_lowest_id_regardless_of_order() {
-        let a = vec![res(5, ResourceType::Ambulance, 1, 0), res(3, ResourceType::Ambulance, 0, 1)];
+        let a = vec![
+            res(5, ResourceType::Ambulance, 1, 0),
+            res(3, ResourceType::Ambulance, 0, 1),
+        ];
         let mut b = a.clone();
         b.reverse();
-        let pa = plan(&inc(), &Snapshot { resources: a, ..Default::default() }, &Weights::default(), 0);
-        let pb = plan(&inc(), &Snapshot { resources: b, ..Default::default() }, &Weights::default(), 0);
+        let pa = plan(
+            &inc(),
+            &Snapshot {
+                resources: a,
+                ..Default::default()
+            },
+            &Weights::default(),
+            0,
+        );
+        let pb = plan(
+            &inc(),
+            &Snapshot {
+                resources: b,
+                ..Default::default()
+            },
+            &Weights::default(),
+            0,
+        );
         assert_eq!(pa.assignments[0].resource_id, 3);
         assert_eq!(pa, pb);
     }
@@ -85,8 +136,15 @@ mod tests {
         let mut leased = res(1, ResourceType::Ambulance, 0, 0);
         leased.lease_expiry = 10_000;
         let taken = res(2, ResourceType::Ambulance, 0, 0);
-        let s = Snapshot { resources: vec![leased, taken, res(3, ResourceType::FireTruck, 4, 4)],
-            assignments: vec![Assignment { incident_id: 9, resource_id: 2, score: 0.0 }], ..Default::default() };
+        let s = Snapshot {
+            resources: vec![leased, taken, res(3, ResourceType::FireTruck, 4, 4)],
+            assignments: vec![Assignment {
+                incident_id: 9,
+                resource_id: 2,
+                score: 0.0,
+            }],
+            ..Default::default()
+        };
         let p = plan(&inc(), &s, &Weights::default(), 5_000);
         assert_eq!(p.assignments[0].resource_id, 3);
     }

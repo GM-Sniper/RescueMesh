@@ -14,7 +14,10 @@ impl Zone {
     pub const GRID: u8 = 5;
 
     pub fn new(x: u8, y: u8) -> Self {
-        Zone { x: x % Self::GRID, y: y % Self::GRID }
+        Zone {
+            x: x % Self::GRID,
+            y: y % Self::GRID,
+        }
     }
 
     /// Manhattan distance between two zones.
@@ -45,7 +48,10 @@ impl ResourceType {
         use Category::*;
         use ResourceType::*;
         match (self, c) {
-            (Ambulance, Medical) | (FireTruck, Fire) | (RescueTeam, Rescue) | (SupplyTruck, Supply) => 1.0,
+            (Ambulance, Medical)
+            | (FireTruck, Fire)
+            | (RescueTeam, Rescue)
+            | (SupplyTruck, Supply) => 1.0,
             (RescueTeam, Medical) | (RescueTeam, Fire) | (Ambulance, Rescue) => 0.5,
             _ => 0.0,
         }
@@ -65,8 +71,8 @@ pub struct Incident {
     pub owner: u32,
     pub category: Category,
     pub location: Zone,
-    pub severity: u8,    // 1..=10
-    pub timestamp: u64,  // unix ms
+    pub severity: u8,   // 1..=10
+    pub timestamp: u64, // unix ms
     pub status: IncidentStatus,
     pub ttl_secs: u64,
 }
@@ -115,6 +121,11 @@ pub struct Weights {
 
 impl Default for Weights {
     fn default() -> Self {
-        Weights { severity: 0.6, age: 0.4, capability: 0.7, distance: 0.3 }
+        Weights {
+            severity: 0.6,
+            age: 0.4,
+            capability: 0.7,
+            distance: 0.3,
+        }
     }
 }

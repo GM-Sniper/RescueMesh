@@ -1,10 +1,20 @@
 use crate::domain::*;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 const BASE_TS: u64 = 1_700_000_000_000;
 
-const CATS: [Category; 4] = [Category::Medical, Category::Fire, Category::Rescue, Category::Supply];
-const TYPES: [ResourceType; 4] = [ResourceType::Ambulance, ResourceType::FireTruck, ResourceType::RescueTeam, ResourceType::SupplyTruck];
+const CATS: [Category; 4] = [
+    Category::Medical,
+    Category::Fire,
+    Category::Rescue,
+    Category::Supply,
+];
+const TYPES: [ResourceType; 4] = [
+    ResourceType::Ambulance,
+    ResourceType::FireTruck,
+    ResourceType::RescueTeam,
+    ResourceType::SupplyTruck,
+];
 
 fn incident_from(rng: &mut StdRng, id: IncidentId) -> Incident {
     Incident {
@@ -28,7 +38,9 @@ pub fn generate_incident(seed: u64) -> Incident {
 /// Same seed, same snapshot. Ids are 1..=n, sorted.
 pub fn generate_snapshot(seed: u64, n_inc: usize, n_res: usize) -> Snapshot {
     let mut rng = StdRng::seed_from_u64(seed);
-    let incidents = (1..=n_inc as u64).map(|id| incident_from(&mut rng, id)).collect();
+    let incidents = (1..=n_inc as u64)
+        .map(|id| incident_from(&mut rng, id))
+        .collect();
     let resources = (1..=n_res as u64)
         .map(|id| Resource {
             id,
@@ -39,7 +51,11 @@ pub fn generate_snapshot(seed: u64, n_inc: usize, n_res: usize) -> Snapshot {
             lease_expiry: 0,
         })
         .collect();
-    Snapshot { incidents, resources, assignments: vec![] }
+    Snapshot {
+        incidents,
+        resources,
+        assignments: vec![],
+    }
 }
 
 #[cfg(test)]
