@@ -1,0 +1,17 @@
+[package]
+name = "injector"
+version = "0.1.0"
+edition = "2024"
+
+# The program is called `inject`:  cargo run -p injector -- --node 2 --duration 10s
+[[bin]]
+name = "inject"
+path = "src/main.rs"
+
+[dependencies]
+common = { path = "../common" }
+tonic.workspace = true
+tokio.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+rand.workspace = true
