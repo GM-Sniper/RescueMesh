@@ -7,6 +7,8 @@ use std::time::Duration;
 
 use common::NodeId;
 use common::config::ClusterConfig;
+use common::pb::node_client::NodeClient;
+use tonic::transport::Channel;
 // tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
 use tokio::time::{Instant, sleep_until};
 
@@ -77,6 +79,16 @@ impl NodeState {
             }
             // Loop: if the mute was extended while we slept, sleep again.
         }
+    }
+
+    /// The one way to get a client for an outgoing call. None while muted:
+    /// a silent node sends nothing (no heartbeats, no broadcasts), like a crashed one.
+    #[allow(dead_code)] // used by the heartbeat loop (task 5) and broadcast (task 6)
+    pub fn peer_for_sending(&self, peer: NodeId) -> Option<NodeClient<Channel>> {
+        if self.is_muted() {
+            return None;
+        }
+        self.peers.client(peer)
     }
 }
 
