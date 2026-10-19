@@ -169,4 +169,82 @@ mod tests {
         assert_eq!(err.code(), tonic::Code::Unimplemented);
         assert_eq!(svc.state.in_flight(), 0);
     }
+
+    // ---- Task 4: mute hook. `start_paused` = fake clock that jumps ahead whenever
+    // everything is waiting, so these 10 s scenarios finish in milliseconds.
+
+    use tokio::time::{Instant, timeout};
+
+    fn order(target_node: u32, duration_ms: u64) -> Request<FaultCommand> {
+        Request::new(FaultCommand {
+            fault_id: "f1".into(),
+            target_node,
+            duration_ms,
+            issuer_node: 0,
+            term: 0,
+        })
+    }
+
+    fn ping() -> Request<HeartbeatRequest> {
+        Request::new(HeartbeatRequest { from_node: 2, seq: 1 })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fault_order_is_accepted_and_mutes() {
+        let svc = service();
+        let ack = svc.inject_fault(order(1, 10_000)).await.unwrap().into_inner();
+        assert!(ack.accepted);
+        assert_eq!(ack.fault_id, "f1");
+        assert!(svc.state.is_muted());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn refuses_bad_orders() {
+        for (target, ms) in [(2, 10_000), (1, 0), (1, 20_001)] {
+            let svc = service();
+            let ack = svc.inject_fault(order(target, ms)).await.unwrap().into_inner();
+            assert!(!ack.accepted, "target {target}, {ms} ms should be refused");
+            assert!(!ack.reason.is_empty());
+            assert!(!svc.state.is_muted());
+        }
+        let svc = service();
+        let ack = svc.inject_fault(order(1, 20_000)).await.unwrap().into_inner();
+        assert!(ack.accepted, "exactly 20 s is allowed");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn muted_heartbeat_gets_no_early_answer() {
+        let svc = service();
+        svc.inject_fault(order(1, 10_000)).await.unwrap();
+        // No answer at all within 9 s: no quick error.
+        assert!(timeout(Duration::from_secs(9), svc.heartbeat(ping())).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn muted_heartbeat_is_dropped_when_mute_ends() {
+        let svc = service();
+        svc.inject_fault(order(1, 10_000)).await.unwrap();
+        let start = Instant::now();
+        let err = svc.heartbeat(ping()).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(start.elapsed() >= Duration::from_secs(10));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn answers_normally_after_mute() {
+        let svc = service();
+        svc.inject_fault(order(1, 10_000)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10_001)).await;
+        assert!(!svc.state.is_muted());
+        let reply = svc.heartbeat(ping()).await.unwrap().into_inner();
+        assert_eq!(reply.node_id, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn muted_node_ignores_new_fault_orders() {
+        let svc = service();
+        svc.inject_fault(order(1, 10_000)).await.unwrap();
+        let second = timeout(Duration::from_secs(5), svc.inject_fault(order(1, 1_000))).await;
+        assert!(second.is_err(), "a muted node must not answer a new fault order");
+    }
 }

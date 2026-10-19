@@ -11,3 +11,7 @@ clap.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }  # RUST_LOG=debug shows more
+
+[dev-dependencies]
+# Tests only: a paused, fake clock, so a 10 s mute test runs in milliseconds.
+tokio = { workspace = true, features = ["test-util"] }

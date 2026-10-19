@@ -148,4 +148,31 @@ mod tests {
         assert!(handler(&s, false).is_ok());
         assert_eq!(s.in_flight(), 0);
     }
+
+    #[tokio::test(start_paused = true)] // fake clock: sleeps jump ahead instantly
+    async fn mute_is_never_shortened() {
+        let s = state();
+        s.mute_for(Duration::from_secs(10));
+        s.mute_for(Duration::from_secs(2)); // shorter order: ignored
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert!(s.is_muted());
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        assert!(!s.is_muted());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn no_outgoing_calls_while_muted() {
+        let cfg = ClusterConfig::parse(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:50052\"\n",
+        )
+        .unwrap();
+        let peers = Peers::new(&cfg, 1).unwrap();
+        let s = NodeState::new(1, cfg, peers);
+        assert!(s.peer_for_sending(2).is_some());
+        s.mute_for(Duration::from_secs(1));
+        assert!(s.peer_for_sending(2).is_none());
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(s.peer_for_sending(2).is_some());
+    }
 }
