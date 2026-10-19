@@ -1,6 +1,6 @@
 //! Mock node (owner: P6): a fake server for testing the client until P1's real node
-//! can answer `Submit` (Tue Oct 20). It plans nothing; it just echoes the request_id
-//! back with an empty plan.
+//! can answer `Submit` (Tue Oct 20). It checks the incident like the real node will,
+//! but plans nothing: it echoes the request_id back with a plan that assigns no resources.
 //!
 //! Run:  cargo run -p client --bin mock_server -- --port 50051 --id 1 --delay-ms 2
 
@@ -10,6 +10,7 @@ use std::sync::Mutex; // lets several requests safely share the `seen` set
 use std::time::Duration;
 
 use common::NodeId;
+use common::conversions::incident_from_pb; // P2: proto Incident -> domain Incident, with validation
 use common::pb::{self, node_server::{Node, NodeServer}, submit_request}; // `Node` = the trait a server must implement
 use tonic::{Request, Response, Status, transport::Server}; // gRPC request/reply wrappers and the server itself
 
@@ -29,9 +30,12 @@ impl Node for MockNode {
         if req.request_id.is_empty() {
             return Err(Status::invalid_argument("request_id is empty")); // every request must carry an ID
         }
-        let Some(submit_request::Kind::Incident(_incident)) = req.kind else {
+        let Some(submit_request::Kind::Incident(incident)) = req.kind else {
             return Err(Status::invalid_argument("expected an incident")); // Step A only accepts incidents
         };
+        // Same check the real node will do: P2's converter rejects bad incidents
+        // (no location, severity outside 1..10, category UNSPECIFIED, ...).
+        let incident = incident_from_pb(incident).map_err(Status::invalid_argument)?;
 
         if !self.delay.is_zero() {
             tokio::time::sleep(self.delay).await; // fake work; `.await` lets other requests run meanwhile
@@ -39,12 +43,16 @@ impl Node for MockNode {
 
         // `insert` returns false if the ID was already in the set, so that's a retry.
         let duplicate = !self.seen.lock().unwrap().insert(req.request_id.clone());
-        println!("node {} answered {} (duplicate: {duplicate})", self.id, req.request_id);
+        println!("node {} answered {} for incident {} (duplicate: {duplicate})", self.id, req.request_id, incident.id);
 
         Ok(Response::new(pb::SubmitReply {
             request_id: req.request_id, // echo the ID so the client can match reply to request
             executor_node: self.id,     // "I ran the planner"
-            plan: Some(pb::Plan {}),    // empty until P2 adds Plan's fields
+            plan: Some(pb::Plan {
+                incident_id: incident.id, // which incident this plan is for
+                priority: 0.0,            // the mock doesn't run P2's planner, so no real priority
+                assignments: vec![],      // ...and no resources assigned
+            }),
             duplicate,
         }))
     }

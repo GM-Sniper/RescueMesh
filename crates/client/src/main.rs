@@ -2,30 +2,33 @@
 //! then resends the first one to check that the node spots the duplicate.
 //!
 //! Run (with the mock server already running in another terminal):
-//!   cargo run -p client -- --node 127.0.0.1:50051 --count 5
+//!   cargo run -p client -- --node 127.0.0.1:50051 --count 5 --seed 1
 
 use client::{ClientMiddleware, DEFAULT_TIMEOUT, SubmitOutcome}; // our library from src/lib.rs
-use common::pb;
+use common::conversions::incident_to_pb; // P2: domain Incident -> proto Incident
+use common::generators::generate_incident; // P2: same seed always gives the same incident
 
 #[tokio::main] // starts the async runtime, then runs `main` inside it
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let node_addr: String = arg("--node", "127.0.0.1:50051".to_string()); // the one fixed node (Step A)
-    let count: u32 = arg("--count", 5); // how many requests to send
+    let count: u64 = arg("--count", 5); // how many requests to send
+    let seed: u64 = arg("--seed", 1); // first incident's seed; request i uses seed + i, so runs are repeatable
 
     let client = ClientMiddleware::connect(&node_addr, DEFAULT_TIMEOUT).await?; // fails here if no node is listening
     println!("connected to {node_addr}");
 
-    let mut first_id = None; // remember the first request_id for the duplicate test
-    for _ in 0..count {
-        let outcome = client.submit(pb::Incident {}).await; // empty incident until P2 adds Incident's fields
+    let mut first = None; // remember the first request_id and incident for the duplicate test
+    for i in 0..count {
+        let incident = incident_to_pb(&generate_incident(seed + i)); // a realistic random incident, as proto
+        let outcome = client.submit(incident.clone()).await; // clone: we may resend the first one below
         print_outcome(&outcome);
-        first_id.get_or_insert(outcome.request_id); // keeps only the first ID
+        first.get_or_insert((outcome.request_id, incident)); // keeps only the first one
     }
 
-    // Retry test: same request_id again, so the node should answer with duplicate = true.
-    if let Some(id) = first_id {
+    // Retry test: same request_id and incident again, so the node should answer with duplicate = true.
+    if let Some((id, incident)) = first {
         println!("resending {id} to test duplicate detection:");
-        let outcome = client.submit_with_id(id, pb::Incident {}).await;
+        let outcome = client.submit_with_id(id, incident).await;
         print_outcome(&outcome);
     }
     Ok(())
