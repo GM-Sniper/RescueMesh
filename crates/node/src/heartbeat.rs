@@ -105,6 +105,8 @@ mod tests {
     use std::time::Duration;
 
     use common::config::ClusterConfig;
+    use common::pb::FaultCommand;
+    use common::pb::node_client::NodeClient;
     use common::pb::node_server::NodeServer;
 
     use super::*;
@@ -198,5 +200,88 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(5300)).await; // 0.3 s after the mute
         // Without the reset, 5 s of self-caused silence would mark both peers down.
         assert_eq!(s.alive_peers(), vec![2, 3]);
+    }
+
+    // ---- 5f: the plan's done-check with 3 real nodes, real network, real clock.
+
+    /// Starts one full node like main does: server, heartbeat senders, ticker.
+    fn start_node(id: NodeId, cfg: &ClusterConfig) -> Arc<NodeState> {
+        let state = state_for(id, cfg);
+        let addr = cfg.node(id).unwrap().addr.parse().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(NodeServer::new(NodeService::new(state.clone())))
+                .serve(addr),
+        );
+        spawn_senders(state.clone());
+        spawn_ticker(state.clone());
+        state
+    }
+
+    /// Polls every 10 ms until `cond` holds; fails the test after `max`.
+    async fn wait_until(what: &str, max: Duration, cond: impl Fn() -> bool) -> Duration {
+        let start = std::time::Instant::now();
+        while !cond() {
+            assert!(start.elapsed() < max, "timed out waiting for: {what}");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        start.elapsed()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn muting_node_2_is_detected_by_the_others_and_it_comes_back() {
+        let cfg = ClusterConfig::parse(&format!(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:{}\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:{}\"\n\
+             [[nodes]]\nid = 3\naddr = \"127.0.0.1:{}\"\n\
+             [timing]\nheartbeat_interval_ms = 50\nsuspect_after_ms = 150\n\
+             rpc_deadline_ms = 100\nconnect_timeout_ms = 100\n",
+            free_port(),
+            free_port(),
+            free_port()
+        ))
+        .unwrap();
+        let (n1, n2, n3) = (start_node(1, &cfg), start_node(2, &cfg), start_node(3, &cfg));
+        let limit = Duration::from_secs(2);
+
+        // 1. Everyone sees everyone.
+        wait_until("all alive", limit, || {
+            n1.alive_peers() == [2, 3] && n3.alive_peers() == [1, 2]
+        })
+        .await;
+
+        // 2. Mute node 2 for 800 ms through a real InjectFault call.
+        let mut client = NodeClient::connect(format!("http://{}", cfg.node(2).unwrap().addr))
+            .await
+            .unwrap();
+        let ack = client
+            .inject_fault(FaultCommand {
+                fault_id: "test".into(),
+                target_node: 2,
+                duration_ms: 800,
+                issuer_node: 0,
+                term: 0,
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.accepted);
+
+        // 3. Nodes 1 and 3 drop node 2 on their own, within suspect + tick + margin.
+        let detected = wait_until("node 2 suspected", limit, || {
+            n1.alive_peers() == [3] && n3.alive_peers() == [1]
+        })
+        .await;
+        assert!(
+            detected < Duration::from_millis(450),
+            "detection took {detected:?}; expected about 150 ms + 100 ms tick"
+        );
+
+        // 4. After the mute, node 2 is back for both, and node 2 itself sees both
+        //    (fresh detector on unmute, then real heartbeats).
+        wait_until("node 2 alive again", limit, || {
+            n1.alive_peers() == [2, 3] && n3.alive_peers() == [1, 2] && n2.alive_peers() == [1, 3]
+        })
+        .await;
     }
 }
