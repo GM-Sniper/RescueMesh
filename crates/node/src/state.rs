@@ -110,6 +110,19 @@ impl NodeState {
         self.detector.lock().unwrap().tick(now_std())
     }
 
+    /// Throws the old detector away and starts a fresh one: every peer alive, full
+    /// suspect_after each. Used on unmute, so a mute behaves like a reboot with a
+    /// clean view instead of logging false PeerDowns for the silence we caused.
+    #[allow(dead_code)] // called by the ticker (5d), started from main in 5e
+    pub fn reset_detector(&self) {
+        let fresh = FailureDetector::new(
+            self.peers.ids(),
+            self.config.timing.suspect_after(),
+            now_std(),
+        );
+        *self.detector.lock().unwrap() = fresh;
+    }
+
     /// Peers we currently believe are alive, smallest ID first.
     #[allow(dead_code)] // used by broadcast (task 6) and the election (Step B)
     pub fn alive_peers(&self) -> Vec<NodeId> {

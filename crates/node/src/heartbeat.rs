@@ -8,12 +8,47 @@
 //! what makes the detector suspect a peer.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::NodeId;
 use common::pb::HeartbeatRequest;
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
+use crate::failure_detector::PeerEvent;
 use crate::state::NodeState;
+
+/// How often the ticker re-checks the detector. A change is noticed at most this
+/// late, which is small next to suspect_after (1.5 s).
+const TICK: Duration = Duration::from_millis(100);
+
+/// Starts the ticker: every TICK, ask the detector who changed and log it.
+/// Paused while muted; on unmute it starts a fresh detector (like a reboot).
+pub fn spawn_ticker(state: Arc<NodeState>) {
+    tokio::spawn(async move {
+        let mut ticker = interval(TICK);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+        let mut was_muted = false;
+        loop {
+            ticker.tick().await;
+            if state.is_muted() {
+                was_muted = true; // a muted node hears nothing: its view means nothing
+                continue;
+            }
+            if was_muted {
+                was_muted = false;
+                state.reset_detector();
+                tracing::info!("unmuted: starting a fresh failure detector");
+                continue;
+            }
+            for event in state.check_peers() {
+                match event {
+                    PeerEvent::PeerDown(peer) => tracing::warn!(peer, "peer suspected down"),
+                    PeerEvent::PeerUp(peer) => tracing::info!(peer, "peer alive again"),
+                }
+            }
+        }
+    });
+}
 
 /// Starts one heartbeat worker per peer. They run until the node stops.
 pub fn spawn_senders(state: Arc<NodeState>) {
@@ -131,5 +166,37 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert_eq!(node1.check_peers(), vec![PeerEvent::PeerDown(2)]);
         assert!(node1.alive_peers().is_empty());
+    }
+
+    // ---- 5d: the ticker, on the fake clock (default timing: suspect after 1.5 s).
+
+    fn three_node_state() -> Arc<NodeState> {
+        let cfg = ClusterConfig::parse(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:50052\"\n\
+             [[nodes]]\nid = 3\naddr = \"127.0.0.1:50053\"\n",
+        )
+        .unwrap();
+        state_for(1, &cfg)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ticker_detects_silent_peers() {
+        let s = three_node_state();
+        spawn_ticker(s.clone());
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        assert_eq!(s.alive_peers(), vec![2, 3]);
+        tokio::time::sleep(Duration::from_millis(600)).await; // 1.6 s of silence
+        assert!(s.alive_peers().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unmute_starts_a_fresh_detector() {
+        let s = three_node_state();
+        spawn_ticker(s.clone());
+        s.mute_for(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(5300)).await; // 0.3 s after the mute
+        // Without the reset, 5 s of self-caused silence would mark both peers down.
+        assert_eq!(s.alive_peers(), vec![2, 3]);
     }
 }
