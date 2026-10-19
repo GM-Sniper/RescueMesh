@@ -6,24 +6,31 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use common::NodeId;
 use common::config::ClusterConfig;
 
+use crate::peers::Peers;
+
+#[allow(dead_code)] // config and peers are first read by the heartbeat loop (task 5)
 pub struct NodeState {
     pub id: NodeId,
     pub config: ClusterConfig,
+    /// One client per other node (see peers.rs).
+    pub peers: Peers,
     /// Requests currently being processed. P3's load collector reads this as "queue length".
     in_flight: AtomicUsize,
-    // Added later: peers (3d), muted (task 4), failure detector (task 5), store (P4).
+    // Added later: muted (task 4), failure detector (task 5), store (P4).
 }
 
 impl NodeState {
-    pub fn new(id: NodeId, config: ClusterConfig) -> Self {
+    pub fn new(id: NodeId, config: ClusterConfig, peers: Peers) -> Self {
         NodeState {
             id,
             config,
+            peers,
             in_flight: AtomicUsize::new(0),
         }
     }
 
     /// P3's hook: how many requests this node is working on right now.
+    #[allow(dead_code)] // read by P3's load collector once it is wired in
     pub fn in_flight(&self) -> usize {
         // Relaxed: the counter is a statistic; no other data depends on its ordering.
         self.in_flight.load(Ordering::Relaxed)
@@ -61,7 +68,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        NodeState::new(1, cfg)
+        let peers = Peers::new(&cfg, 1).unwrap(); // one node, so no peers and no channels
+        NodeState::new(1, cfg, peers)
     }
 
     #[test]
