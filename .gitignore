@@ -1,1 +1,3 @@
 /target
+# loadgen output (CSV + metadata per run); can be large, so share runs on purpose, not by accident
+/results
