@@ -63,6 +63,16 @@ message FaultAck {
   string reason = 3;       // why it was refused (e.g. "duration over 20 s"); empty if accepted
 }
 
+// ---- Election (owner: P3) ----
+// Step B: for each request, every alive node sends its Bid; the lowest load_score
+// runs the planner. Ties go to the lowest node_id, so every node picks the same winner.
+
+message Bid {
+  string request_id = 1;  // the request being bid on; bids for different requests never mix
+  uint32 node_id = 2;     // bidder's ID (starts at 1)
+  double load_score = 3;  // bidder's LoadReport score, normalized 0-1; lower = less loaded
+}
+
 // ---- Change log and replication (owner: P4) ----
 // Field numbers are wire identities: rename freely, never renumber or reuse once merged.
 
