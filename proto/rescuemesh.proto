@@ -1,6 +1,6 @@
 // RescueMesh wire protocol (owner: P1).
 // v0 (Fri Oct 16): Heartbeat only, to prove the build and gRPC work.
-// v1 (Sat Oct 17): adds SubmitRequest, Bid, Replicate, FetchLog, FaultCommand.
+// v1 (Mon Oct 19): adds Submit, domain types, Bid, Replicate, FetchLog, FaultCommand.
 // Rule: every state-changing message carries request_id.
 // Rule: never change or reuse a field number once it is merged.
 syntax = "proto3";
@@ -11,6 +11,9 @@ package rescuemesh.v1;
 service Node {
   // Liveness probe, sent by each node to each peer every 500 ms.
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatReply);
+
+  // Client entry point: report an incident, get back a response plan.
+  rpc Submit(SubmitRequest) returns (SubmitReply);
 
   // The call the fault-injector CLI makes: send a FaultCommand to the node, get a FaultAck back.
   rpc InjectFault(FaultCommand) returns (FaultAck);
@@ -24,6 +27,87 @@ message HeartbeatRequest {
 message HeartbeatReply {
   uint32 node_id = 1;    // replier's ID, so the caller knows it reached the right node
   uint64 seq = 2;        // echoes the request's seq
+}
+
+// ---- Client requests (owner: P1) ----
+
+message SubmitRequest {
+  string request_id = 1;    // client-generated Uuid; same ID on every retry
+  oneof kind {              // what the client is submitting
+    Incident incident = 2;  // Step A: the only kind
+    // Later kinds get NEW numbers, e.g. ResourceOffer offer = 3; ResourceRequest need = 4;
+  }
+}
+
+message SubmitReply {
+  string request_id = 1;     // echoes the request's ID, since replies can come from several nodes
+  uint32 executor_node = 2;  // node that ran the planner
+  Plan plan = 3;
+  bool duplicate = 4;        // true if this request_id was already processed and the stored plan was returned
+}
+
+// ---- Domain types (fields from P2's common::domain; schema owned by P1) ----
+// Every enum starts with UNSPECIFIED = 0, so a field the sender forgot is rejected
+// instead of silently meaning the first real value.
+
+enum Category {
+  CATEGORY_UNSPECIFIED = 0;
+  CATEGORY_MEDICAL = 1;
+  CATEGORY_FIRE = 2;
+  CATEGORY_RESCUE = 3;
+  CATEGORY_SUPPLY = 4;
+}
+
+enum ResourceType {
+  RESOURCE_TYPE_UNSPECIFIED = 0;
+  RESOURCE_TYPE_AMBULANCE = 1;
+  RESOURCE_TYPE_FIRE_TRUCK = 2;
+  RESOURCE_TYPE_RESCUE_TEAM = 3;
+  RESOURCE_TYPE_SUPPLY_TRUCK = 4;
+}
+
+enum IncidentStatus {
+  INCIDENT_STATUS_UNSPECIFIED = 0;
+  INCIDENT_STATUS_OPEN = 1;
+  INCIDENT_STATUS_ASSIGNED = 2;
+  INCIDENT_STATUS_RESOLVED = 3;
+}
+
+message Zone {             // one cell of the 5x5 grid
+  uint32 x = 1;            // 0..4
+  uint32 y = 2;            // 0..4
+}
+
+message Incident {
+  uint64 id = 1;
+  uint32 owner = 2;
+  Category category = 3;
+  Zone location = 4;
+  uint32 severity = 5;      // 1..10
+  uint64 timestamp_ms = 6;  // unix ms, set by the reporter
+  IncidentStatus status = 7;
+  uint64 ttl_secs = 8;
+}
+
+message Resource {
+  uint64 id = 1;
+  ResourceType resource_type = 2;
+  uint32 quantity = 3;
+  bool available = 4;
+  Zone location = 5;
+  uint64 lease_expiry_ms = 6;  // unix ms; 0 = not leased
+}
+
+message Assignment {
+  uint64 incident_id = 1;
+  uint64 resource_id = 2;
+  double score = 3;
+}
+
+message Plan {
+  uint64 incident_id = 1;
+  double priority = 2;
+  repeated Assignment assignments = 3;  // v1: at most one
 }
 
 // Failure simulation command.
@@ -75,9 +159,6 @@ message ApplyPlan {
   Incident incident = 1;
   Plan plan = 2;
 }
-
-message Incident {}  // TODO(P2): fields (empty stub so this compiles)
-message Plan {}      // TODO(P2): fields
 
 // Step B: source node pushes a new entry to a peer.
 message ReplicateRequest {
