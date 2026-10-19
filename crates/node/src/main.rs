@@ -5,7 +5,6 @@
 // (e.g. timeout()) are not called by anyone yet.
 #[allow(dead_code)]
 mod failure_detector;
-#[allow(dead_code)] // started from main in 5e
 mod heartbeat;
 mod peers;
 mod service;
@@ -60,10 +59,14 @@ async fn main() -> anyhow::Result<()> {
     let peers = Peers::new(&config, args.id)?;
     let peer_ids: Vec<NodeId> = peers.ids().collect();
 
-    // 5. Shared state, given to the service now and to background tasks later.
+    // 5. Shared state, given to the service and the background tasks.
     let state = Arc::new(NodeState::new(args.id, config, peers));
 
-    // 6. Open the doors: serve the Node service until Ctrl+C.
+    // 6. Background tasks: heartbeats to each peer, and the detector ticker.
+    heartbeat::spawn_senders(state.clone());
+    heartbeat::spawn_ticker(state.clone());
+
+    // 7. Open the doors: serve the Node service until Ctrl+C.
     tracing::info!(id = args.id, %listen, peers = ?peer_ids, "node listening");
     tonic::transport::Server::builder()
         .add_service(NodeServer::new(NodeService::new(state)))

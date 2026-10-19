@@ -37,7 +37,6 @@ impl Peers {
     }
 
     /// A client for `peer` (a cheap clone sharing the one connection), or None if unknown.
-    #[allow(dead_code)] // first used by the heartbeat loop (task 5)
     pub fn client(&self, peer: NodeId) -> Option<NodeClient<Channel>> {
         self.clients.get(&peer).cloned()
     }

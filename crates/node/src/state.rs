@@ -15,7 +15,6 @@ use tokio::time::{Instant, sleep_until};
 use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::peers::Peers;
 
-#[allow(dead_code)] // config and peers are first read by the heartbeat loop (task 5)
 pub struct NodeState {
     pub id: NodeId,
     pub config: ClusterConfig,
@@ -91,7 +90,6 @@ impl NodeState {
 
     /// The one way to get a client for an outgoing call. None while muted:
     /// a silent node sends nothing (no heartbeats, no broadcasts), like a crashed one.
-    #[allow(dead_code)] // used by the heartbeat loop (task 5) and broadcast (task 6)
     pub fn peer_for_sending(&self, peer: NodeId) -> Option<NodeClient<Channel>> {
         if self.is_muted() {
             return None;
@@ -105,7 +103,6 @@ impl NodeState {
     }
 
     /// Re-checks every peer; returns only the changes (PeerDown / PeerUp).
-    #[allow(dead_code)] // called by the ticker (5d)
     pub fn check_peers(&self) -> Vec<PeerEvent> {
         self.detector.lock().unwrap().tick(now_std())
     }
@@ -113,7 +110,6 @@ impl NodeState {
     /// Throws the old detector away and starts a fresh one: every peer alive, full
     /// suspect_after each. Used on unmute, so a mute behaves like a reboot with a
     /// clean view instead of logging false PeerDowns for the silence we caused.
-    #[allow(dead_code)] // called by the ticker (5d), started from main in 5e
     pub fn reset_detector(&self) {
         let fresh = FailureDetector::new(
             self.peers.ids(),
