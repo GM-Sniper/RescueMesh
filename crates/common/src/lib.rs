@@ -10,6 +10,7 @@ pub mod pb {
 pub type NodeId = u32;
 
 pub mod config;
+pub mod conversions;
 pub mod domain;
 pub mod generators;
 pub mod planner;

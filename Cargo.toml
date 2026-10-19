@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/client", "crates/common", "crates/loadgen", "crates/node"]
+members = [
+    "crates/client",
+    "crates/common",
+    "crates/loadgen",
+    "crates/node",
+]
 
 [workspace.dependencies]
 tonic = "=0.14.6"
