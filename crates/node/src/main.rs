@@ -1,7 +1,8 @@
 //! RescueMesh cloud node. The same program runs on all 3 machines; only --id differs.
 //! Run from the repo root:  cargo run -p node -- --id 1 [--config config/nodes.toml]
 
-// Not called yet: wired to the heartbeat loop in task 5.
+// P5's module, used through NodeState. Left unedited; some of its helpers
+// (e.g. timeout()) are not called by anyone yet.
 #[allow(dead_code)]
 mod failure_detector;
 mod peers;

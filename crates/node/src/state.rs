@@ -12,6 +12,7 @@ use tonic::transport::Channel;
 // tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
 use tokio::time::{Instant, sleep_until};
 
+use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::peers::Peers;
 
 #[allow(dead_code)] // config and peers are first read by the heartbeat loop (task 5)
@@ -26,17 +27,24 @@ pub struct NodeState {
     /// An end time instead of an on/off flag: nothing has to switch it back off,
     /// and overlapping mutes just keep the later end.
     muted_until: Mutex<Option<Instant>>,
-    // Added later: failure detector (task 5), store (P4).
+    /// P5's failure detector: who we currently believe is alive (task 5).
+    /// Private: used only through heard_from / check_peers / alive_peers, so the
+    /// time always comes from the same clock and the lock is held only briefly.
+    detector: Mutex<FailureDetector>,
+    // Added later: store (P4).
 }
 
 impl NodeState {
     pub fn new(id: NodeId, config: ClusterConfig, peers: Peers) -> Self {
+        // Every peer starts "alive" and gets the full suspect_after to send its first heartbeat.
+        let detector = FailureDetector::new(peers.ids(), config.timing.suspect_after(), now_std());
         NodeState {
             id,
             config,
             peers,
             in_flight: AtomicUsize::new(0),
             muted_until: Mutex::new(None),
+            detector: Mutex::new(detector),
         }
     }
 
@@ -90,6 +98,30 @@ impl NodeState {
         }
         self.peers.client(peer)
     }
+
+    /// "We just heard from `peer`": a reply to our heartbeat, or a heartbeat it sent us.
+    #[allow(dead_code)] // called by the heartbeat sender (5b) and handler (5c)
+    pub fn heard_from(&self, peer: NodeId) {
+        self.detector.lock().unwrap().record(peer, now_std());
+    }
+
+    /// Re-checks every peer; returns only the changes (PeerDown / PeerUp).
+    #[allow(dead_code)] // called by the ticker (5d)
+    pub fn check_peers(&self) -> Vec<PeerEvent> {
+        self.detector.lock().unwrap().tick(now_std())
+    }
+
+    /// Peers we currently believe are alive, smallest ID first.
+    #[allow(dead_code)] // used by broadcast (task 6) and the election (Step B)
+    pub fn alive_peers(&self) -> Vec<NodeId> {
+        self.detector.lock().unwrap().alive_peers()
+    }
+}
+
+/// The current time on tokio's clock, in the standard form P5's detector expects.
+/// In fake-clock tests this is the fake time, so the detector and the mute stay in sync.
+fn now_std() -> std::time::Instant {
+    Instant::now().into_std()
 }
 
 /// Decrements `in_flight` when it goes out of scope, however the handler ends
@@ -174,5 +206,44 @@ mod tests {
         assert!(s.peer_for_sending(2).is_none());
         tokio::time::sleep(Duration::from_secs(2)).await;
         assert!(s.peer_for_sending(2).is_some());
+    }
+
+    // ---- Task 5a: P5's detector inside the state, on the fake clock.
+
+    fn three_node_state() -> NodeState {
+        let cfg = ClusterConfig::parse(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:50052\"\n\
+             [[nodes]]\nid = 3\naddr = \"127.0.0.1:50053\"\n",
+        )
+        .unwrap();
+        let peers = Peers::new(&cfg, 1).unwrap();
+        NodeState::new(1, cfg, peers) // suspect_after = 1500 ms (default)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn peers_heard_regularly_stay_alive() {
+        let s = three_node_state();
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            s.heard_from(2);
+            s.heard_from(3);
+            assert!(s.check_peers().is_empty());
+        }
+        assert_eq!(s.alive_peers(), vec![2, 3]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn silence_gives_peer_down_then_heard_gives_peer_up() {
+        let s = three_node_state();
+        tokio::time::sleep(Duration::from_millis(1000)).await;
+        s.heard_from(3); // only node 3 keeps talking
+        tokio::time::sleep(Duration::from_millis(500)).await; // 1.5 s of fake time
+        assert_eq!(s.check_peers(), vec![PeerEvent::PeerDown(2)]);
+        assert_eq!(s.alive_peers(), vec![3]);
+
+        s.heard_from(2);
+        assert_eq!(s.check_peers(), vec![PeerEvent::PeerUp(2)]);
+        assert_eq!(s.alive_peers(), vec![2, 3]);
     }
 }
