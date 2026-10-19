@@ -1,6 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/client", "crates/common", "crates/loadgen", "crates/node"]
+members = [
+    "crates/client",
+    "crates/common",
+    "crates/loadgen",
+    "crates/node",
+]
 
 [workspace.dependencies]
 tonic = "=0.14.6"
@@ -10,4 +15,11 @@ prost = "=0.14.4"
 protox = "=0.10.0"
 # Added by P6 (client):
 tokio = { version = "=1.53.3", features = ["rt-multi-thread", "macros", "time"] }  # async runtime: runs network calls, timers and many tasks at once
-uuid = { version = "=1.28.0", features = ["v4"] }                                  # request_id generator; "v4" = random UUIDs
+# Added by P1 (node):
+clap = { version = "=4.6.7", features = ["derive"] }  # command-line arguments (--id, --config)
+toml = "=1.1.8"                                       # reads config/nodes.toml
+anyhow = "=1.0.104"                                   # simple error handling in main
+tracing = "=0.1.44"                                   # logging calls (info!, warn!)
+tracing-subscriber = "=0.3.23"                        # prints those logs with timestamps
+serde = { version = "=1.0.229", features = ["derive"] }  # P2 domain types + config: Rust structs <-> TOML
+rand = "=0.8.8"                                       # P2 seeded generators

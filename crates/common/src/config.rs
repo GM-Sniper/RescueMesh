@@ -1,0 +1,182 @@
+//! Cluster configuration, read from `config/nodes.toml` (localhost) or
+//! `config/nodes.lab.toml` (the 3 real machines). Every program reads the same file:
+//! a node finds itself by `--id` and treats the others as peers; a client reads
+//! the node addresses.
+
+use std::collections::HashSet;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::time::Duration;
+
+use anyhow::{Context, bail};
+use serde::Deserialize;
+
+use crate::NodeId;
+use crate::domain::Weights;
+
+/// The whole config file.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClusterConfig {
+    /// The cloud nodes. Clients are not listed: they are not peers.
+    pub nodes: Vec<NodeEntry>,
+    /// Intervals and timeouts. Optional in the file; missing values use the defaults.
+    #[serde(default)]
+    pub timing: Timing,
+    /// Planner scoring weights (P2). Optional; missing values use the defaults.
+    #[serde(default)]
+    pub weights: Weights,
+}
+
+/// One `[[nodes]]` entry.
+#[derive(Debug, Clone, Deserialize)]
+pub struct NodeEntry {
+    /// Starts at 1; 0 is reserved for clients.
+    pub id: NodeId,
+    /// Address that peers and clients dial, e.g. "127.0.0.1:50051" or "10.0.0.11:50051".
+    pub addr: String,
+}
+
+/// The `[timing]` table. In the file so stress tests can try other values without rebuilding.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct Timing {
+    /// How often each node sends a heartbeat to each peer.
+    pub heartbeat_interval_ms: u64,
+    /// Silence after which a peer is suspected down (P5's detector).
+    pub suspect_after_ms: u64,
+    /// Longest we wait for any reply from a peer.
+    pub rpc_deadline_ms: u64,
+    /// Longest we wait to open a connection to a peer.
+    pub connect_timeout_ms: u64,
+}
+
+impl Default for Timing {
+    fn default() -> Self {
+        Timing {
+            heartbeat_interval_ms: 500,
+            suspect_after_ms: 1500,
+            rpc_deadline_ms: 1000,
+            connect_timeout_ms: 500,
+        }
+    }
+}
+
+impl Timing {
+    pub fn heartbeat_interval(&self) -> Duration {
+        Duration::from_millis(self.heartbeat_interval_ms)
+    }
+    pub fn suspect_after(&self) -> Duration {
+        Duration::from_millis(self.suspect_after_ms)
+    }
+    pub fn rpc_deadline(&self) -> Duration {
+        Duration::from_millis(self.rpc_deadline_ms)
+    }
+    pub fn connect_timeout(&self) -> Duration {
+        Duration::from_millis(self.connect_timeout_ms)
+    }
+}
+
+impl ClusterConfig {
+    /// Reads and checks the file. A mistake fails here, at startup, with a clear message.
+    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read config file {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("bad config file {}", path.display()))
+    }
+
+    /// Parses and checks config text (separate from `load` so tests need no file).
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let cfg: ClusterConfig = toml::from_str(text)?;
+        cfg.check()?;
+        Ok(cfg)
+    }
+
+    fn check(&self) -> anyhow::Result<()> {
+        if self.nodes.is_empty() {
+            bail!("no [[nodes]] listed");
+        }
+        let mut seen = HashSet::new();
+        for n in &self.nodes {
+            if n.id == 0 {
+                bail!("node id 0 is reserved for clients; ids start at 1");
+            }
+            if !seen.insert(n.id) {
+                bail!("node id {} is listed twice", n.id);
+            }
+            n.addr
+                .parse::<SocketAddr>()
+                .with_context(|| format!("node {}: addr {:?} is not ip:port", n.id, n.addr))?;
+        }
+        if self.timing.suspect_after_ms <= self.timing.heartbeat_interval_ms {
+            bail!("timing.suspect_after_ms must be longer than heartbeat_interval_ms");
+        }
+        Ok(())
+    }
+
+    /// The entry for node `id`, if it is listed.
+    pub fn node(&self, id: NodeId) -> Option<&NodeEntry> {
+        self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// Every node except `me`.
+    pub fn peers(&self, me: NodeId) -> impl Iterator<Item = &NodeEntry> {
+        self.nodes.iter().filter(move |n| n.id != me)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const THREE_NODES: &str = r#"
+        [[nodes]]
+        id = 1
+        addr = "127.0.0.1:50051"
+        [[nodes]]
+        id = 2
+        addr = "127.0.0.1:50052"
+        [[nodes]]
+        id = 3
+        addr = "127.0.0.1:50053"
+    "#;
+
+    #[test]
+    fn minimal_file_uses_defaults() {
+        let cfg = ClusterConfig::parse(THREE_NODES).unwrap();
+        assert_eq!(cfg.timing.heartbeat_interval_ms, 500);
+        assert_eq!(cfg.weights, Weights::default());
+        let peers: Vec<NodeId> = cfg.peers(2).map(|n| n.id).collect();
+        assert_eq!(peers, vec![1, 3]);
+        assert!(cfg.node(4).is_none());
+    }
+
+    #[test]
+    fn partial_tables_keep_other_defaults() {
+        let text = format!("{THREE_NODES}\n[timing]\nrpc_deadline_ms = 300\n[weights]\nage = 0.9\n");
+        let cfg = ClusterConfig::parse(&text).unwrap();
+        assert_eq!(cfg.timing.rpc_deadline_ms, 300);
+        assert_eq!(cfg.timing.heartbeat_interval_ms, 500);
+        assert_eq!(cfg.weights.age, 0.9);
+        assert_eq!(cfg.weights.severity, 0.6);
+    }
+
+    #[test]
+    fn shipped_localhost_file_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/nodes.toml");
+        let cfg = ClusterConfig::load(path).unwrap();
+        assert_eq!(cfg.nodes.len(), 3);
+    }
+
+    #[test]
+    fn rejects_mistakes() {
+        let dup = THREE_NODES.replace("id = 3", "id = 2");
+        assert!(ClusterConfig::parse(&dup).is_err());
+        let zero = THREE_NODES.replace("id = 1", "id = 0");
+        assert!(ClusterConfig::parse(&zero).is_err());
+        let bad_addr = THREE_NODES.replace("127.0.0.1:50053", "localhost");
+        assert!(ClusterConfig::parse(&bad_addr).is_err());
+        let bad_timing = format!("{THREE_NODES}\n[timing]\nsuspect_after_ms = 400\n");
+        assert!(ClusterConfig::parse(&bad_timing).is_err());
+    }
+}
