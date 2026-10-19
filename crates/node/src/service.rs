@@ -46,7 +46,9 @@ impl Node for NodeService {
         let hb = req.into_inner();
         // debug, not info: 2 peers x 2 per second would flood the log. Show with RUST_LOG=debug.
         tracing::debug!(from = hb.from_node, seq = hb.seq, "heartbeat received");
-        // Task 5: tell the failure detector we heard from hb.from_node.
+        // A peer's own heartbeat is proof it is alive (and how a returning node
+        // announces itself). Clients (0) and unknown IDs are ignored by the detector.
+        self.state.heard_from(hb.from_node);
         let reply = HeartbeatReply {
             node_id: self.state.id,
             seq: hb.seq,
@@ -246,6 +248,25 @@ mod tests {
         svc.inject_fault(order(1, 10_000)).await.unwrap();
         let second = timeout(Duration::from_secs(5), svc.inject_fault(order(1, 1_000))).await;
         assert!(second.is_err(), "a muted node must not answer a new fault order");
+    }
+
+    // ---- Task 5c: an incoming heartbeat counts as hearing from its sender.
+
+    #[tokio::test(start_paused = true)]
+    async fn incoming_heartbeat_brings_peer_back_up() {
+        let cfg = ClusterConfig::parse(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:50052\"\n",
+        )
+        .unwrap();
+        let peers = Peers::new(&cfg, 1).unwrap();
+        let svc = NodeService::new(Arc::new(NodeState::new(1, cfg, peers)));
+
+        tokio::time::sleep(Duration::from_millis(1500)).await; // node 2 silent for 1.5 s
+        assert_eq!(svc.state.check_peers(), vec![crate::failure_detector::PeerEvent::PeerDown(2)]);
+
+        svc.heartbeat(ping()).await.unwrap(); // node 2's own heartbeat arrives
+        assert_eq!(svc.state.check_peers(), vec![crate::failure_detector::PeerEvent::PeerUp(2)]);
     }
 
     // ---- Task 4f: the same mute, end to end over a real network, with the real clock.

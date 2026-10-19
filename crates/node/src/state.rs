@@ -100,7 +100,6 @@ impl NodeState {
     }
 
     /// "We just heard from `peer`": a reply to our heartbeat, or a heartbeat it sent us.
-    #[allow(dead_code)] // called by the heartbeat sender (5b) and handler (5c)
     pub fn heard_from(&self, peer: NodeId) {
         self.detector.lock().unwrap().record(peer, now_std());
     }
