@@ -1,0 +1,29 @@
+# Localhost layout: 3 nodes on one laptop, different ports.
+# For the 3 real machines, copy this to nodes.lab.toml and put in their IPs (same port is fine).
+# Every program reads this file: nodes find themselves by --id, clients read the addresses.
+
+[[nodes]]
+id = 1
+addr = "127.0.0.1:50051"
+
+[[nodes]]
+id = 2
+addr = "127.0.0.1:50052"
+
+[[nodes]]
+id = 3
+addr = "127.0.0.1:50053"
+
+# Optional: any missing value falls back to the default shown.
+[timing]
+heartbeat_interval_ms = 500   # each node -> each peer
+suspect_after_ms = 1500       # 3 missed heartbeats -> peer suspected down
+rpc_deadline_ms = 1000        # longest wait for a peer's reply
+connect_timeout_ms = 500      # longest wait to open a connection
+
+# Planner scoring weights (P2). Optional; defaults are the worked example's.
+[weights]
+severity = 0.6
+age = 0.4
+capability = 0.7
+distance = 0.3

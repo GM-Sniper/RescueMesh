@@ -9,6 +9,7 @@ pub mod pb {
 /// Identifies a cloud node. IDs start at 1; 0 means "a client, not a node".
 pub type NodeId = u32;
 
+pub mod config;
 pub mod domain;
 pub mod generators;
 pub mod planner;
