@@ -247,4 +247,47 @@ mod tests {
         let second = timeout(Duration::from_secs(5), svc.inject_fault(order(1, 1_000))).await;
         assert!(second.is_err(), "a muted node must not answer a new fault order");
     }
+
+    // ---- Task 4f: the same mute, end to end over a real network, with the real clock.
+
+    #[tokio::test]
+    async fn real_network_mute_round_trip() {
+        use common::pb::node_client::NodeClient;
+        use common::pb::node_server::NodeServer;
+
+        // 1. A real server on a free port, in the background.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let addr: std::net::SocketAddr = ([127, 0, 0, 1], port).into();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(NodeServer::new(service()))
+                .serve(addr),
+        );
+
+        // 2. A real client (retry briefly while the server starts), normal heartbeat.
+        let mut client = loop {
+            match NodeClient::connect(format!("http://{addr}")).await {
+                Ok(c) => break c,
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        };
+        assert_eq!(client.heartbeat(ping()).await.unwrap().into_inner().node_id, 1);
+
+        // 3. Mute for 500 ms; the ack still comes back over the network.
+        let ack = client.inject_fault(order(1, 500)).await.unwrap().into_inner();
+        assert!(ack.accepted);
+
+        // 4. Heartbeat with a 200 ms deadline: silence, not a quick error.
+        let muted = timeout(Duration::from_millis(200), client.heartbeat(ping())).await;
+        assert!(muted.is_err(), "muted node must not answer at all, got {muted:?}");
+
+        // 5. After the mute, it answers normally again.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let reply = client.heartbeat(ping()).await.unwrap().into_inner();
+        assert_eq!(reply.node_id, 1);
+    }
 }
