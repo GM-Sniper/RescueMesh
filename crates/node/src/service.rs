@@ -4,6 +4,7 @@
 //! where other modules plug in.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::pb::node_server::Node;
 use common::pb::{
@@ -80,12 +81,57 @@ async fn handle_submit(
     Err(Status::unimplemented("Submit is wired in task 7"))
 }
 
-/// Task 4: send the FaultAck, then go silent for duration_ms.
+/// Longest allowed silence: the course caps an injected fault at 20 s.
+const MAX_MUTE_MS: u64 = 20_000;
+
+/// Task 4: check the fault order, go silent for duration_ms, and ack.
+/// Refusals are FaultAcks (accepted = false + reason), not gRPC errors, so the
+/// injector only has to read one kind of answer.
 async fn handle_inject_fault(
-    _state: &NodeState,
-    _cmd: FaultCommand,
+    state: &NodeState,
+    cmd: FaultCommand,
 ) -> Result<Response<FaultAck>, Status> {
-    Err(Status::unimplemented("InjectFault is wired in task 4"))
+    let refusal = if cmd.target_node != state.id {
+        Some(format!("this is node {}, not node {}", state.id, cmd.target_node))
+    } else if cmd.duration_ms == 0 {
+        Some("duration must be at least 1 ms".to_string())
+    } else if cmd.duration_ms > MAX_MUTE_MS {
+        Some(format!("duration over {} s", MAX_MUTE_MS / 1000))
+    } else {
+        None
+    };
+    if let Some(reason) = refusal {
+        tracing::warn!(fault_id = %cmd.fault_id, %reason, "fault order refused");
+        return Ok(Response::new(FaultAck {
+            fault_id: cmd.fault_id,
+            accepted: false,
+            reason,
+        }));
+    }
+
+    let duration = Duration::from_millis(cmd.duration_ms);
+    state.mute_for(duration);
+    tracing::info!(
+        fault_id = %cmd.fault_id,
+        duration_ms = cmd.duration_ms,
+        issuer = cmd.issuer_node,
+        term = cmd.term,
+        "muted"
+    );
+    // Log line only: the node wakes up by itself when muted_until passes. No overlap is
+    // possible, because a muted node holds (ignores) new fault orders at the gate.
+    let fault_id = cmd.fault_id.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(duration).await;
+        tracing::info!(%fault_id, "mute ended");
+    });
+
+    // Sent even though we are now muted: this request passed the gate before the mute.
+    Ok(Response::new(FaultAck {
+        fault_id: cmd.fault_id,
+        accepted: true,
+        reason: String::new(),
+    }))
 }
 
 #[cfg(test)]
