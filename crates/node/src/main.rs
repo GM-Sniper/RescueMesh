@@ -5,6 +5,9 @@
 // (e.g. timeout()) are not called by anyone yet.
 #[allow(dead_code)]
 mod failure_detector;
+// Task 6. No caller in Step A: the election and replication use it in Step B.
+#[allow(dead_code)]
+mod broadcast;
 // P5: fault CSV. Not called yet: P1 wires it into the mute hook and the detector ticker.
 #[allow(dead_code)]
 mod fault_log;
