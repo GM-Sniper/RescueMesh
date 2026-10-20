@@ -10,6 +10,7 @@ use common::load::LoadReport;
 
 use crate::load::LoadCollector;
 use crate::peers::Peers;
+use crate::store::Store;
 
 #[allow(dead_code)] // config and peers are first read by the heartbeat loop (task 5)
 pub struct NodeState {
@@ -21,6 +22,8 @@ pub struct NodeState {
     in_flight: AtomicUsize,
     /// P3: CPU and service-time samples behind this node's load score (see load.rs).
     pub load: LoadCollector,
+    /// P4: incidents, resources, assignments and the change log (see store.rs).
+    pub store: Store,
     // Added later: muted (task 4), failure detector (task 5), store (P4).
 }
 
@@ -33,6 +36,7 @@ impl NodeState {
             peers,
             in_flight: AtomicUsize::new(0),
             load,
+            store: Store::with_default_resources(id),
         }
     }
 
