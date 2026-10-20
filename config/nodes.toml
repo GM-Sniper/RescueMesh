@@ -27,3 +27,14 @@ severity = 0.6
 age = 0.4
 capability = 0.7
 distance = 0.3
+
+# Load score for Step B's election (P3). Optional; defaults shown.
+# load_score = 0.5 x queue + 0.3 x CPU + 0.2 x service time, each normalized to 0-1.
+[load]
+sample_interval_ms = 200   # CPU sampling; sysinfo needs >= 200 ms between readings
+queue_weight = 0.5
+cpu_weight = 0.3
+service_weight = 0.2
+queue_max = 10             # this many requests in progress = fully loaded
+service_cap_ms = 100.0     # this average time per request = fully loaded
+service_ewma_alpha = 0.2   # newest request's share of the service-time average
