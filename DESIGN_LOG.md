@@ -43,3 +43,41 @@ Code: `crates/common/src/load.rs` (formula, config, `LoadReport`), `crates/node/
 Checked: the plan's worked example (queue 4, CPU 50 %, service 20 ms) gives 0.39 in a unit test. Under artificial load (every core busy), sampled CPU rose from about 47 % to 99.7 % (`cargo test -p node -- --ignored --nocapture`). Live numbers: `RUST_LOG=info,node::load=debug cargo run -p node -- --id 1`.
 
 **For P6 (node_metrics):** call `state.load_report()` once per second and log `queue_len`, `cpu_pct`, `service_ms`, `load_score`.
+
+
+## P4: Store and Change Log
+
+Code and usage: `crates/node/src/store.rs`, `docs/p4-changes.md`. This section holds the decisions only.
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Two dedup layers: `(source_node, seq)` for log entries, `request_id` for client requests | Only one of them | They answer different questions (did I apply this entry? did I already answer this request?), so neither can replace the other |
+| Order comes from `(source_node, seq)`; `timestamp_ms` is informational only | Wall-clock ordering | Machine clocks differ and nothing synchronizes them |
+| `seq = applied[self] + 1`, assigned inside the write lock | Atomic counter outside the lock | Outside the lock, seq 6 could be written before 5 and leave a hole |
+| `try_apply` re-checks `request_id` and that every planned resource exists and is free, inside the write lock; nothing is written on error | Hold the lock across snapshot + plan + apply | The planner runs between snapshot and apply. Holding the lock across it serializes every request, which defeats P3's load balancing. Re-checking costs only a rare retry |
+| Gaps are rejected, not buffered (`Gap { expected }`) | Buffer out-of-order entries | A buffer needs a size limit, an expiry, and a rule for an entry that never comes. The caller can just `FetchLog` |
+| A skipped entry (`Superseded`, `Invalid`) is still logged and still advances `applied[src]`, with a warning; state is untouched | Drop it | Otherwise the source looks like a gap forever and `entries_since` serves a log with a hole |
+| No free resource: empty plan, incident logged as `Open`, plan kept in `by_request` | Reject the request; queue and re-plan | The request was processed and a retry gets the same answer. `TODO(P4)` in `try_apply` |
+| Starting resources are constants in `store.rs` (seed 42, 10 resources) | A `[resources]` table in `nodes.toml` | Avoids touching `config.rs` for now. Every node needs the same set. `TODO(P4)`: remove once clients can offer resources as log operations; make configurable only if experiments need a different resource count |
+| `by_request` stores `(origin node, seq, plan)` | Plan only | Lets a later rule compare origins. Nothing depends on it yet |
+| Recovery by log replay (`FetchLog`), decided in Step C | Snapshot transfer | Replay reuses the idempotent `apply_remote`. A snapshot needs a point-in-time cut that matches `applied` and a new RPC. Revisit if the log gets long, and add log trimming then |
+
+### Invalid in-order entries (provisional; revisit in Step B, when replication calls `apply_remote`)
+
+| Alternative | What happens | Trade-off |
+|---|---|---|
+| **Log, advance, warn** (chosen for now) | Entry kept in the log, `applied[src]` advances, warning | Replication keeps moving and nothing is lost. This node's state may differ from the others' until someone looks |
+| **Stop and alert** | Do not advance; halt replication from that source until a person looks | Safest for consistency, but it blocks every entry behind the bad one |
+| **Quarantine** | As the first option, plus a list of `(source, seq, reason)` | The entry can be reported and re-applied later. Costs the list and a way to re-apply |
+
+The reason starts with `unsupported op` or `bad data`. `TODO(P4)` in `Store::apply_remote` points here.
+
+### Same request_id from two origins (provisional; revisit all three before building the undo in Step B)
+
+P3's Q4: keep the plan from the lower origin `node_id`. Step A: **first applied wins** (`Superseded`).
+
+| Alternative | How it works | Limits |
+|---|---|---|
+| **Undo** | Apply as now. On a late lower-origin entry, release the loser's assignments, reset its incident, keep its log entry | Works with the current state. Needs a reversible apply, and the winner's resources may have been taken meanwhile |
+| **Replay** | Rebuild the state from the log with "lowest origin per request_id counts" | Needs a clock-free canonical order of entries. We do not have one |
+| **Avoid** | Wait for Coordinator confirmation before `try_apply` | Adds delay to every request, and a late Coordinator still leaves the problem |
