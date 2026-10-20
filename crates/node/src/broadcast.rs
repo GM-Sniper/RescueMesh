@@ -172,6 +172,42 @@ mod tests {
         assert!(start.elapsed() < DEADLINE, "took {:?}", start.elapsed());
     }
 
+    // ---- 6b: deadlines. A muted peer keeps its connection open and never answers.
+
+    const SHORT: Duration = Duration::from_millis(300);
+
+    #[tokio::test]
+    async fn silent_peer_times_out_without_holding_up_the_other() {
+        let cfg = three_node_config();
+        serve(2, &cfg).await;
+        let node3 = serve(3, &cfg).await;
+        node3.mute_for(Duration::from_secs(5));
+        let node1 = state_for(1, &cfg);
+
+        let start = Instant::now();
+        let results = broadcast(&node1, SHORT, heartbeat).await;
+        let took = start.elapsed();
+        assert!(matches!(results[0], (2, PeerResult::Reply(_))), "{:?}", results[0]);
+        assert!(matches!(results[1], (3, PeerResult::TimedOut)), "{:?}", results[1]);
+        // It really waited for node 3, but only about one deadline.
+        assert!(took >= SHORT && took < SHORT + Duration::from_millis(150), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn calls_run_in_parallel() {
+        let cfg = three_node_config();
+        serve(2, &cfg).await.mute_for(Duration::from_secs(5));
+        serve(3, &cfg).await.mute_for(Duration::from_secs(5));
+        let node1 = state_for(1, &cfg);
+
+        let start = Instant::now();
+        let results = broadcast(&node1, SHORT, heartbeat).await;
+        let took = start.elapsed();
+        assert!(matches!(results[..], [(2, PeerResult::TimedOut), (3, PeerResult::TimedOut)]));
+        // One after another would take 2 x 300 ms; in parallel it is about 300 ms.
+        assert!(took < Duration::from_millis(450), "took {took:?}: calls did not run in parallel");
+    }
+
     #[tokio::test]
     async fn muted_node_sends_nothing() {
         let cfg = three_node_config();
