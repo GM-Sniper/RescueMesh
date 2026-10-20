@@ -2,10 +2,13 @@
 //! Shared as `Arc<NodeState>`: cheap to clone, all clones point to the same struct.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Instant;
 
 use common::NodeId;
 use common::config::ClusterConfig;
+use common::load::LoadReport;
 
+use crate::load::LoadCollector;
 use crate::peers::Peers;
 
 #[allow(dead_code)] // config and peers are first read by the heartbeat loop (task 5)
@@ -16,42 +19,58 @@ pub struct NodeState {
     pub peers: Peers,
     /// Requests currently being processed. P3's load collector reads this as "queue length".
     in_flight: AtomicUsize,
+    /// P3: CPU and service-time samples behind this node's load score (see load.rs).
+    pub load: LoadCollector,
     // Added later: muted (task 4), failure detector (task 5), store (P4).
 }
 
 impl NodeState {
     pub fn new(id: NodeId, config: ClusterConfig, peers: Peers) -> Self {
+        let load = LoadCollector::new(config.load);
         NodeState {
             id,
             config,
             peers,
             in_flight: AtomicUsize::new(0),
+            load,
         }
     }
 
     /// P3's hook: how many requests this node is working on right now.
-    #[allow(dead_code)] // read by P3's load collector once it is wired in
     pub fn in_flight(&self) -> usize {
         // Relaxed: the counter is a statistic; no other data depends on its ordering.
         self.in_flight.load(Ordering::Relaxed)
     }
 
+    /// P3: this node's load right now; `load_score` is what it bids in Step B.
+    /// The queue length is read live, so two requests arriving within one CPU
+    /// sample still see different scores.
+    pub fn load_report(&self) -> LoadReport {
+        self.load.current(self.in_flight())
+    }
+
     /// Call at the start of a request handler. Counts the request until the guard is dropped.
     pub fn start_request(&self) -> InFlightGuard<'_> {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
-        InFlightGuard { state: self }
+        InFlightGuard {
+            state: self,
+            started: Instant::now(),
+        }
     }
 }
 
 /// Decrements `in_flight` when it goes out of scope, however the handler ends
-/// (success, early error return, or the request being cancelled).
+/// (success, early error return, or the request being cancelled), and gives the
+/// request's duration to the load collector's service-time average.
 pub struct InFlightGuard<'a> {
     state: &'a NodeState,
+    started: Instant,
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         self.state.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.state.load.record_service_time(self.started.elapsed());
     }
 }
 
@@ -98,5 +117,24 @@ mod tests {
         assert!(handler(&s, true).is_err());
         assert!(handler(&s, false).is_ok());
         assert_eq!(s.in_flight(), 0);
+    }
+
+    #[test]
+    fn load_report_follows_the_queue_and_records_service_time() {
+        let s = state();
+        assert_eq!(s.load_report().load_score, 0.0);
+        let g = s.start_request();
+        // 1 of queue_max 10, weight 0.5 -> 0.05; no CPU sample or finished request yet.
+        assert_eq!(s.load_report().queue_len, 1);
+        assert!((s.load_report().load_score - 0.05).abs() < 1e-9);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drop(g);
+        let r = s.load_report();
+        assert_eq!(r.queue_len, 0);
+        assert!(
+            r.service_ms >= 5.0,
+            "service time not recorded: {}",
+            r.service_ms
+        );
     }
 }
