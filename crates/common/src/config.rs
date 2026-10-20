@@ -13,6 +13,7 @@ use serde::Deserialize;
 
 use crate::NodeId;
 use crate::domain::Weights;
+use crate::load::LoadConfig;
 
 /// The whole config file.
 #[derive(Debug, Clone, Deserialize)]
@@ -25,6 +26,9 @@ pub struct ClusterConfig {
     /// Planner scoring weights (P2). Optional; missing values use the defaults.
     #[serde(default)]
     pub weights: Weights,
+    /// Load score inputs and weights (P3). Optional; missing values use the defaults.
+    #[serde(default)]
+    pub load: LoadConfig,
 }
 
 /// One `[[nodes]]` entry.
@@ -111,6 +115,7 @@ impl ClusterConfig {
         if self.timing.suspect_after_ms <= self.timing.heartbeat_interval_ms {
             bail!("timing.suspect_after_ms must be longer than heartbeat_interval_ms");
         }
+        self.load.check()?;
         Ok(())
     }
 
@@ -178,5 +183,7 @@ mod tests {
         assert!(ClusterConfig::parse(&bad_addr).is_err());
         let bad_timing = format!("{THREE_NODES}\n[timing]\nsuspect_after_ms = 400\n");
         assert!(ClusterConfig::parse(&bad_timing).is_err());
+        let bad_load = format!("{THREE_NODES}\n[load]\nqueue_max = 0\n");
+        assert!(ClusterConfig::parse(&bad_load).is_err());
     }
 }

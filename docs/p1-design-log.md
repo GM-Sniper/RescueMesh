@@ -77,6 +77,8 @@ Library boundary for the whole project: tonic carries bytes over HTTP/2 and pros
 **Alternatives.** A plain counter (not thread-safe); incrementing and decrementing by hand.
 **Why.** The guard decrements however the handler ends (success, early error, cancelled request), so the "queue length" P3 reads can never drift upward.
 
+**Interaction with the mute hook.** P3's collector also uses the guard to time each request (its service-time average). In `submit`, the guard is dropped right after the work is done, before the reply gate. Otherwise a request held by a mute would record up to 20 s as service time, and the node would look fully loaded, and lose elections, right after it unmutes. Requests held at the entry gate are never counted either, because the guard is created after that gate.
+
 ### 4.4 Thin handlers: the dispatch point
 **What.** Each RPC method in `service.rs` only unwraps the message, counts it and applies the mute gate, then calls a `handle_*` function where the real work lives.
 **Why.** Every request passes through one place, so the mute rule cannot be bypassed, and teammates' modules (planner, store, injector) plug in without rewriting the server.

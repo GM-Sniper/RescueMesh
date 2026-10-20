@@ -7,12 +7,15 @@ use std::time::Duration;
 
 use common::NodeId;
 use common::config::ClusterConfig;
+use common::load::LoadReport;
 use common::pb::node_client::NodeClient;
 use tonic::transport::Channel;
 // tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
+// Also used by the in-flight guard to time requests (P3's service-time average).
 use tokio::time::{Instant, sleep_until};
 
 use crate::failure_detector::{FailureDetector, PeerEvent};
+use crate::load::LoadCollector;
 use crate::peers::Peers;
 
 pub struct NodeState {
@@ -22,6 +25,8 @@ pub struct NodeState {
     pub peers: Peers,
     /// Requests currently being processed. P3's load collector reads this as "queue length".
     in_flight: AtomicUsize,
+    /// P3: CPU and service-time samples behind this node's load score (see load.rs).
+    pub load: LoadCollector,
     /// When the current mute ends; None = never muted (task 4).
     /// An end time instead of an on/off flag: nothing has to switch it back off,
     /// and overlapping mutes just keep the later end.
@@ -35,6 +40,7 @@ pub struct NodeState {
 
 impl NodeState {
     pub fn new(id: NodeId, config: ClusterConfig, peers: Peers) -> Self {
+        let load = LoadCollector::new(config.load);
         // Every peer starts "alive" and gets the full suspect_after to send its first heartbeat.
         let detector = FailureDetector::new(peers.ids(), config.timing.suspect_after(), now_std());
         NodeState {
@@ -42,22 +48,32 @@ impl NodeState {
             config,
             peers,
             in_flight: AtomicUsize::new(0),
+            load,
             muted_until: Mutex::new(None),
             detector: Mutex::new(detector),
         }
     }
 
     /// P3's hook: how many requests this node is working on right now.
-    #[allow(dead_code)] // read by P3's load collector once it is wired in
     pub fn in_flight(&self) -> usize {
         // Relaxed: the counter is a statistic; no other data depends on its ordering.
         self.in_flight.load(Ordering::Relaxed)
     }
 
+    /// P3: this node's load right now; `load_score` is what it bids in Step B.
+    /// The queue length is read live, so two requests arriving within one CPU
+    /// sample still see different scores.
+    pub fn load_report(&self) -> LoadReport {
+        self.load.current(self.in_flight())
+    }
+
     /// Call at the start of a request handler. Counts the request until the guard is dropped.
     pub fn start_request(&self) -> InFlightGuard<'_> {
         self.in_flight.fetch_add(1, Ordering::Relaxed);
-        InFlightGuard { state: self }
+        InFlightGuard {
+            state: self,
+            started: Instant::now(),
+        }
     }
 
     /// Go silent for `d` from now. An existing longer mute is kept, never shortened.
@@ -133,14 +149,17 @@ fn now_std() -> std::time::Instant {
 }
 
 /// Decrements `in_flight` when it goes out of scope, however the handler ends
-/// (success, early error return, or the request being cancelled).
+/// (success, early error return, or the request being cancelled), and gives the
+/// request's duration to the load collector's service-time average.
 pub struct InFlightGuard<'a> {
     state: &'a NodeState,
+    started: Instant,
 }
 
 impl Drop for InFlightGuard<'_> {
     fn drop(&mut self) {
         self.state.in_flight.fetch_sub(1, Ordering::Relaxed);
+        self.state.load.record_service_time(self.started.elapsed());
     }
 }
 
@@ -187,6 +206,25 @@ mod tests {
         assert!(handler(&s, true).is_err());
         assert!(handler(&s, false).is_ok());
         assert_eq!(s.in_flight(), 0);
+    }
+
+    #[test]
+    fn load_report_follows_the_queue_and_records_service_time() {
+        let s = state();
+        assert_eq!(s.load_report().load_score, 0.0);
+        let g = s.start_request();
+        // 1 of queue_max 10, weight 0.5 -> 0.05; no CPU sample or finished request yet.
+        assert_eq!(s.load_report().queue_len, 1);
+        assert!((s.load_report().load_score - 0.05).abs() < 1e-9);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        drop(g);
+        let r = s.load_report();
+        assert_eq!(r.queue_len, 0);
+        assert!(
+            r.service_ms >= 5.0,
+            "service time not recorded: {}",
+            r.service_ms
+        );
     }
 
     #[tokio::test(start_paused = true)] // fake clock: sleeps jump ahead instantly

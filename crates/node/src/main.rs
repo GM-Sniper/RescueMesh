@@ -9,6 +9,7 @@ mod failure_detector;
 #[allow(dead_code)]
 mod fault_log;
 mod heartbeat;
+mod load;
 mod peers;
 mod service;
 mod state;
@@ -67,7 +68,9 @@ async fn main() -> anyhow::Result<()> {
     // 5. Shared state, given to the service and the background tasks.
     let state = Arc::new(NodeState::new(args.id, config, peers));
 
-    // 6. Background tasks: heartbeats to each peer, and the detector ticker.
+    // 6. Background tasks: CPU sampling for the load score (P3), heartbeats to
+    //    each peer, and the detector ticker.
+    load::spawn_sampler(state.clone());
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
 

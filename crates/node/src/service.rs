@@ -59,8 +59,13 @@ impl Node for NodeService {
 
     async fn submit(&self, req: Request<SubmitRequest>) -> Result<Response<SubmitReply>, Status> {
         self.gate().await?; // before counting: held requests are not work
-        let _guard = self.state.start_request(); // P3's queue counter, until this returns
-        let reply = handle_submit(&self.state, req.into_inner()).await?;
+        let guard = self.state.start_request(); // P3's queue counter and service time
+        let result = handle_submit(&self.state, req.into_inner()).await;
+        // Stop counting and timing before the reply gate: time held by a mute is not
+        // service time, and counting it would make the node look overloaded (and lose
+        // elections) right after it unmutes.
+        drop(guard);
+        let reply = result?;
         // Muted mid-request: drop the reply. The client retries with the same
         // request_id and gets the stored plan (duplicate = true).
         self.gate().await?;

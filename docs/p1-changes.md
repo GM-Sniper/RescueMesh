@@ -48,7 +48,7 @@ cargo run -p node -- --id 3
 
 ## For each teammate
 - **P2:** `[weights]` is read into `cfg.weights` (your `Weights`). Your conversions are used in task 7: their `String` errors become `Status::invalid_argument`.
-- **P3:** `state.in_flight()` is the number of `Submit` requests being processed right now (your queue length). Requests held by a mute are not counted.
+- **P3:** your collector is merged into `NodeState` (`state.load_report()`). `in_flight()` counts the `Submit` requests being processed right now, and the guard times each one. Time a request spends held by a mute is neither counted nor timed: the guard is created after the entry gate and dropped before the reply gate.
 - **P4:** task 7 calls `snapshot()`, `apply()` and `lookup_request()` from your store; until it lands, a stub with the same API is used. `FetchLog` replies over 4 MB are rejected by default, so recovery may need paging.
 - **P5:** `InjectFault` works: target must be the node itself, `duration_ms` 1 to 20 000, refusals come back as `FaultAck { accepted: false, reason }`. The node logs `muted` and `mute ended` with timestamps for your CSV. Your detector is wired to real heartbeats.
 - **P6:** `Submit` answers `unimplemented` until task 7; keep using your mock server until then. Muted nodes never answer quickly, so the client's own timeout is what ends those requests.
