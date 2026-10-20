@@ -1,4 +1,4 @@
-# P1 progress: protocol, node, transport, mute hook, heartbeats
+# P1 progress: protocol, node, transport, mute hook, heartbeats, broadcast
 
 Owner: P1 (reviewer: P5). Design reasons for everything below: [`docs/p1-design-log.md`](p1-design-log.md).
 
@@ -7,10 +7,10 @@ Owner: P1 (reviewer: P5). Design reasons for everything below: [`docs/p1-design-
 |---|---|---|
 | 1. Workspace compiles everywhere | Fri Oct 16 | Done, on `main` |
 | 2. Proto v1 (`Submit`, domain types, plus P3/P4/P5 messages) | Sat Oct 17 | Done, on `main` (PR #6) |
-| 3. Node skeleton: config loader, `0.0.0.0`, shared state, peer connections, dispatch point | Sun Oct 18 | Done, PR #8 waiting for review |
-| 4. Mute hook | Sun Oct 18 | Done, will go in the next PR |
-| 5. Heartbeat loop + failure detection | Mon Oct 19 | Done, will go in the next PR |
-| 6. `broadcast()` + timeout/retry policy | Mon Oct 19 | Not started |
+| 3. Node skeleton: config loader, `0.0.0.0`, shared state, peer connections, dispatch point | Sun Oct 18 | Done, on `main` (PR #8) |
+| 4. Mute hook | Sun Oct 18 | Done, PR #10 |
+| 5. Heartbeat loop + failure detection | Mon Oct 19 | Done, PR #10 |
+| 6. `broadcast()` + timeout/retry policy | Mon Oct 19 | Done, PR #10 |
 | 7. Handler wiring: `Submit` → snapshot → plan → apply → reply | Tue Oct 20 | Not started; needs P4's store (a stub is used until it lands) |
 
 Done-check from the plan: 3 localhost nodes log each other's heartbeats ✅, the mute hook silences one on command ✅, a request returns a plan end to end (task 7).
@@ -43,6 +43,7 @@ cargo run -p node -- --id 3
 | `crates/node/src/peers.rs` | One lazy connection per peer, with a connect timeout | Wrap every call in `tokio::time::timeout(...)`; deadlines are ours |
 | `crates/node/src/service.rs` | The `Node` service: `Heartbeat`, `Submit` (stub until task 7), `InjectFault`; the mute gate | P4/P2 plug into `handle_submit` in task 7 |
 | `crates/node/src/heartbeat.rs` | One heartbeat worker per peer (500 ms), and the 100 ms detector ticker | Logs `peer suspected down` / `peer alive again` with timestamps |
+| `crates/node/src/broadcast.rs` | `broadcast(state, deadline, call)`: the same call to every peer at once, one result per peer (`Reply` / `Failed` / `TimedOut` / `NotSent`), at most one retry for `Unavailable` | For Step B's `Bid`, `Replicate` and broadcast `FaultCommand`; see "Using broadcast" below |
 | `crates/node/src/failure_detector.rs` | P5's detector (unchanged), used through `NodeState` | |
 | `docs/p1-design-log.md` | Every P1 design decision with alternatives and reasons | Material for the report |
 
@@ -53,12 +54,32 @@ cargo run -p node -- --id 3
 - **P5:** `InjectFault` works: target must be the node itself, `duration_ms` 1 to 20 000, refusals come back as `FaultAck { accepted: false, reason }`. The node logs `muted` and `mute ended` with timestamps for your CSV. Your detector is wired to real heartbeats.
 - **P6:** `Submit` answers `unimplemented` until task 7; keep using your mock server until then. Muted nodes never answer quickly, so the client's own timeout is what ends those requests.
 
+## Using broadcast (Step B: P3 election, P4 replication, P5 automatic injector)
+```rust
+let bid = Bid { request_id, node_id: state.id, load_score };
+let results = broadcast(&state, deadline, move |mut client| {
+    let bid = bid.clone();
+    async move { client.bid(bid).await } // the RPC P1 adds to `service Node` in Step B
+}).await;
+for (peer, result) in results {
+    match result {
+        PeerResult::Reply(ack) => { /* peer answered */ }
+        PeerResult::TimedOut | PeerResult::Failed(_) => { /* treat the peer as out */ }
+        PeerResult::NotSent => { /* we are muted: take no part */ }
+    }
+}
+```
+- Every peer is called, even ones suspected down; the result tells you who answered.
+- The whole call, retry included, takes at most `deadline`.
+- A retried message can arrive twice: the receiving handler must ignore a `request_id` / `fault_id` it has already handled.
+
 ## Tests
-`cargo test --workspace`: 20 in `common` (P2's planner/generators/conversions, config loader) and 33 in `node`, including:
+`cargo test --workspace`: 26 in `common` (P2's planner, generators and conversions; config loader; P3's load formula), 3 in `injector` (P5), and 51 in `node`, including:
 - mute behaviour on a fake clock (10 s scenarios in milliseconds) and over a real network;
-- failure detection with 3 real nodes in one test: a muted node is dropped by the others and seen again afterwards.
+- failure detection with 3 real nodes in one test: a muted node is dropped by the others and seen again afterwards;
+- broadcast: a muted peer times out without holding up the other, calls run in parallel, and the retry rules on fake calls.
 
 ## Next
-- Task 6: `broadcast()` and the timeout/retry policy.
 - Task 7: wire `Submit` (with a stub store if P4's is not ready).
+- Wire P5's fault log (`mute_start` / `mute_end`, `peer_down` / `peer_up`).
 - Before Wednesday: the real machines' IPs for `nodes.lab.toml`, and allowing `node.exe` through each machine's firewall.

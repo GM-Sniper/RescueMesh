@@ -159,3 +159,44 @@ Expected detection time: 1.0 to 1.6 s after a node goes silent, depending on how
 - Unit tests on a fake clock: silence gives PeerDown at 1.5 s, hearing again gives PeerUp, unmute starts fresh (the test fails if the reset is removed).
 - 3 real nodes in one test, real network: node 2 muted for 800 ms is dropped by nodes 1 and 3 within 450 ms (test timings: heartbeat 50 ms, suspect 150 ms) and seen again after the mute, by both and by node 2 itself.
 - Manual run, 3 real processes, real timings: node 2's process killed; nodes 1 and 3 logged `peer suspected down` independently after 1.18 s; node 2 restarted and both logged `peer alive again` 94 ms later; no false alarms before or after.
+
+---
+
+## 8. Broadcast, timeouts and retries (task 6)
+
+### 8.1 What `broadcast()` does
+**What.** `broadcast(state, deadline, call)` makes the same call on every peer at the same time and returns one result per peer, sorted by ID: `Reply(answer)`, `Failed(status)`, `TimedOut`, or `NotSent` (this node is muted). It is generic over the call ("given a client, make this RPC"), so Step B's `Bid`, `Replicate` and broadcast `FaultCommand` all use it without changing it.
+**Why.** Fan-out, deadlines and retries are written once, in one place, instead of in every protocol that needs them. The caller decides what missing answers mean (for example, the election treats a missing bid as "that node is out").
+
+### 8.2 Every configured peer is called, not only the ones believed alive
+**Alternatives.** Call only `alive_peers()`.
+**Why.** The calls run in parallel, so a dead peer costs no extra time: the broadcast waits one deadline either way. A peer that has just come back but is not marked alive yet (up to one 100 ms tick) would otherwise be left out, and an election could pick a winner without its bid.
+
+### 8.3 Parallel calls under one deadline
+**What.** Each call runs in its own task inside a `JoinSet`, wrapped in our own `tokio::time::timeout`. Results are collected as they finish. If the caller stops waiting, every pending call is cancelled. A panic in one call is logged and does not lose the other peers' results.
+**Alternatives.** Calling peers one after another; waiting only for a quorum of replies.
+**Why.** One silent peer must not delay the others: in the election ("send the bid, wait T, decide"), a sequential broadcast would double the wait whenever a node is down, and that wait is part of the failover time we measure. Returning early at a quorum is not needed in Step A; it can be added for Step B if the election wants it.
+**Evidence.** With a 300 ms deadline and one muted peer, the other peer's reply arrives and the broadcast ends between 300 and 450 ms. With both peers muted it also ends in under 450 ms; calling them one after another would take 600 ms.
+
+### 8.4 Retry policy: at most one retry, only for "could not reach the peer"
+**What.** A call that fails fast with `Unavailable` (connection refused, or a connection broken by a peer restart) is retried once, and only with the time left before the deadline. Everything else is final:
+- a timeout (the deadline is used up; a silent peer will not answer a second time either);
+- any other error, such as `invalid_argument` (the peer answered "no"; asking again gives the same answer);
+- a second failure (a dead peer costs at most two quick attempts).
+
+**Alternatives.** No retries at all; retrying until the deadline (with backoff); also retrying timeouts.
+**Why.** One retry covers the common blip, the first call after a peer restarts hitting the old broken connection, so a peer that is actually back is not missing from an election. Retrying more would only add load on a peer that is really down; persistent failures are the failure detector's job, not the broadcast's. Retrying a timeout would break the deadline.
+**Safety.** A retry may deliver a message twice (if the first attempt did arrive). Every state-changing message carries a `request_id` or `fault_id`, so receivers must ignore a duplicate; Step B's handlers for `Bid`, `Replicate` and `FaultCommand` have to keep that rule.
+**Evidence.** Fake-call tests on a fake clock: `Unavailable` once then a reply gives a reply after 2 attempts; `Unavailable` every time gives `Failed` after 2 attempts (not 3); `invalid_argument` and timeouts are tried once; a first attempt failing at 250 ms of a 300 ms deadline leaves the retry only 50 ms, and the broadcast ends at exactly 300 ms.
+
+### 8.5 All timeouts in one place
+| Timeout | Value | Set in | Where it applies |
+|---|---|---|---|
+| Connect timeout | 500 ms | `[timing] connect_timeout_ms` | Opening a connection to a peer (instead of the OS's ~21 s) |
+| Per-call deadline | 1000 ms | `[timing] rpc_deadline_ms` | Each heartbeat; the default `broadcast` deadline |
+| Heartbeat interval | 500 ms | `[timing] heartbeat_interval_ms` | One heartbeat per peer |
+| Suspect after | 1500 ms | `[timing] suspect_after_ms` | Silence before PeerDown (3 missed heartbeats) |
+| Detector tick | 100 ms | code (`heartbeat.rs`) | How often PeerDown/PeerUp are checked |
+| Broadcast deadline | caller's choice (default 1000 ms) | argument to `broadcast` | The whole fan-out, retry included; the election may choose a shorter T |
+| Longest mute | 20 000 ms | code (`service.rs`) | Course limit on an injected fault |
+| Client timeout (P6) | 5 s | `client::DEFAULT_TIMEOUT` | A client request; what ends a request held by a muted node |
