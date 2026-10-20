@@ -475,6 +475,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "injector"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "common",
+ "rand",
+ "tokio",
+ "tonic",
+]
+
+[[package]]
 name = "is_terminal_polyfill"
 version = "1.70.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
