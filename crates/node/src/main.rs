@@ -16,7 +16,8 @@ mod load;
 mod peers;
 mod service;
 mod state;
-// P4: store and change log. Not called yet: wired by the Submit handler and replication.
+// P4: store and change log. Used by the Submit handler; the replication functions
+// (apply_remote, entries_since, applied) are not called until Step B.
 #[allow(dead_code)]
 mod store;
 

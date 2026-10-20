@@ -4,15 +4,20 @@
 //! where other modules plug in.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use common::conversions::{incident_from_pb, plan_to_pb};
+use common::domain::Plan;
 use common::pb::node_server::Node;
 use common::pb::{
     FaultAck, FaultCommand, HeartbeatReply, HeartbeatRequest, SubmitReply, SubmitRequest,
+    submit_request,
 };
+use common::planner;
 use tonic::{Request, Response, Status};
 
 use crate::state::NodeState;
+use crate::store::ApplyError;
 
 pub struct NodeService {
     /// Shared with the background tasks (heartbeat loop, detector ticker).
@@ -79,13 +84,89 @@ impl Node for NodeService {
     }
 }
 
-/// Task 7 (Tue): check request_id -> incident_from_pb -> store.snapshot() -> plan()
-/// -> store.apply() -> reply.
+/// How many times to plan again when another request takes a planned resource
+/// between our snapshot and our write.
+const MAX_PLAN_ATTEMPTS: usize = 3;
+
+/// Task 7: one client request, in the order from P4's notes (docs/p4-changes.md):
+/// lookup_request -> incident_from_pb -> snapshot -> plan -> try_apply -> reply.
 async fn handle_submit(
-    _state: &NodeState,
-    _req: SubmitRequest,
+    state: &NodeState,
+    req: SubmitRequest,
 ) -> Result<Response<SubmitReply>, Status> {
-    Err(Status::unimplemented("Submit is wired in task 7"))
+    // 1. Every request needs its ID (idempotency) and an incident (the only kind in Step A).
+    let request_id = req.request_id;
+    if request_id.is_empty() {
+        return Err(Status::invalid_argument("request_id is empty"));
+    }
+    let Some(submit_request::Kind::Incident(incident)) = req.kind else {
+        return Err(Status::invalid_argument("expected an incident"));
+    };
+    let reply = |plan: &Plan, duplicate: bool| {
+        Response::new(SubmitReply {
+            request_id: request_id.clone(),
+            executor_node: state.id,
+            plan: Some(plan_to_pb(plan)),
+            duplicate,
+        })
+    };
+
+    // 2. Already handled: the same answer again, never a second plan.
+    if let Some(stored) = state.store.lookup_request(&request_id) {
+        return Ok(reply(&stored, true));
+    }
+
+    // 3. P2's conversion checks the incident (category, severity 1-10, location...).
+    let incident = incident_from_pb(incident).map_err(Status::invalid_argument)?;
+    let weights = state.config.weights;
+
+    // 4. Snapshot -> plan -> try_apply. try_apply re-checks under the store's lock, so a
+    //    resource taken by another request in between is caught, and we plan again.
+    for attempt in 1..=MAX_PLAN_ATTEMPTS {
+        let now = now_unix_ms();
+        let snapshot = state.store.snapshot();
+        let to_plan = incident.clone();
+        // The planner is CPU work: run it off the async threads so it can never
+        // delay heartbeats (which would cause false PeerDowns).
+        let plan = tokio::task::spawn_blocking(move || {
+            planner::plan(&to_plan, &snapshot, &weights, now)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("planner failed: {e}")))?;
+
+        match state.store.try_apply(&request_id, incident.clone(), plan, now) {
+            Ok(applied) => {
+                tracing::debug!(
+                    %request_id,
+                    assigned = applied.plan.assignments.len(),
+                    duplicate = applied.duplicate,
+                    attempt,
+                    "submit applied"
+                );
+                return Ok(reply(&applied.plan, applied.duplicate));
+            }
+            Err(ApplyError::ResourceTaken { resource_id }) => {
+                tracing::debug!(%request_id, attempt, resource_id, "resource taken meanwhile; planning again");
+            }
+            Err(ApplyError::UnknownResource { resource_id }) => {
+                return Err(Status::internal(format!(
+                    "plan names resource {resource_id}, which the store does not have"
+                )));
+            }
+        }
+    }
+    // Conflicts every time: the client may retry with the same request_id.
+    Err(Status::aborted(format!(
+        "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
+    )))
+}
+
+/// The node's wall clock in Unix milliseconds (the planner's `now`, the log entry's timestamp).
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Longest allowed silence: the course caps an injected fault at 20 s.
@@ -167,13 +248,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_is_a_stub_and_leaves_counter_at_zero() {
+    async fn empty_submit_is_rejected_and_leaves_counter_at_zero() {
         let svc = service();
         let err = svc
             .submit(Request::new(SubmitRequest::default()))
             .await
             .unwrap_err();
-        assert_eq!(err.code(), tonic::Code::Unimplemented);
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert_eq!(svc.state.in_flight(), 0);
     }
 

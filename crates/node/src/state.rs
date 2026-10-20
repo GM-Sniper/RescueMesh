@@ -29,7 +29,6 @@ pub struct NodeState {
     /// P3: CPU and service-time samples behind this node's load score (see load.rs).
     pub load: LoadCollector,
     /// P4: incidents, resources, assignments and the change log (see store.rs).
-    #[allow(dead_code)] // first read by the Submit handler (task 7)
     pub store: Store,
     /// When the current mute ends; None = never muted (task 4).
     /// An end time instead of an on/off flag: nothing has to switch it back off,
