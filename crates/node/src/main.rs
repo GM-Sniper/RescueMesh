@@ -7,6 +7,10 @@ mod failure_detector;
 // P5: fault CSV. Not called yet: wired with the mute hook (task 4) and detector (task 5).
 mod fault_log;
 mod load;
+// P6: NODE_METRICS LOG (ONE CSV ROW PER SECOND: QUEUE, CPU, SERVICE TIME, LOAD SCORE).
+// NOTE FOR P1 / STEPA/P1: P6 ADDED ONLY THIS `mod` LINE AND THE `node_metrics::spawn` CALL IN STEP 5
+// BELOW. NOTHING ELSE IN THIS FILE CHANGED. PLEASE KEEP BOTH LINES WHEN YOU MERGE MAIN INTO STEPA/P1.
+mod node_metrics;
 mod peers;
 mod service;
 mod state;
@@ -68,6 +72,9 @@ async fn main() -> anyhow::Result<()> {
     // 5. Shared state, given to the service now and to background tasks later.
     let state = Arc::new(NodeState::new(args.id, config, peers));
     load::spawn_sampler(state.clone()); // P3: CPU sampling for the load score
+    // P6 (SEE NOTE AT THE TOP, P1): ONE ROW PER SECOND TO logs/node_metrics-node<ID>.CSV
+    node_metrics::spawn(state.clone(), format!("logs/node_metrics-node{}.csv", args.id))
+        .context("cannot open the node_metrics log")?;
 
     // 6. Open the doors: serve the Node service until Ctrl+C.
     tracing::info!(id = args.id, %listen, peers = ?peer_ids, "node listening");

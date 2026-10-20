@@ -120,6 +120,14 @@ impl ClientMiddleware {
 }
 
 impl SubmitOutcome {
+    /// Did the plan actually assign a resource?
+    /// - Some(true):  yes, at least one resource was assigned
+    /// - Some(false): the node planned, but nothing was free (empty plan; P4: resubmit with a NEW request_id)
+    /// - None:        no plan at all (the request failed, or in Step B this node wasn't the executor)
+    pub fn assigned(&self) -> Option<bool> {
+        self.plan.as_ref().map(|plan| !plan.assignments.is_empty())
+    }
+
     /// Builds the outcome for a request that got no usable reply.
     fn failed(request_id: String, latency_us: u64, status: SubmitStatus, error: String) -> Self {
         SubmitOutcome {
