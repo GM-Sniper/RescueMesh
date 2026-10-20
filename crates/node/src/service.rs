@@ -258,6 +258,97 @@ mod tests {
         assert_eq!(svc.state.in_flight(), 0);
     }
 
+    // ---- Task 7b: Submit against the real store (10 default resources) and P2's
+    // planner, with real incidents from P2's seeded generator. No network.
+
+    use common::conversions::incident_to_pb;
+    use common::generators::generate_incident;
+
+    fn submit_req(request_id: &str, seed: u64) -> Request<SubmitRequest> {
+        Request::new(SubmitRequest {
+            request_id: request_id.into(),
+            kind: Some(submit_request::Kind::Incident(incident_to_pb(&generate_incident(seed)))),
+        })
+    }
+
+    #[tokio::test]
+    async fn valid_submit_returns_a_plan() {
+        let svc = service();
+        let reply = svc.submit(submit_req("r1", 7)).await.unwrap().into_inner();
+        assert_eq!(reply.request_id, "r1");
+        assert_eq!(reply.executor_node, 1);
+        assert!(!reply.duplicate);
+        let plan = reply.plan.expect("a plan");
+        assert_eq!(plan.incident_id, generate_incident(7).id);
+        assert_eq!(plan.assignments.len(), 1, "a free resource exists, so one is assigned");
+        assert_eq!(svc.state.store.applied().get(&1), Some(&1)); // one log entry
+    }
+
+    #[tokio::test]
+    async fn same_request_twice_gives_the_same_plan_once() {
+        let svc = service();
+        let first = svc.submit(submit_req("r1", 7)).await.unwrap().into_inner();
+        let again = svc.submit(submit_req("r1", 7)).await.unwrap().into_inner();
+        assert!(again.duplicate);
+        assert_eq!(again.plan, first.plan);
+        assert_eq!(svc.state.store.applied().get(&1), Some(&1)); // still one log entry
+        assert_eq!(svc.state.store.snapshot().assignments.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn bad_inputs_are_rejected_and_store_nothing() {
+        let svc = service();
+        let mut bad_incident = incident_to_pb(&generate_incident(7));
+        bad_incident.severity = 0;
+        let cases = [
+            submit_req("", 7), // empty request_id
+            Request::new(SubmitRequest { request_id: "r2".into(), kind: None }),
+            Request::new(SubmitRequest {
+                request_id: "r3".into(),
+                kind: Some(submit_request::Kind::Incident(bad_incident)),
+            }),
+        ];
+        for req in cases {
+            let err = svc.submit(req).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}", err.message());
+        }
+        assert!(svc.state.store.applied().is_empty());
+        assert_eq!(svc.state.in_flight(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_requests_never_double_book() {
+        let svc = Arc::new(service());
+        // 20 requests at once for 10 resources: they collide, and the handler re-plans.
+        let tasks: Vec<_> = (1..=20u64)
+            .map(|i| {
+                let svc = svc.clone();
+                tokio::spawn(async move { svc.submit(submit_req(&format!("r{i}"), i)).await })
+            })
+            .collect();
+        let mut aborted = Vec::new();
+        for (i, task) in (1..=20u64).zip(tasks) {
+            match task.await.unwrap() {
+                Ok(_) => {}
+                Err(s) if s.code() == tonic::Code::Aborted => aborted.push(i),
+                Err(s) => panic!("request r{i}: unexpected error {s:?}"),
+            }
+        }
+        // Retrying with the same request_id succeeds once the rush is over.
+        for i in aborted {
+            svc.submit(submit_req(&format!("r{i}"), i)).await.unwrap();
+        }
+
+        let snap = svc.state.store.snapshot();
+        let mut resources: Vec<u64> = snap.assignments.iter().map(|a| a.resource_id).collect();
+        let total = resources.len();
+        resources.sort();
+        resources.dedup();
+        assert_eq!(resources.len(), total, "a resource was given to two incidents");
+        assert_eq!(total, 10, "all 10 resources end up assigned, once each");
+        assert_eq!(svc.state.store.applied().get(&1), Some(&20)); // every request logged once
+    }
+
     // ---- Task 4: mute hook. `start_paused` = fake clock that jumps ahead whenever
     // everything is waiting, so these 10 s scenarios finish in milliseconds.
 
