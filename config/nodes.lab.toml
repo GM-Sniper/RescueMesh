@@ -1,0 +1,42 @@
+# The 3 real lab machines. Before running: replace each REPLACE-ME with that
+# machine's IPv4 address (ipconfig), keep the port. Until then a node refuses to
+# start ("addr ... is not ip:port"), so fake addresses can never be used by mistake.
+# Every machine uses this same file; only --id differs:
+#   cargo run --release -p node -- --id N --config config/nodes.lab.toml
+# Allow node.exe through each machine's firewall (private networks).
+
+[[nodes]]
+id = 1
+addr = "REPLACE-ME:50051"
+
+[[nodes]]
+id = 2
+addr = "REPLACE-ME:50051"
+
+[[nodes]]
+id = 3
+addr = "REPLACE-ME:50051"
+
+# Optional: any missing value falls back to the default shown.
+[timing]
+heartbeat_interval_ms = 500   # each node -> each peer
+suspect_after_ms = 1500       # 3 missed heartbeats -> peer suspected down
+rpc_deadline_ms = 1000        # longest wait for a peer's reply
+connect_timeout_ms = 500      # longest wait to open a connection
+
+# Planner scoring weights (P2). Optional; defaults are the worked example's.
+[weights]
+severity = 0.6
+age = 0.4
+capability = 0.7
+distance = 0.3
+
+# Load score for Step B's election (P3). Optional; defaults shown.
+[load]
+sample_interval_ms = 200
+queue_weight = 0.5
+cpu_weight = 0.3
+service_weight = 0.2
+queue_max = 10
+service_cap_ms = 100.0
+service_ewma_alpha = 0.2
