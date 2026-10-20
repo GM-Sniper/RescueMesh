@@ -5,6 +5,9 @@
 // (e.g. timeout()) are not called by anyone yet.
 #[allow(dead_code)]
 mod failure_detector;
+// P5: fault CSV. Not called yet: P1 wires it into the mute hook and the detector ticker.
+#[allow(dead_code)]
+mod fault_log;
 mod heartbeat;
 mod peers;
 mod service;
@@ -42,7 +45,9 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. Logging: "info" by default; RUST_LOG=debug shows every heartbeat.
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
         .init();
 
     // 3. Load and check the config, then find ourselves in it.
