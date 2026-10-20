@@ -16,6 +16,9 @@ mod load;
 mod peers;
 mod service;
 mod state;
+// P4: store and change log. Not called yet: wired by the Submit handler and replication.
+#[allow(dead_code)]
+mod store;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
