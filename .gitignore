@@ -1,2 +1,5 @@
 /target
+# loadgen output (CSV + metadata per run); can be large, so share runs on purpose, not by accident
+/results
+# node fault logs (P5's fault CSV per node)
 /logs

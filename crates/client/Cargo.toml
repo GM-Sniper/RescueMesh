@@ -2,5 +2,10 @@
 name = "client"
 version = "0.1.0"
 edition = "2024"
+default-run = "client"            # `cargo run -p client` runs the demo (src/main.rs), not the mock server
 
 [dependencies]
+common = { path = "../common" }   # generated proto code: SubmitRequest, SubmitReply, NodeClient, Node trait
+tonic.workspace = true            # gRPC: connections, sending requests, the mock server
+tokio.workspace = true            # async runtime: lets us .await network calls and run timeouts
+uuid.workspace = true             # makes a random, unique request_id for every request
