@@ -44,6 +44,10 @@ The handler is the function that runs when a client sends a request. Call the st
    - `UnknownResource`: the plan names a resource the store doesn't have. That is a bug today: return an error, don't retry.
 6. Reply to the client.
 
+In Step B the order changes. With the election, a node that already has the request still takes part and replies with the stored plan only if it wins (see `docs/p3-election-design.md`, Section 2, step 2). In Step A there is no election, so the steps above are right as they are.
+
+In Step B, a node that does not win the election replies with no plan (the plan field is absent). The winner always sets the plan, even when it is empty. So an absent plan means "this node was not the executor", and an empty plan means "this node was the executor and nothing was free".
+
 ## What to do with entries from other nodes (Step B)
 
 Pass each entry to `apply_remote(entry)`, reply to the sender with `acked_seq = applied()[source]` ("I have everything from that node up to this number"), then act on the result:
@@ -61,8 +65,8 @@ Pass each entry to `apply_remote(entry)`, reply to the sender with `acked_seq = 
 | What is open | Owner and step |
 |---|---|
 | The `Replicate` and `FetchLog` calls are missing from the gRPC service, so nobody can send or fetch log entries between nodes yet. Someone has to write those handlers. | P1 and P4, Step B |
-| When two nodes handle the same request, the store keeps whichever plan it applied first, but P3's Q4 says the plan from the lower node id should win. Undoing the first plan is not built; the options are in `DESIGN_LOG.md`. | P4 and P3, Step B |
-| When an entry from another node uses a resource that a local entry already took, the store keeps the first assignment and logs a warning. Nodes can end up with different state, and nothing fixes it yet. | P4, P1 and P3, Step B |
+| When two nodes handle the same request, the store keeps whichever plan it applied first, but P3's Q4 says the plan from the lower node id should win. Undoing the first plan is not built; the options are in `DESIGN_LOG.md`. Having exactly one executor per request only holds once replication has caught up. If a retry reaches a node that has not yet received the first entry, that node can win and execute the request too. The lower-origin rule (undo, Step B) is what makes all nodes end up with the same plan. | P4 and P3, Step B |
+| When an entry from another node uses a resource that a local entry already took, the store keeps the first assignment and logs a warning. Nodes can end up with different state, and nothing fixes it yet. This is likelier if a returning node bids before it has caught up (see `docs/p3-election-design.md`, Section 4), because it can plan from a stale snapshot. | P4, P1 and P3, Step B |
 | Nobody owns detecting and fixing conflicts yet. Proposal: P4 detects and records them in the store, P3 owns the rule, P2 adds the status value, P1 writes the handler. The spec wants a visible reconciliation state, so the incident and assignment status enum needs a conflict value. | P2 for the enum, whole team for owners, Steps B and C |
 | `UnknownResource` is a bug today. Once resources can expire or be offered by clients, a missing resource becomes normal and the handler should re-plan, as it does for `ResourceTaken`. | P4 and P1, Step B |
 | An unreadable entry is logged, counted as applied and skipped with a warning. That is a provisional choice; the alternatives are in `DESIGN_LOG.md`. | P4, Step B |
