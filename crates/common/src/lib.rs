@@ -13,4 +13,5 @@ pub mod config;
 pub mod conversions;
 pub mod domain;
 pub mod generators;
+pub mod load;
 pub mod planner;

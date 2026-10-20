@@ -25,3 +25,5 @@ tracing = "=0.1.44"                                   # logging calls (info!, wa
 tracing-subscriber = "=0.3.23"                        # prints those logs with timestamps
 serde = { version = "=1.0.229", features = ["derive"] }  # P2 domain types + config: Rust structs <-> TOML
 rand = "=0.8.8"                                       # P2 seeded generators
+# Added by P3 (load collector); only the "system" part, for CPU use:
+sysinfo = { version = "=0.38.4", default-features = false, features = ["system"] }

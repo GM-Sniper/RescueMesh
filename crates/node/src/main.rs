@@ -6,6 +6,7 @@
 mod failure_detector;
 // P5: fault CSV. Not called yet: wired with the mute hook (task 4) and detector (task 5).
 mod fault_log;
+mod load;
 mod peers;
 mod service;
 mod state;
@@ -63,6 +64,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 5. Shared state, given to the service now and to background tasks later.
     let state = Arc::new(NodeState::new(args.id, config, peers));
+    load::spawn_sampler(state.clone()); // P3: CPU sampling for the load score
 
     // 6. Open the doors: serve the Node service until Ctrl+C.
     tracing::info!(id = args.id, %listen, peers = ?peer_ids, "node listening");
