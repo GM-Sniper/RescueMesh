@@ -1,4 +1,4 @@
-# P1 Design Log: Protocol, Node, Transport, Fault Injection, Failure Detection
+# P1 Design Log: Protocol, Node, Transport, Fault Injection, Failure Detection, Submit
 
 Owner: P1. One entry per decision: what we chose, the alternatives, and why.
 Library boundary for the whole project: tonic carries bytes over HTTP/2 and prost encodes them. Everything below (message design, timeouts, heartbeats, failure detection, the mute hook) is our own code.
@@ -200,3 +200,47 @@ Expected detection time: 1.0 to 1.6 s after a node goes silent, depending on how
 | Broadcast deadline | caller's choice (default 1000 ms) | argument to `broadcast` | The whole fan-out, retry included; the election may choose a shorter T |
 | Longest mute | 20 000 ms | code (`service.rs`) | Course limit on an injected fault |
 | Client timeout (P6) | 5 s | `client::DEFAULT_TIMEOUT` | A client request; what ends a request held by a muted node |
+
+---
+
+## 9. Submit handler (task 7)
+
+### 9.1 The path of one request
+**What.** `handle_submit` in `service.rs`, in the order from P4's notes:
+1. check `request_id` is not empty and the request carries an incident (`invalid_argument` otherwise);
+2. `lookup_request`: an ID already handled gets its stored plan back with `duplicate = true`, and nothing is planned again;
+3. P2's `incident_from_pb` checks the incident (category, severity 1 to 10, location); its error text becomes `invalid_argument`;
+4. `snapshot` → P2's `planner::plan` → P4's `try_apply`, which re-checks under the store's lock that every planned resource is still free;
+5. reply with the plan, `executor_node` = this node, and `duplicate` from `try_apply`.
+
+Nothing is stored when a request is rejected.
+
+### 9.2 Re-plan up to 3 times, then `aborted`
+**What.** If `try_apply` says a planned resource was taken by another request between our snapshot and our write (`ResourceTaken`), the handler takes a new snapshot and plans again. After 3 conflicts in a row it replies `aborted` and logs a warning; the client may retry with the same `request_id`.
+**Alternatives.** Hold the store's lock across snapshot, plan and apply; retry forever; give up on the first conflict.
+**Why.** Holding the lock across the planner would make every request wait for every other one, which defeats P3's load balancing (P4's design log, same decision). Retrying forever has no upper bound on latency under heavy contention. Giving up at once fails far too often: with 20 simultaneous requests for 10 resources and a single attempt, 9 to 12 of the 20 failed; with 3 attempts the same test always ends with exactly 10 resources assigned, none twice. In a 1000-request run from 10 clients at once, about 1 request in 1000 is aborted, only in the opening burst while the last free resources are being taken.
+**`UnknownResource`** (the plan names a resource the store does not have) means the planner and the store disagree, a bug, so it is `internal`, not retried.
+
+### 9.3 The planner runs off the async threads
+**What.** `planner::plan` runs inside `tokio::task::spawn_blocking`.
+**Why.** The planner is pure CPU work. On the async threads, a slow plan would delay the heartbeat tasks sharing those threads, and peers could miss heartbeats and report false PeerDowns. Off them, heartbeats stay on time however heavy the planning is.
+
+### 9.4 `now` is this node's wall clock
+**What.** The planner's `now` (incident age) and the log entry's timestamp are this node's Unix time in milliseconds.
+**Caveat.** Machines' clocks differ. That is harmless here: the age only weighs priorities inside one plan, and ordering between nodes uses `(source_node, seq)`, never timestamps (P4's design log). Keep lab clocks synced anyway, because P6 and P5 compare CSV timestamps across machines.
+
+### 9.5 Not tested: a mute that starts in the middle of a request
+A request that passed the entry gate and is then muted has its reply dropped at the second gate, and its in-flight guard was already dropped before that gate (4.3), so the held time is neither counted nor timed. There is no automated test for it: the planner finishes in under a millisecond, so a test cannot reliably start a mute during it, and a test that only sometimes hits the case would be flaky. The ordering is visible in the four lines of `submit()`, and the gate itself is tested on its own (task 4 tests).
+
+### 9.6 Evidence
+- Unit tests with the real store, planner and incidents: a valid request gets a plan; the same ID twice gives the same plan once (`duplicate = true`, one log entry); bad inputs store nothing; 20 concurrent requests never double-book a resource.
+- 3 real nodes, P6's client and load generator against node 1 (release build): the client gets plans and `duplicate = true` on a resend; 3 runs of 1000 requests from 10 clients gave 1000, 999 and 999 `ok`, all with `executor_node = 1`, about 10 000 requests per second; each error matched one `submit aborted` warning in node 1's log.
+
+---
+
+## 10. Fault log wiring (task 7)
+
+**What.** Each node appends P5's fault CSV to `logs/faults-node<N>.csv` (git-ignored): `MUTE_START` when a fault order is accepted, `MUTE_END` when the mute ends (the muted node writes both), and `PEER_DOWN` / `PEER_UP` from the detector ticker on every other node. `--run-id` names the run in every row; pass loadgen's `--run-id` so P6 can join the files. Default: `run-<unix seconds>`, as in loadgen.
+**Alternatives.** One file per run; logging from inside the failure detector.
+**Why.** Appending keeps a restarted node's rows in the same file (P5's `open` writes the header only once), and the run ID column separates runs. The ticker already turns detector changes into log lines, so the CSV rows are written at the same point; the detector stays a pure data structure. The log is optional in `NodeState`, so unit tests write no files.
+**Evidence.** 3 real nodes, node 2 muted for 3 s by the injector: node 2 wrote `MUTE_START` and `MUTE_END` 3.01 s apart; node 3 wrote `PEER_DOWN` 1.14 s and node 1 1.53 s after the mute started; both wrote `PEER_UP` 0.15 to 0.2 s after it ended. A unit test checks the two mute rows on a fake clock.

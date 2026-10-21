@@ -15,8 +15,10 @@ use tonic::transport::Channel;
 use tokio::time::{Instant, sleep_until};
 
 use crate::failure_detector::{FailureDetector, PeerEvent};
+use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
 use crate::peers::Peers;
+use crate::store::Store;
 
 pub struct NodeState {
     pub id: NodeId,
@@ -27,6 +29,8 @@ pub struct NodeState {
     in_flight: AtomicUsize,
     /// P3: CPU and service-time samples behind this node's load score (see load.rs).
     pub load: LoadCollector,
+    /// P4: incidents, resources, assignments and the change log (see store.rs).
+    pub store: Store,
     /// When the current mute ends; None = never muted (task 4).
     /// An end time instead of an on/off flag: nothing has to switch it back off,
     /// and overlapping mutes just keep the later end.
@@ -35,7 +39,8 @@ pub struct NodeState {
     /// Private: used only through heard_from / check_peers / alive_peers, so the
     /// time always comes from the same clock and the lock is held only briefly.
     detector: Mutex<FailureDetector>,
-    // Added later: store (P4).
+    /// P5's fault CSV (MUTE_START/END, PEER_DOWN/UP). None in tests, so they write no files.
+    pub fault_log: Option<FaultLog>,
 }
 
 impl NodeState {
@@ -49,9 +54,17 @@ impl NodeState {
             peers,
             in_flight: AtomicUsize::new(0),
             load,
+            store: Store::with_default_resources(id),
             muted_until: Mutex::new(None),
             detector: Mutex::new(detector),
+            fault_log: None,
         }
+    }
+
+    /// Turns on the fault CSV (main does this; tests leave it off).
+    pub fn with_fault_log(mut self, log: FaultLog) -> Self {
+        self.fault_log = Some(log);
+        self
     }
 
     /// P3's hook: how many requests this node is working on right now.
