@@ -43,7 +43,8 @@ pub fn spawn_ticker(state: Arc<NodeState>) {
             for event in state.check_peers() {
                 match event {
                     PeerEvent::PeerDown(peer) => {
-                        tracing::warn!(peer, "peer suspected down");
+                        // error, not warn: printed in red, the event to spot in a node's window.
+                        tracing::error!(peer, "peer suspected down");
                         if let Some(log) = &state.fault_log {
                             log.peer_down(peer);
                         }

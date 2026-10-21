@@ -137,7 +137,7 @@ try {
     # ---- 4. A fault while serving ----------------------------------------------
     Say "Step 4: node 2 goes silent for 6 s WHILE node 1 serves 500 requests (100 per second)"
     Note "Node 2 confirms, then stops answering and stops sending. Nobody tells the others:"
-    Note "nodes 1 and 3 print 'WARN peer suspected down peer=2' about 1.5 s later, on their own."
+    Note "nodes 1 and 3 print 'ERROR peer suspected down peer=2' (red) about 1.5 s later, on their own."
     Note "Node 1 keeps answering clients the whole time."
     & "$bin\inject.exe" --node 2 --duration 6s
     Run-Load "$runId-fault" 500 100
@@ -146,7 +146,7 @@ try {
 
     # ---- 5. A real crash -----------------------------------------------------
     Say "Step 5: a real crash - killing node 3's process"
-    Note "Watch: nodes 1 and 2 print 'peer suspected down peer=3' after about 1.5 s."
+    Note "Watch: nodes 1 and 2 print 'ERROR peer suspected down peer=3' (red) after about 1.5 s."
     $killUs = NowUs
     Stop-Node 3
     Pause-Step 3

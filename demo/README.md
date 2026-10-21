@@ -29,7 +29,7 @@ The first run builds in release mode and takes a minute or two; run `-Auto` once
 "Now 600 per second, more than 10 resources can serve (about 330 per second). About half the requests find nothing free at that moment, races become much more frequent, and a few requests lose three times in a row and are told to retry. That is how the system behaves when demand exceeds supply: it answers fast and honestly, it does not slow down or double-book."
 
 **Step 4: a fault while serving.**
-"The fault injector tells node 2 to go silent for 6 seconds, and at the same time node 1 serves 500 more requests. Nobody tells nodes 1 and 3." Point at windows 1 and 3: "After about 1.5 seconds, three missed heartbeats, both mark node 2 as suspected down, each on its own." Then the summary: "And node 1 answered every request: a failed peer does not stop the service. When the 6 seconds are over, node 2 comes back by itself."
+"The fault injector tells node 2 to go silent for 6 seconds, and at the same time node 1 serves 500 more requests. Nobody tells nodes 1 and 3." Point at windows 1 and 3: "After about 1.5 seconds, three missed heartbeats, both mark node 2 as suspected down, each on its own" (the red ERROR lines). Then the summary: "And node 1 answered every request: a failed peer does not stop the service. When the 6 seconds are over, node 2 comes back by itself."
 If asked why it does not just return an error: "A crashed machine never says it is down. If it answered with an error, the others would know instantly, and our detection and failover measurements would be meaningless."
 
 **Step 5: a real crash.**
