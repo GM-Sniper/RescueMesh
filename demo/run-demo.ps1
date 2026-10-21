@@ -174,10 +174,6 @@ try {
         Note ("Detection, {0}: {1}" -f $case.name, ($times -join ", "))
     }
     Pause-Step 1
-
-    # ---- 7. Evidence -----------------------------------------------------------
-    Say "Step 7: the automated tests (Submit, mute, failure detection, broadcast, planner, ...)"
-    cargo test -q --workspace 2>&1 | Select-String "test result: .* [1-9]\d* passed"
 } finally {
     Say "Stopping all nodes"
     foreach ($id in @($nodes.Keys)) {

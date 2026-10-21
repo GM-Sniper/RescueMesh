@@ -38,9 +38,6 @@ If asked why it does not just return an error: "A crashed machine never says it 
 **Step 6: the fault log.**
 "Every node writes its own fault log: when it was muted, and when it noticed a peer go down or come back. The script lines them up on one timeline and computes the detection time: about 1.3 to 1.4 seconds, for the mute and for the crash. These files, together with the load generator's CSV, are what our experiments and graphs are built from."
 
-**Step 7: tests.**
-"Everything shown is also covered by about a hundred automated tests: the request path with the real store and planner, including 20 simultaneous requests for 10 resources that never double-book; the mute behaviour on a simulated clock; a test with three real nodes where one is muted and comes back; and the broadcast helper the election will use in Step B."
-
 ## Likely questions
 | Question | Answer |
 |---|---|
