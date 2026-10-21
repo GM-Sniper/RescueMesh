@@ -168,12 +168,18 @@ async fn handle_submit(
             }
         }
     }
-    // Conflicts every time: the client may retry with the same request_id.
-    // warn: the client only sees "error", so the node's log must say why.
-    tracing::warn!(%request_id, "submit aborted: resources kept changing during planning");
+    // Lost the race every time: nothing was saved; the client may retry with the same request_id.
+    // debug, not warn: under overload this happens in bursts, and the once-a-second
+    // summary already counts it ("gave up"). Show with RUST_LOG=node::service=debug.
+    tracing::debug!(
+        %request_id,
+        attempts = MAX_PLAN_ATTEMPTS,
+        "submit gave up: every planned resource was taken by another request before it could be saved"
+    );
     SubmitStats::add(&state.stats.aborted);
     Err(Status::aborted(format!(
-        "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
+        "gave up after {MAX_PLAN_ATTEMPTS} attempts: each time, the resource we planned was taken \
+         by another request before we could save it; nothing was saved, retry with the same request_id"
     )))
 }
 

@@ -75,7 +75,7 @@ function Run-Load($name, $requests, $rate) {
     Write-Host ("  Requests   {0} sent, {1} answered (executed by {2}), {3} failed" -f $rows.Count, $ok.Count, $executors, ($rows.Count - $ok.Count)) -ForegroundColor White
     Write-Host ("  Resources  {0} got one, {1} found none free at that moment" -f $d.assigned, $d.none_free) -ForegroundColor Green
     Write-Host ("  Races      {0} times a request lost a resource to another and planned again;" -f $d.replans) -ForegroundColor Yellow
-    Write-Host ("             {0} gave up after 3 tries (the client may retry); never double-booked" -f $d.aborted) -ForegroundColor Yellow
+    Write-Host ("             {0} gave up after losing 3 races in a row (nothing saved; the client may retry)" -f $d.aborted) -ForegroundColor Yellow
     if ($lat.Count -gt 0) {
         Write-Host ("  Latency    typical {0:N1} ms, 99% under {1:N1} ms, slowest {2:N1} ms" -f (& $pct 0.50), (& $pct 0.99), $lat[-1]) -ForegroundColor White
     }
