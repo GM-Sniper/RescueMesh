@@ -156,6 +156,8 @@ async fn handle_submit(
         }
     }
     // Conflicts every time: the client may retry with the same request_id.
+    // warn: the client only sees "error", so the node's log must say why.
+    tracing::warn!(%request_id, "submit aborted: resources kept changing during planning");
     Err(Status::aborted(format!(
         "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
     )))
