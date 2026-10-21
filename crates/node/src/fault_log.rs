@@ -18,7 +18,7 @@
 //! `wall_ts_us` is the wall clock (microseconds since 1970), because rows from
 //! different machines are compared. Keep the machines' clocks synced (chrony/NTP).
 //!
-//! Who calls what (not wired yet):
+//! Who calls what (wired by P1 in task 7d):
 //!   - P1's mute hook (task 4): `mute_start` after sending the FaultAck, `mute_end` when the timer ends.
 //!   - The detector ticker (task 5): `peer_down` / `peer_up` for each event from `tick()`.
 
