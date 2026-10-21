@@ -17,6 +17,7 @@ use common::planner;
 use tonic::{Request, Response, Status};
 
 use crate::state::NodeState;
+use crate::stats::SubmitStats;
 use crate::store::ApplyError;
 
 pub struct NodeService {
@@ -92,7 +93,7 @@ const MAX_PLAN_ATTEMPTS: usize = 3;
 /// Task 7: one client request, in the order from P4's notes (docs/p4-changes.md):
 /// lookup_request -> incident_from_pb -> snapshot -> plan -> try_apply -> reply.
 async fn handle_submit(
-    state: &NodeState,
+    state: &Arc<NodeState>, // Arc: the mission timers keep their own handle
     req: SubmitRequest,
 ) -> Result<Response<SubmitReply>, Status> {
     // 1. Every request needs its ID (idempotency) and an incident (the only kind in Step A).
@@ -114,6 +115,7 @@ async fn handle_submit(
 
     // 2. Already handled: the same answer again, never a second plan.
     if let Some(stored) = state.store.lookup_request(&request_id) {
+        SubmitStats::add(&state.stats.repeats);
         return Ok(reply(&stored, true));
     }
 
@@ -144,9 +146,19 @@ async fn handle_submit(
                     attempt,
                     "submit applied"
                 );
+                let stats = &state.stats;
+                if applied.duplicate {
+                    SubmitStats::add(&stats.repeats);
+                } else if applied.plan.assignments.is_empty() {
+                    SubmitStats::add(&stats.none_free);
+                } else {
+                    SubmitStats::add(&stats.assigned);
+                    start_missions(state, &applied.plan);
+                }
                 return Ok(reply(&applied.plan, applied.duplicate));
             }
             Err(ApplyError::ResourceTaken { resource_id }) => {
+                SubmitStats::add(&state.stats.replans);
                 tracing::debug!(%request_id, attempt, resource_id, "resource taken meanwhile; planning again");
             }
             Err(ApplyError::UnknownResource { resource_id }) => {
@@ -159,9 +171,27 @@ async fn handle_submit(
     // Conflicts every time: the client may retry with the same request_id.
     // warn: the client only sees "error", so the node's log must say why.
     tracing::warn!(%request_id, "submit aborted: resources kept changing during planning");
+    SubmitStats::add(&state.stats.aborted);
     Err(Status::aborted(format!(
         "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
     )))
+}
+
+/// Demo branch (temporary, agreed with P4): when the node runs with a mission time,
+/// each assigned resource is freed again once its mission is over.
+fn start_missions(state: &Arc<NodeState>, plan: &Plan) {
+    let Some(mission) = state.mission else {
+        return; // no mission time: resources stay assigned, as on main
+    };
+    for a in &plan.assignments {
+        let (state, resource_id, incident_id) = (state.clone(), a.resource_id, a.incident_id);
+        tokio::spawn(async move {
+            tokio::time::sleep(mission).await;
+            if state.store.release(resource_id, incident_id) {
+                SubmitStats::add(&state.stats.released);
+            }
+        });
+    }
 }
 
 /// The node's wall clock in Unix milliseconds (the planner's `now`, the log entry's timestamp).
@@ -279,6 +309,28 @@ mod tests {
             request_id: request_id.into(),
             kind: Some(submit_request::Kind::Incident(incident_to_pb(&generate_incident(seed)))),
         })
+    }
+
+    #[tokio::test]
+    async fn resources_come_back_after_their_mission() {
+        let cfg = ClusterConfig::parse("[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n").unwrap();
+        let peers = Peers::new(&cfg, 1).unwrap();
+        let state = NodeState::new(1, cfg, peers).with_mission(Duration::from_millis(100));
+        let svc = NodeService::new(Arc::new(state));
+
+        for i in 0..10 {
+            svc.submit(submit_req(&format!("r{i}"), i)).await.unwrap();
+        }
+        let full = svc.submit(submit_req("r10", 10)).await.unwrap().into_inner();
+        assert!(full.plan.unwrap().assignments.is_empty(), "all 10 busy");
+
+        tokio::time::sleep(Duration::from_millis(300)).await; // missions end
+        let after = svc.submit(submit_req("r11", 11)).await.unwrap().into_inner();
+        assert_eq!(after.plan.unwrap().assignments.len(), 1, "a freed resource is reused");
+
+        let s = &svc.state.stats;
+        let n = |c: &std::sync::atomic::AtomicU64| c.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!((n(&s.assigned), n(&s.none_free), n(&s.released)), (11, 1, 10));
     }
 
     #[tokio::test]

@@ -18,6 +18,7 @@ use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
 use crate::peers::Peers;
+use crate::stats::SubmitStats;
 use crate::store::Store;
 
 pub struct NodeState {
@@ -41,6 +42,11 @@ pub struct NodeState {
     detector: Mutex<FailureDetector>,
     /// P5's fault CSV (MUTE_START/END, PEER_DOWN/UP). None in tests, so they write no files.
     pub fault_log: Option<FaultLog>,
+    /// Demo branch: Submit counters behind the once-a-second summary (see stats.rs).
+    pub stats: SubmitStats,
+    /// Demo branch (temporary, agreed with P4): how long an assigned resource stays busy
+    /// before it is freed again. None = never freed, as on main.
+    pub mission: Option<Duration>,
 }
 
 impl NodeState {
@@ -58,7 +64,15 @@ impl NodeState {
             muted_until: Mutex::new(None),
             detector: Mutex::new(detector),
             fault_log: None,
+            stats: SubmitStats::default(),
+            mission: None,
         }
+    }
+
+    /// Demo branch: free each assigned resource again `d` after it was assigned.
+    pub fn with_mission(mut self, d: Duration) -> Self {
+        self.mission = Some(d);
+        self
     }
 
     /// Turns on the fault CSV (main does this; tests leave it off).

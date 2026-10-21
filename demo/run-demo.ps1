@@ -18,8 +18,10 @@ $logDir = Join-Path $root "logs\demo"
 $resultsDir = Join-Path $logDir "results"
 # One name for this run: written in every fault-log row and every loadgen file.
 $runId = "demo-$(Get-Date -Format yyyyMMdd-HHmmss)"
-# Node 1 also prints one line per request it applies ("submit applied").
-$node1Log = "info,node::service=debug"
+# Temporary (demo branch, agreed with P4): an assigned resource is busy for this long,
+# then free again. Scaled-down time: 30 ms stands in for a real mission.
+$missionMs = 30
+$statsFile = Join-Path $root "logs\submit-stats-node1.txt"
 $nodes = @{}
 
 function Say($text) { Write-Host ""; Write-Host $text -ForegroundColor Cyan }
@@ -32,17 +34,50 @@ function Pause-Step($seconds) {
 }
 
 function Start-Node($id) {
-    $level = if ($id -eq 1) { $node1Log } else { "info" }
     if ($Auto) {
-        $env:RUST_LOG = $level # inherited by the process started next
-        $nodes[$id] = Start-Process -FilePath "$bin\node.exe" -ArgumentList "--id", $id, "--run-id", $runId `
+        $nodes[$id] = Start-Process -FilePath "$bin\node.exe" `
+            -ArgumentList "--id", $id, "--run-id", $runId, "--mission-ms", $missionMs `
             -RedirectStandardOutput "$logDir\node$id-$(Get-Random).log" `
             -RedirectStandardError "$logDir\node$id-$(Get-Random).err" -PassThru -WindowStyle Hidden
-        Remove-Item Env:RUST_LOG
     } else {
-        $cmd = "`$host.UI.RawUI.WindowTitle = 'RescueMesh node $id'; `$env:RUST_LOG = '$level'; " +
-               "& '$bin\node.exe' --id $id --run-id $runId"
+        $cmd = "`$host.UI.RawUI.WindowTitle = 'RescueMesh node $id'; " +
+               "& '$bin\node.exe' --id $id --run-id $runId --mission-ms $missionMs"
         $nodes[$id] = Start-Process powershell -ArgumentList "-NoExit", "-Command", $cmd -PassThru
+    }
+}
+
+# Node 1's counters (logs\submit-stats-node1.txt, rewritten every second), as a hashtable.
+function Read-Stats {
+    $s = @{}
+    if (Test-Path $statsFile) {
+        Get-Content $statsFile | ForEach-Object { $k, $v = $_ -split "=", 2; $s[$k] = [int64]$v }
+    }
+    $s
+}
+
+# Runs loadgen, then prints one readable block: requests, resources, races, latency.
+function Run-Load($name, $requests, $rate) {
+    $before = Read-Stats
+    & "$bin\loadgen.exe" --requests $requests --clients 10 --rate $rate --out $resultsDir --run-id $name |
+        Where-Object { $_ -notmatch "^wrote" }
+    Start-Sleep -Milliseconds 1500 # node 1 rewrites its stats file once a second
+    $after = Read-Stats
+    $d = @{}
+    foreach ($k in "assigned", "none_free", "repeats", "replans", "aborted") { $d[$k] = [int64]$after[$k] - [int64]$before[$k] }
+
+    $rows = Import-Csv (Join-Path $resultsDir "$name.csv")
+    $ok = @($rows | Where-Object { $_.status -eq "ok" })
+    $lat = @($ok | ForEach-Object { [double]$_.latency_us / 1000 } | Sort-Object)
+    $pct = { param($p) $lat[[math]::Min($lat.Count - 1, [math]::Floor($p * $lat.Count))] }
+    $executors = ($ok | Group-Object executor_node | ForEach-Object { "node $($_.Name)" }) -join ", "
+
+    Write-Host ""
+    Write-Host ("  Requests   {0} sent, {1} answered (executed by {2}), {3} failed" -f $rows.Count, $ok.Count, $executors, ($rows.Count - $ok.Count)) -ForegroundColor White
+    Write-Host ("  Resources  {0} got one, {1} found none free at that moment" -f $d.assigned, $d.none_free) -ForegroundColor Green
+    Write-Host ("  Races      {0} times a request lost a resource to another and planned again;" -f $d.replans) -ForegroundColor Yellow
+    Write-Host ("             {0} gave up after 3 tries (the client may retry); never double-booked" -f $d.aborted) -ForegroundColor Yellow
+    if ($lat.Count -gt 0) {
+        Write-Host ("  Latency    typical {0:N1} ms, 99% under {1:N1} ms, slowest {2:N1} ms" -f (& $pct 0.50), (& $pct 0.99), $lat[-1]) -ForegroundColor White
     }
 }
 
@@ -56,19 +91,6 @@ function Stop-Node($id) {
     }
 }
 
-# Reads loadgen's CSV and prints the counts and the latency percentiles.
-function Show-LoadSummary($name) {
-    $rows = Import-Csv (Join-Path $resultsDir "$name.csv")
-    $ok = @($rows | Where-Object { $_.status -eq "ok" })
-    $lat = @($ok | ForEach-Object { [double]$_.latency_us / 1000 } | Sort-Object)
-    $pct = { param($p) $lat[[math]::Min($lat.Count - 1, [math]::Floor($p * $lat.Count))] }
-    $executors = ($ok | Group-Object executor_node | ForEach-Object { "node $($_.Name): $($_.Count)" }) -join ", "
-    Note ("{0} requests: {1} ok, {2} not ok   (executor: {3})" -f $rows.Count, $ok.Count, ($rows.Count - $ok.Count), $executors)
-    if ($lat.Count -gt 0) {
-        Note ("latency: p50 {0:N2} ms, p99 {1:N2} ms, max {2:N2} ms" -f (& $pct 0.50), (& $pct 0.99), $lat[-1])
-    }
-}
-
 # ---- 0. Build ----------------------------------------------------------------
 Say "Step 0: building everything (release, so the timings are real)"
 cargo build -q --release -p node -p injector -p client -p loadgen
@@ -76,6 +98,7 @@ if ($LASTEXITCODE -ne 0) { throw "build failed" }
 New-Item -ItemType Directory -Force $logDir, $resultsDir | Out-Null
 # Auto mode prints logs\demo\*.log at the end: start from an empty folder.
 if ($Auto) { Remove-Item "$logDir\*.log", "$logDir\*.err" -ErrorAction SilentlyContinue }
+Remove-Item $statsFile -ErrorAction SilentlyContinue # node 1's counters start from zero
 Note "Run name: $runId"
 
 try {
@@ -90,19 +113,25 @@ try {
     # ---- 2. One real request ---------------------------------------------------
     Say "Step 2: a client sends 5 emergencies to node 1"
     Note "Node 1 checks each one, takes a snapshot of the free resources, runs the planner,"
-    Note "stores the plan and replies. Node 1's window prints 'submit applied assigned=1'."
-    Note "Then the client resends the first request with the SAME ID: the stored plan comes"
-    Note "back (duplicate=true) and nothing is planned or stored twice."
+    Note "stores the plan and replies. Then the client resends the first request with the"
+    Note "SAME ID: the stored plan comes back (duplicate=true), nothing is planned twice."
+    Note "Node 1's window prints a one-line summary each second while requests arrive."
     & "$bin\client.exe" --count 5 --seed 100
-    Pause-Step 1
+    Pause-Step 2
 
     # ---- 3. Load -----------------------------------------------------------------
-    Say "Step 3: load test - 10 clients send 1000 requests to node 1 as fast as they can"
-    Note "Only 10 resources exist and none are released in Step A: the first ones get a"
-    Note "resource, the rest get an empty plan ('nothing free'). No resource is ever given"
-    Note "twice: a request that loses a race for a resource is planned again."
-    & "$bin\loadgen.exe" --requests 1000 --clients 10 --out $resultsDir --run-id "$runId-load" | Select-Object -First 2
-    Show-LoadSummary "$runId-load"
+    Say "Step 3a: normal load - 10 clients send 1000 requests to node 1, 200 per second"
+    Note "10 resources (ambulances, fire trucks, ...). Each assignment is a mission: the"
+    Note "resource is busy for $missionMs ms (scaled-down time), then free again. Many requests"
+    Note "arrive at the same moment and want the same best resource: the store re-checks"
+    Note "every plan when saving, so the loser plans again on fresh data."
+    Run-Load "$runId-normal" 1000 200
+    Pause-Step 1
+
+    Say "Step 3b: overload - the same 1000 requests at 600 per second"
+    Note "10 resources x one $missionMs ms mission each can serve about 330 per second. Above"
+    Note "that some requests find nothing free, and races get more frequent."
+    Run-Load "$runId-overload" 1000 600
     Pause-Step 1
 
     # ---- 4. A fault while serving ----------------------------------------------
@@ -111,8 +140,7 @@ try {
     Note "nodes 1 and 3 print 'WARN peer suspected down peer=2' about 1.5 s later, on their own."
     Note "Node 1 keeps answering clients the whole time."
     & "$bin\inject.exe" --node 2 --duration 6s
-    & "$bin\loadgen.exe" --requests 500 --clients 10 --rate 100 --out $resultsDir --run-id "$runId-fault" | Select-Object -First 2
-    Show-LoadSummary "$runId-fault"
+    Run-Load "$runId-fault" 500 100
     Note "When the 6 s are over node 2 comes back by itself: 'INFO peer alive again peer=2'."
     if ($Auto) { Start-Sleep -Seconds 3 } else { Pause-Step 0 }
 
@@ -159,10 +187,10 @@ try {
 }
 
 if ($Auto) {
-    Say "Node logs (Auto mode; node 1's 'submit applied' lines left out)"
+    Say "Node logs (Auto mode)"
     Get-ChildItem $logDir -Filter *.log | Sort-Object LastWriteTime | ForEach-Object {
         Write-Host "--- $($_.Name)" -ForegroundColor Yellow
-        Get-Content $_.FullName | Where-Object { $_ -notmatch "submit applied" } |
+        Get-Content $_.FullName |
             ForEach-Object { $_ -replace '^\d{4}-\d\d-\d\dT', '' }
     }
 }

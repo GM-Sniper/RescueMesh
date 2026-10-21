@@ -14,6 +14,7 @@ mod load;
 mod peers;
 mod service;
 mod state;
+mod stats;
 // P4: store and change log. Used by the Submit handler; the replication functions
 // (apply_remote, entries_since, applied) are not called until Step B.
 #[allow(dead_code)]
@@ -21,7 +22,7 @@ mod store;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context;
 use clap::Parser;
@@ -48,6 +49,10 @@ struct Args {
     /// Default: run-<unix seconds>, like loadgen.
     #[arg(long)]
     run_id: Option<String>,
+    /// Demo branch (temporary, agreed with P4): free each assigned resource again after
+    /// this many ms, as if its mission ended. 0 = never, as on main.
+    #[arg(long, default_value_t = 0)]
+    mission_ms: u64,
 }
 
 #[tokio::main]
@@ -88,16 +93,21 @@ async fn main() -> anyhow::Result<()> {
     let log_path = format!("logs/faults-node{}.csv", args.id);
     let fault_log = FaultLog::open(&log_path, args.id, &run_id)
         .with_context(|| format!("cannot open fault log {log_path}"))?;
-    let state = Arc::new(NodeState::new(args.id, config, peers).with_fault_log(fault_log));
+    let mut state = NodeState::new(args.id, config, peers).with_fault_log(fault_log);
+    if args.mission_ms > 0 {
+        state = state.with_mission(Duration::from_millis(args.mission_ms));
+    }
+    let state = Arc::new(state);
 
     // 6. Background tasks: CPU sampling for the load score (P3), heartbeats to
     //    each peer, and the detector ticker.
     load::spawn_sampler(state.clone());
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
+    stats::spawn_reporter(state.clone()); // demo branch: one summary line per second, if anything changed
 
     // 7. Open the doors: serve the Node service until Ctrl+C.
-    tracing::info!(id = args.id, %listen, peers = ?peer_ids, %run_id, fault_log = %log_path, "node listening");
+    tracing::info!(id = args.id, %listen, peers = ?peer_ids, %run_id, fault_log = %log_path, mission_ms = args.mission_ms, "node listening");
     tonic::transport::Server::builder()
         .add_service(NodeServer::new(NodeService::new(state)))
         .serve(listen)

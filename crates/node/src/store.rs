@@ -232,6 +232,26 @@ impl Store {
         })
     }
 
+    /// TEMP (demo branch only, agreed with P4, who replaces it with a proper release
+    /// operation): the mission is over, so the resource is free again and the incident
+    /// is resolved. Local only: not a log entry, so it does not replicate in Step B.
+    /// Frees the resource only if it still serves `incident_id`; returns whether it did.
+    pub fn release(&self, resource_id: ResourceId, incident_id: IncidentId) -> bool {
+        let mut g = self.write();
+        if !g
+            .assignments
+            .get(&resource_id)
+            .is_some_and(|a| a.incident_id == incident_id)
+        {
+            return false;
+        }
+        g.assignments.remove(&resource_id);
+        if let Some(incident) = g.incidents.get_mut(&incident_id) {
+            incident.status = IncidentStatus::Resolved;
+        }
+        true
+    }
+
     /// Replication path: apply an entry created by another node. Idempotent; never buffers.
     pub fn apply_remote(&self, entry: pb::LogEntry) -> RemoteOutcome {
         let mut g = self.write();
@@ -386,6 +406,20 @@ mod tests {
 
     fn apply(s: &Store, rid: &str, inc: u64, res: &[u64]) -> Applied {
         s.try_apply(rid, incident(inc), plan(inc, res), 99).unwrap()
+    }
+
+    #[test]
+    fn release_frees_the_resource_only_for_its_own_incident() {
+        let s = store(1, 3);
+        apply(&s, "r1", 10, &[2]);
+        assert!(!s.release(2, 11), "another incident cannot free it");
+        assert!(s.release(2, 10));
+        assert!(!s.release(2, 10), "already free");
+        let snap = s.snapshot();
+        assert!(snap.assignments.is_empty());
+        assert_eq!(snap.incidents[0].status, IncidentStatus::Resolved);
+        // Free again: a new request can take it.
+        assert_eq!(apply(&s, "r2", 12, &[2]).plan.assignments.len(), 1);
     }
 
     #[test]
