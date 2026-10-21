@@ -50,7 +50,8 @@ impl Node for NodeService {
         self.gate().await?; // muted: arriving requests are held
         let hb = req.into_inner();
         // debug, not info: 2 peers x 2 per second would flood the log. Show with RUST_LOG=debug.
-        tracing::debug!(from = hb.from_node, seq = hb.seq, "heartbeat received");
+        // Logged under node::heartbeat, so RUST_LOG=node::service=debug shows only requests.
+        tracing::debug!(target: "node::heartbeat", from = hb.from_node, seq = hb.seq, "heartbeat received");
         // A peer's own heartbeat is proof it is alive (and how a returning node
         // announces itself). Clients (0) and unknown IDs are ignored by the detector.
         self.state.heard_from(hb.from_node);
