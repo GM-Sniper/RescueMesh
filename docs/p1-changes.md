@@ -93,3 +93,16 @@ End to end (release build, 3 nodes, P6's loadgen, 1000 requests from 10 clients)
 - Before Wednesday: the real machines' IPs for `nodes.lab.toml`, allowing `node.exe` through each machine's firewall, and syncing the machines' clocks.
 - Open question with P5: heartbeats received also count as "heard" (design log 7.3); P5's doc says replies only.
 - Step B: the election (P3, PR #12) and replication use `broadcast()`.
+
+## To handle later (found while building the demo)
+**1. "Suspected down" is a suspicion, not a fact.** No timeout can tell a crashed node from a slow one or from one broken link, so a live node can be wrongly suspected (it is seen alive again at its next heartbeat).
+- Step B: the election and replication must stay correct when a suspicion is wrong (a wrongly suspected node just misses a round; `request_id` / terms keep a late answer harmless). Agree this rule with P3 and P4.
+- Count false alarms in the experiments: a `PEER_DOWN` with no matching `MUTE_START` or crash in the fault logs.
+- If false alarms matter: before suspecting a peer, ask another node to reach it (indirect probe, as in SWIM). This catches a single broken link. Step C at the earliest.
+
+**2. Retries.**
+- Inside the node: after a lost race, `Submit` plans again immediately (up to 3 times). Two colliding requests then often pick the same next resource and collide again. Try a short random wait (0-2 ms) between attempts and measure the "gave up" count under overload before and after.
+- Client side: nobody retries yet. An `aborted` (gave up) or `unavailable` (node muted) reply ends the request, and loadgen counts it as an error. P6: retry with the **same** `request_id`, after a short growing wait, a limited number of times.
+- Empty plans: a request that finds no free resource is answered at once and its incident stays `Open`. Decide with P4 whether to queue it until a resource is released.
+
+**3. Resource release (P4).** The demo branch frees each resource after `--mission-ms` with a temporary local `Store::release`. P4 replaces it with a "resource released" log entry, so the release replicates in Step B.
