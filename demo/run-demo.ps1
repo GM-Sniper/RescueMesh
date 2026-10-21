@@ -74,6 +74,8 @@ Say "Step 0: building everything (release, so the timings are real)"
 cargo build -q --release -p node -p injector -p client -p loadgen
 if ($LASTEXITCODE -ne 0) { throw "build failed" }
 New-Item -ItemType Directory -Force $logDir, $resultsDir | Out-Null
+# Auto mode prints logs\demo\*.log at the end: start from an empty folder.
+if ($Auto) { Remove-Item "$logDir\*.log", "$logDir\*.err" -ErrorAction SilentlyContinue }
 Note "Run name: $runId"
 
 try {
@@ -132,7 +134,7 @@ try {
         Where-Object { $_.run_id -eq $runId } | Sort-Object { [int64]$_.wall_ts_us }
     $t0 = [int64]$rows[0].wall_ts_us
     foreach ($r in $rows) {
-        $what = if ($r.peer_id) { "peer $($r.peer_id)" } else { "$($r.duration_ms) ms" }
+        $what = if ($r.peer_id) { "peer $($r.peer_id)" } elseif ($r.duration_ms) { "$($r.duration_ms) ms" } else { "" }
         Note ("+{0,6:N2} s   node {1}  {2,-10}  {3}" -f (([int64]$r.wall_ts_us - $t0) / 1e6), $r.node_id, $r.event, $what)
     }
     # Detection time = from the fault (mute start / process killed) to each peer's PEER_DOWN.
