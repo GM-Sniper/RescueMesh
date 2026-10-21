@@ -178,7 +178,7 @@ const MAX_MUTE_MS: u64 = 20_000;
 /// Refusals are FaultAcks (accepted = false + reason), not gRPC errors, so the
 /// injector only has to read one kind of answer.
 async fn handle_inject_fault(
-    state: &NodeState,
+    state: &Arc<NodeState>, // Arc: the "mute ended" task keeps its own handle
     cmd: FaultCommand,
 ) -> Result<Response<FaultAck>, Status> {
     let refusal = if cmd.target_node != state.id {
@@ -208,12 +208,19 @@ async fn handle_inject_fault(
         term = cmd.term,
         "muted"
     );
-    // Log line only: the node wakes up by itself when muted_until passes. No overlap is
+    if let Some(log) = &state.fault_log {
+        log.mute_start(&cmd.fault_id, cmd.duration_ms);
+    }
+    // Logging only: the node wakes up by itself when muted_until passes. No overlap is
     // possible, because a muted node holds (ignores) new fault orders at the gate.
     let fault_id = cmd.fault_id.clone();
+    let state = state.clone();
     tokio::spawn(async move {
         tokio::time::sleep(duration).await;
         tracing::info!(%fault_id, "mute ended");
+        if let Some(log) = &state.fault_log {
+            log.mute_end(&fault_id);
+        }
     });
 
     // Sent even though we are now muted: this request passed the gate before the mute.
@@ -427,6 +434,30 @@ mod tests {
         svc.inject_fault(order(1, 10_000)).await.unwrap();
         let second = timeout(Duration::from_secs(5), svc.inject_fault(order(1, 1_000))).await;
         assert!(second.is_err(), "a muted node must not answer a new fault order");
+    }
+
+    // ---- Task 7d: the mute hook writes P5's fault CSV.
+
+    #[tokio::test(start_paused = true)]
+    async fn mute_writes_start_and_end_rows() {
+        let path = std::env::temp_dir()
+            .join(format!("rescuemesh-test-{}-mute-rows", std::process::id()))
+            .join("faults.csv");
+        let _ = std::fs::remove_file(&path);
+        let cfg = ClusterConfig::parse("[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n").unwrap();
+        let peers = Peers::new(&cfg, 1).unwrap();
+        let log = crate::fault_log::FaultLog::open(&path, 1, "t").unwrap();
+        let svc = NodeService::new(Arc::new(NodeState::new(1, cfg, peers).with_fault_log(log)));
+
+        svc.inject_fault(order(1, 10_000)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(10_001)).await; // lets the "mute ended" task run
+        let events: Vec<String> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .skip(1) // header
+            .map(|l| l.split(',').take(6).collect::<Vec<_>>().join(","))
+            .collect();
+        assert_eq!(events, ["t,1,MUTE_START,f1,,10000", "t,1,MUTE_END,f1,,"]);
     }
 
     // ---- Task 5c: an incoming heartbeat counts as hearing from its sender.

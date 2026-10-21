@@ -42,8 +42,18 @@ pub fn spawn_ticker(state: Arc<NodeState>) {
             }
             for event in state.check_peers() {
                 match event {
-                    PeerEvent::PeerDown(peer) => tracing::warn!(peer, "peer suspected down"),
-                    PeerEvent::PeerUp(peer) => tracing::info!(peer, "peer alive again"),
+                    PeerEvent::PeerDown(peer) => {
+                        tracing::warn!(peer, "peer suspected down");
+                        if let Some(log) = &state.fault_log {
+                            log.peer_down(peer);
+                        }
+                    }
+                    PeerEvent::PeerUp(peer) => {
+                        tracing::info!(peer, "peer alive again");
+                        if let Some(log) = &state.fault_log {
+                            log.peer_up(peer);
+                        }
+                    }
                 }
             }
         }
