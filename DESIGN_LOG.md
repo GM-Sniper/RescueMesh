@@ -24,6 +24,10 @@ Planner v1 assigns at most one resource to each incident.
 
 Generators use a seed to produce repeatable outputs, and planner tie-breaking is deterministic.
 
+## P1: Protocol, Node, Transport, Fault Injection, Failure Detection
+
+P1's entries are kept in their own file: [`docs/p1-design-log.md`](docs/p1-design-log.md).
+
 ## P3: Load Metric (LoadCollector)
 
 Code: `crates/common/src/load.rs` (formula, config, `LoadReport`), `crates/node/src/load.rs` (sampling). Weights live in the `[load]` table of `config/nodes.toml`.
