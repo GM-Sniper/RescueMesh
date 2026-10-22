@@ -350,6 +350,42 @@ Tested: 2 unit tests (`cargo test -p node node_metrics`), and a real node run fo
 
 ---
 
+## 10. Thu Oct 22: switch from the mock to the real node (not committed yet)
+
+P1's `Submit` is on `main` (PR #10). Merged `main` into `StepA/p6`; the only conflict was the two `node_metrics` lines in `crates/node/src/main.rs`, re-added after P1's new step 6.
+
+The client and the load generator now read the node's address from **the same config file the nodes use**, instead of a hard-coded address:
+
+```rust
+pub fn target_addr(config_path: &str, target: NodeId, override_addr: Option<&str>) -> Result<String, ...> { // in client/lib.rs
+    if let Some(addr) = override_addr { return Ok(addr.to_string()); }              // --node given: use it as is (e.g. the mock)
+    let config = common::config::ClusterConfig::load(config_path)?;                 // same loader and checks as the nodes
+    let node = config.node(target).ok_or_else(|| format!("node {target} is not listed in {config_path}"))?; // find node --target
+    Ok(node.addr.clone())                                                           // e.g. "10.0.0.12:50051"
+}                                                                                   // end of target_addr
+```
+
+| Flag (client demo and loadgen) | Default | Meaning |
+|---|---|---|
+| `--config` | `config/nodes.toml` | Cluster config; `config/nodes.lab.toml` on the real machines |
+| `--target` | `1` | Which node in that file to send to |
+| `--node` | none | Any address instead (e.g. the mock server); wins over `--config` |
+
+A lab config that still says `REPLACE-ME` is refused with a clear error, so the run can't go to a wrong address by mistake.
+
+### Rehearsal on one laptop (release build, real node 2)
+
+```text
+1000 requests  (1000 ok, 0 timeout, 0 error)      # every request answered
+assigned:  8 got a resource, 992 got nothing      # the store starts with 10 resources; the demo used 2 first
+mean 7.51 ms | p50 7.65 ms | p95 15.42 ms | p99 26.82 ms | max 42.29 ms   # latency of ok requests
+throughput: 100.0 ok requests/s over 10.00 s       # exactly the --rate 100 target
+```
+
+Almost every plan is empty because P4's store starts with only 10 resources and Step A never frees them (on P4's handle-later list). Latency is still meaningful: the planner runs for every request.
+
+---
+
 ## How to run everything
 
 ```bash
@@ -375,7 +411,21 @@ cargo test -p loadgen
 cargo test -p node node_metrics
 ```
 
-On the lab machines, use `--release` for real measurements, and `--node <machine IP>:50051` (see `config/nodes.lab.toml`).
+On the lab machines, use `--release` for real measurements and `--config config/nodes.lab.toml --target <N>` (fill in the IPs in that file first).
+
+## Real-machine run checklist (1000 requests)
+
+1. **Everyone pulls `main`** and runs `cargo build --release` on their machine.
+2. **Fill in `config/nodes.lab.toml`**: replace each `REPLACE-ME` with that machine's IPv4 (`ipconfig`). Everyone uses the same file.
+3. **Firewall:** allow `node.exe` on private networks on each node machine. Avoid Wi-Fi with client isolation (campus guest Wi-Fi often has it).
+4. **Clear old files:** delete the `logs` and `results` folders (both git-ignored; they are recreated).
+5. **Start the 3 nodes**, one per machine, with the same run name:
+   `cargo run --release -p node -- --id <N> --config config/nodes.lab.toml --run-id lab-1000`
+6. **Smoke test** from the client laptop: `cargo run --release -p client -- --config config/nodes.lab.toml --target 1`
+7. **Small run:** `cargo run --release -p loadgen -- --config config/nodes.lab.toml --target 1 --requests 50 --run-id lab-50`
+8. **The 1000-request run:** `cargo run --release -p loadgen -- --config config/nodes.lab.toml --target 1 --clients 10 --requests 1000 --seed 1 --rate 100 --run-id lab-1000`
+9. **Stats:** `cargo run --release -p loadgen --bin stats -- results/lab-1000.csv`
+10. **Collect:** `results/lab-1000.csv` + `.meta.txt` from the client laptop, and `logs/node_metrics-node<N>.csv` + `logs/faults-node<N>.csv` from each node machine.
 
 ## What P6 needs from others
 

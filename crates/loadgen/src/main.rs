@@ -1,8 +1,10 @@
 //! Load generator (owner: P6): many fake clients send requests to one node at the same time,
 //! and every result is saved as one CSV row for the stats script.
 //!
-//! Run (with a node or the mock server already running):
-//!   cargo run -p loadgen -- --clients 10 --requests 1000 --seed 1 --rate 100
+//! Run (with the node already running). The address comes from the same config file the nodes use:
+//!   cargo run -p loadgen -- --clients 10 --requests 1000 --seed 1 --rate 100                     (node 1 in config/nodes.toml)
+//!   cargo run --release -p loadgen -- --config config/nodes.lab.toml --target 1 --requests 1000  (real machines)
+//!   cargo run -p loadgen -- --node 127.0.0.1:6000 --requests 100                                  (any address, e.g. the mock)
 //!
 //! Output, in the `results/` folder:
 //!   <run_id>.csv       one row per request
@@ -26,9 +28,18 @@ use tokio::time::Instant; // stopwatch that works with tokio's sleep_until
 #[derive(Parser, Debug)]
 #[command(about = "RescueMesh load generator: many clients, one CSV row per request")]
 struct Args {
-    /// Node to send to (Step A: one fixed node).
-    #[arg(long, default_value = "127.0.0.1:50051")]
-    node: String,
+    /// Cluster config to read the node address from (the same file the nodes use).
+    /// On the 3 real machines: config/nodes.lab.toml
+    #[arg(long, default_value = "config/nodes.toml")]
+    config: String,
+
+    /// Which node in the config to send to (Step A: one fixed node).
+    #[arg(long, default_value_t = 1)]
+    target: u32,
+
+    /// Send to this address instead of the config's (e.g. the mock server: 127.0.0.1:6000).
+    #[arg(long)]
+    node: Option<String>,
 
     /// How many fake clients send at the same time.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
@@ -82,14 +93,17 @@ async fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&args.out)?; // make results/ if it doesn't exist yet
     let csv_path = args.out.join(format!("{run_id}.csv"));
     let meta_path = args.out.join(format!("{run_id}.meta.txt"));
+    // The node's address: from --node if given, otherwise node --target in --config.
+    let node_addr = client::target_addr(&args.config, args.target, args.node.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Connect every client BEFORE the clock starts, so connection setup isn't counted as request latency.
     // Each client gets its own connection, like separate users would.
     let mut clients = Vec::new();
     for _ in 0..args.clients {
-        clients.push(ClientMiddleware::connect(&args.node, DEFAULT_TIMEOUT).await?);
+        clients.push(ClientMiddleware::connect(&node_addr, DEFAULT_TIMEOUT).await?);
     }
-    println!("{} clients connected to {}, sending {} requests...", args.clients, args.node, args.requests);
+    println!("{} clients connected to {node_addr}, sending {} requests...", args.clients, args.requests);
 
     // The CSV writer runs on its own thread, so slow disk writes never delay a request.
     let (tx, rx) = mpsc::channel::<Row>(); // tx = where tasks drop rows, rx = where the writer picks them up
@@ -166,7 +180,7 @@ async fn main() -> anyhow::Result<()> {
          ok: {}\nunassigned: {}\ntimeout: {}\nerror: {}\n\
          throughput_ok_per_s: {throughput:.1}\n",
         std::env::args().collect::<Vec<_>>().join(" "), // the exact command that was typed
-        args.node, args.clients, args.requests, args.seed, args.rate,
+        node_addr, args.clients, args.requests, args.seed, args.rate,
         git_commit(),
         counts.ok, counts.unassigned, counts.timeout, counts.error,
     );

@@ -1,16 +1,22 @@
 //! Client demo (owner: P6): sends a few incidents to one node and prints each latency,
 //! then resends the first one to check that the node spots the duplicate.
 //!
-//! Run (with the mock server already running in another terminal):
-//!   cargo run -p client -- --node 127.0.0.1:50051 --count 5 --seed 1
+//! Run (with the node already running in another terminal):
+//!   cargo run -p client -- --count 5 --seed 1                               (node 1 in config/nodes.toml)
+//!   cargo run -p client -- --config config/nodes.lab.toml --target 2        (node 2 on the real machines)
+//!   cargo run -p client -- --node 127.0.0.1:6000                            (any address, e.g. the mock)
 
 use client::{ClientMiddleware, DEFAULT_TIMEOUT, SubmitOutcome}; // our library from src/lib.rs
 use common::conversions::incident_to_pb; // P2: domain Incident -> proto Incident
 use common::generators::generate_incident; // P2: same seed always gives the same incident
 
 #[tokio::main] // starts the async runtime, then runs `main` inside it
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let node_addr: String = arg("--node", "127.0.0.1:50051".to_string()); // the one fixed node (Step A)
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config: String = arg("--config", "config/nodes.toml".to_string()); // same file the nodes read
+    let target: u32 = arg("--target", 1); // which node in that file (Step A: one fixed node)
+    let node_override: String = arg("--node", String::new()); // optional: any address; empty = not given
+    let node_override = (!node_override.is_empty()).then_some(node_override.as_str());
+    let node_addr = client::target_addr(&config, target, node_override)?; // --node wins, else the config's address
     let count: u64 = arg("--count", 5); // how many requests to send
     let seed: u64 = arg("--seed", 1); // first incident's seed; request i uses seed + i, so runs are repeatable
 
