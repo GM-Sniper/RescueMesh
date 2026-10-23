@@ -10,6 +10,7 @@ tokio.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 sysinfo.workspace = true
+async-trait.workspace = true
 tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }  # RUST_LOG=debug shows more
 

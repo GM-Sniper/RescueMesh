@@ -1,13 +1,14 @@
 //! State shared by every request handler and background task of one node.
 //! Shared as `Arc<NodeState>`: cheap to clone, all clones point to the same struct.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::NodeId;
 use common::config::ClusterConfig;
 use common::load::LoadReport;
+use common::shared_state::SharedState;
 use common::pb::node_client::NodeClient;
 use tonic::transport::Channel;
 // tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
@@ -18,7 +19,7 @@ use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
 use crate::peers::Peers;
-use crate::store::Store;
+use crate::store::InMemoryStore;
 
 pub struct NodeState {
     pub id: NodeId,
@@ -29,8 +30,9 @@ pub struct NodeState {
     in_flight: AtomicUsize,
     /// P3: CPU and service-time samples behind this node's load score (see load.rs).
     pub load: LoadCollector,
-    /// P4: incidents, resources, assignments and the change log (see store.rs).
-    pub store: Store,
+    /// P4: incidents, resources and assignments, behind the shared-state interface.
+    /// `dyn` so the in-memory store can later be swapped for the DFS-backed one (see store.rs).
+    pub store: Arc<dyn SharedState>,
     /// When the current mute ends; None = never muted (task 4).
     /// An end time instead of an on/off flag: nothing has to switch it back off,
     /// and overlapping mutes just keep the later end.
@@ -54,7 +56,7 @@ impl NodeState {
             peers,
             in_flight: AtomicUsize::new(0),
             load,
-            store: Store::with_default_resources(id),
+            store: Arc::new(InMemoryStore::with_default_resources()),
             muted_until: Mutex::new(None),
             detector: Mutex::new(detector),
             fault_log: None,
