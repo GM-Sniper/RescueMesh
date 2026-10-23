@@ -1,0 +1,54 @@
+filers: ['http://127.0.0.1:8888', 'http://127.0.0.1:8889', 'http://127.0.0.1:8890']
+base path: /spike/run-a7172169
+
+== Check 1: create-if-absent with If-None-Match: * on one filer ==
+PUT /spike/run-a7172169/check1.txt  If-None-Match: *  (first)   -> 201
+PUT /spike/run-a7172169/check1.txt  If-None-Match: *  (second)  -> 201   (412 expected)
+GET /spike/run-a7172169/check1.txt -> 200, body=b'second'
+RESULT: FAIL (the second create was not rejected)
+
+== Check 2: 24 concurrent creates of one path over 3 filers, 8 rounds ==
+round 0: success=24 rejected(412)=0 other=0  filers end with ['writer-4', 'writer-20', 'writer-4']  FAIL (filers DISAGREE)
+round 1: success=24 rejected(412)=0 other=0  filers end with ['writer-18', 'writer-18', 'writer-18']  FAIL
+round 2: success=24 rejected(412)=0 other=0  filers end with ['writer-0', 'writer-0', 'writer-0']  FAIL
+round 3: success=24 rejected(412)=0 other=0  filers end with ['writer-2', 'writer-2', 'writer-22']  FAIL (filers DISAGREE)
+round 4: success=24 rejected(412)=0 other=0  filers end with ['writer-14', 'writer-14', 'writer-14']  FAIL
+round 5: success=24 rejected(412)=0 other=0  filers end with ['writer-4', 'writer-14', 'writer-4']  FAIL (filers DISAGREE)
+round 6: success=24 rejected(412)=0 other=0  filers end with ['writer-12', 'writer-12', 'writer-12']  FAIL
+round 7: success=24 rejected(412)=0 other=0  filers end with ['writer-20', 'writer-20', 'writer-20']  FAIL
+RESULT: exactly one winner in 0/8 rounds
+
+== Check 3: write on filer A, wait until the others return it (10 samples) ==
+appeared on 20 reads; delay ms: min=3.1 median=6.9 max=27.9
+never appeared within 30s: 0
+RESULT: PASS
+
+== Check 4: latency (50 sequential ops per filer) and sizes ==
+http://127.0.0.1:8888: write median 7.0 ms (p95 27.9), read median 4.9 ms (p95 11.1), failures 0
+http://127.0.0.1:8889: write median 6.5 ms (p95 27.9), read median 4.6 ms (p95 19.1), failures 0
+http://127.0.0.1:8890: write median 6.5 ms (p95 17.8), read median 4.6 ms (p95 19.1), failures 0
+PUT 1 KB: status 201 in 5 ms
+PUT 1 MB: status 201 in 52 ms
+PUT 16 MB: status 201 in 269 ms
+PUT 64 MB: status 201 in 643 ms
+burst of 100 parallel small writes: 0.15 s, non-2xx statuses: none
+
+== Check 5 (extra): S3 gateway, If-None-Match: * on 2 gateways ==
+create bucket 'spikebucket' -> 200
+single gateway: first create -> 200, second create -> 412 (412 expected)
+round 0: success=1 rejected(412)=23 other=0  gateways end with ['writer-8', 'writer-8']  PASS
+round 1: success=1 rejected(412)=23 other=0  gateways end with ['writer-6', 'writer-6']  PASS
+round 2: success=1 rejected(412)=23 other=0  gateways end with ['writer-17', 'writer-17']  PASS
+round 3: success=1 rejected(412)=23 other=0  gateways end with ['writer-13', 'writer-13']  PASS
+round 4: success=1 rejected(412)=23 other=0  gateways end with ['writer-4', 'writer-4']  PASS
+round 5: success=1 rejected(412)=23 other=0  gateways end with ['writer-12', 'writer-12']  PASS
+round 6: success=1 rejected(412)=23 other=0  gateways end with ['writer-14', 'writer-14']  PASS
+round 7: success=1 rejected(412)=23 other=0  gateways end with ['writer-12', 'writer-12']  PASS
+RESULT: PASS
+
+== Summary ==
+check_1: FAIL
+check_2: FAIL
+check_3: PASS
+check_5: PASS
+check_4: informational
