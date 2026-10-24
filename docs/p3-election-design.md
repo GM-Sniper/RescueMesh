@@ -4,6 +4,8 @@ Owner: P3. Step A plan item "Election design doc" (draft Tue Oct 20). It turns t
 
 **Who uses this:** P1 (bid RPC and wiring), P5 (automatic injector reuses the election), P4 (duplicate rule, Section 5), P6 (election metrics, Section 8). Everyone reviews: comment on the PR, especially on the open questions in Section 9.
 
+**Scope (professor's feedback):** between the cloud nodes we do the election and fault injection. Duplicate filtering and failure detection on the client side belong to the client middleware (Section 2). P2P between clients is out of scope until Phase 2.
+
 ---
 
 ## 1. Summary
@@ -39,6 +41,10 @@ Client          N1 (0.20)          N2 (0.45)          N3 (0.31)
 
 **Cost per request:** 6 bid calls + 2 Coordinator calls = **8 messages** (survey 9.3), or 6 while one node is silent (4 bid calls between the two live nodes, plus 2 Coordinator calls). Replies ride on the same gRPC calls.
 
+**Client middleware (professor's feedback):**
+- **Filters duplicate responses:** the client gets up to three replies per request (one per node), and after a split decision two of them can carry a plan. The middleware keeps the first reply with a plan for each `request_id` and drops the rest, counting the dropped plans for the split metrics (Section 8).
+- **Fault tolerance:** the middleware's request timeout is the client's failure detection. If no reply with a plan arrives in time, it retries with the same `request_id` (Section 4, "Winner fails").
+
 ## 3. Bid timeout T
 
 | Decision | Alternatives | Why |
@@ -57,7 +63,7 @@ Client          N1 (0.20)          N2 (0.45)          N3 (0.31)
 | A peer's bid call arrives **before** the client's copy, or the client's copy never arrives | The call carries the request, so the node computes and stores its bid right away, replies with it, and joins the election normally. When the client's copy arrives, it is matched by `request_id` and does not create a second bid |
 | **Late bid** (after the node already decided this round) | Logged and ignored. The decision for a round is never changed afterwards |
 | **Muted node** | With P1's mute hook (PR #10, not merged yet), a muted node neither answers nor sends calls, so it sends no bids. The others elect without it |
-| **Winner fails** before replying | The client times out and retries with the same `request_id`. A node that receives the retry while its recorded winner for that request is reported down by the detector starts **round + 1**: new bids, without the failed node. Same-round messages are still ignored, so a retry while the winner is alive does not start a second election. If the plan was already stored and replicated, the new winner returns it (`duplicate = true`) |
+| **Winner fails** before replying | The client middleware times out (client-side failure detection) and retries with the same `request_id`. A node that receives the retry while its recorded winner for that request is reported down by the detector starts **round + 1**: new bids, without the failed node. Same-round messages are still ignored, so a retry while the winner is alive does not start a second election. If the plan was already stored and replicated, the new winner returns it (`duplicate = true`) |
 | **Returning node** | Survey 9.2: it must bring its state up to date before it bids again. Otherwise it plans from a stale snapshot and can assign a resource that is already taken (and its duplicate check can miss a request it never received). So from Step B on, a returning node does not bid until it has fetched the log entries it missed from a peer (`FetchLog`, Q7). Until then it answers bid calls with `ready = false` (Q1), so the others count it as answered and do not wait the full T for it |
 | **Equal scores** | `load_score` is a `double` sent as-is, and every node compares the received values, never a recomputed copy, so equality is exact and the lowest `node_id` wins everywhere |
 
@@ -88,6 +94,8 @@ Client          N1 (0.20)          N2 (0.45)          N3 (0.31)
 - **Not included yet:** round-trip time to the client, which the survey lists as a possible factor. A node only learns a client's RTT once that client's request arrives, so the value would be a guess for new clients. The weights are in the config, and the survey says they are set and justified by experiment in Phase 1, so RTT can be added then if the data shows it matters.
 - **Known weakness (survey 9.6):** scores are measured slightly before the election, so a burst of requests can make one node look less loaded than it is. Our collector reads the queue length live at bid time, which narrows this window. The Phase 1 experiments will show whether the load is spread fairly.
 
+**How load is distributed:** there is no separate load balancer. Every request is multicast to all three nodes, and the election hands it to the node with the lowest `load_score` at that moment. A node that takes a request sees its queue length, and so its score, go up, so the next request tends to go elsewhere. A silent node sends no bid, so its share moves to the two live nodes. We check that the spread is fair with requests executed per node and each node's `load_score` over a run (Section 8).
+
 ## 7. Reuse for the automatic fault injector (P5)
 
 Survey 9.2: the same election selects the node to silence.
@@ -111,6 +119,8 @@ run_id,node_id,request_id,round,bids,winner,duration_us,waited_full_t,late_bids,
 
 From these: election frequency, election duration (normal vs. during an outage), message overhead (8 vs. 6, plus retries), and split-decision rate, as the brief requires. Request latency is measured by the client up to the reply **with a plan**, not the first reply (Q2).
 
+**Success of the system (professor's feedback):** measured by the client, under which conditions how many requests were met. Success rate = requests that got a reply with a plan ÷ requests sent, reported per condition: no fault, during an outage, after a node returns, and at each load level. Alongside it: retries per request, duplicate plans dropped by the middleware, and requests executed per node (load distribution, Section 6).
+
 ## 9. Open questions for the review
 
 | # | Question | Proposal | Who |
@@ -122,3 +132,4 @@ From these: election frequency, election duration (normal vs. during an outage),
 | Q5 | Step A sends each request to one fixed node; Step B multicasts to all 3 | Client sends to all 3 in Step B (survey 1.2) | P6 |
 | Q6 | Is T = 300 ms right on the lab network? | Check on Wed Oct 21: measure node-to-node round trips and pick T well above their maximum | All |
 | Q7 | Who owns the `Replicate` and `FetchLog` RPCs? (not in the proto yet) | P4 defines the messages and handlers, since they belong to the store and replication; P1 adds them to the proto and the gRPC wiring, as with `Submit` | P1, P4 |
+| Q8 | The professor said that between cloud nodes we only do the election and fault injection. Does that rule out node-to-node heartbeats and replication? | To confirm with the professor. Sections 3-5 currently use the failure detector (early stop, round + 1 when the winner is down) and replication (returning node catch-up, split resolution). Without them, early stop and retries move to the client, and we still need a way for nodes to share resource state so two nodes don't assign the same resource | All |
