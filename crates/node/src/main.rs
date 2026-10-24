@@ -11,6 +11,10 @@ mod broadcast;
 mod fault_log;
 mod heartbeat;
 mod load;
+// P6: NODE_METRICS LOG (ONE CSV ROW PER SECOND: QUEUE, CPU, SERVICE TIME, LOAD SCORE).
+// NOTE FOR P1 / STEPA/P1: P6 ADDED ONLY THIS `mod` LINE AND THE `node_metrics::spawn` CALL IN STEP 6
+// BELOW. NOTHING ELSE IN THIS FILE CHANGED. PLEASE KEEP BOTH LINES WHEN YOU MERGE MAIN INTO STEPA/P1.
+mod node_metrics;
 mod peers;
 mod service;
 mod state;
@@ -95,6 +99,9 @@ async fn main() -> anyhow::Result<()> {
     load::spawn_sampler(state.clone());
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
+    // P6 (SEE NOTE AT THE TOP, P1): ONE ROW PER SECOND TO logs/node_metrics-node<ID>.CSV
+    node_metrics::spawn(state.clone(), format!("logs/node_metrics-node{}.csv", args.id))
+        .context("cannot open the node_metrics log")?;
 
     // 7. Open the doors: serve the Node service until Ctrl+C.
     tracing::info!(id = args.id, %listen, peers = ?peer_ids, %run_id, fault_log = %log_path, "node listening");

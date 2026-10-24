@@ -13,6 +13,18 @@ use common::pb::{self, node_client::NodeClient, submit_request}; // code generat
 use tonic::transport::{Channel, Endpoint}; // Endpoint = an address + settings; Channel = the open connection
 use uuid::Uuid; // random unique IDs
 
+/// The node a client talks to, read from the cluster config that the nodes use too
+/// (`config/nodes.toml` on one laptop, `config/nodes.lab.toml` on the 3 real machines).
+/// `override_addr` (the `--node` flag) wins if given, so a quick test can still name any address.
+pub fn target_addr(config_path: &str, target: NodeId, override_addr: Option<&str>) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(addr) = override_addr {
+        return Ok(addr.to_string()); // --node given: use it as is (e.g. the mock server on another port)
+    }
+    let config = common::config::ClusterConfig::load(config_path)?; // same loader and checks as the nodes (REPLACE-ME addresses are refused)
+    let node = config.node(target).ok_or_else(|| format!("node {target} is not listed in {config_path}"))?;
+    Ok(node.addr.clone()) // e.g. "10.0.0.12:50051"
+}
+
 /// How long to wait for a reply before giving up, if the caller doesn't choose.
 /// A muted node hangs instead of answering, so without a limit the client would wait forever.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -120,6 +132,14 @@ impl ClientMiddleware {
 }
 
 impl SubmitOutcome {
+    /// Did the plan actually assign a resource?
+    /// - Some(true):  yes, at least one resource was assigned
+    /// - Some(false): the node planned, but nothing was free (empty plan; P4: resubmit with a NEW request_id)
+    /// - None:        no plan at all (the request failed, or in Step B this node wasn't the executor)
+    pub fn assigned(&self) -> Option<bool> {
+        self.plan.as_ref().map(|plan| !plan.assignments.is_empty())
+    }
+
     /// Builds the outcome for a request that got no usable reply.
     fn failed(request_id: String, latency_us: u64, status: SubmitStatus, error: String) -> Self {
         SubmitOutcome {

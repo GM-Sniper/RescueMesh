@@ -2,6 +2,7 @@
 name = "loadgen"
 version = "0.1.0"
 edition = "2024"
+default-run = "loadgen"          # `cargo run -p loadgen` runs the load generator; the stats script is `--bin stats`
 
 [dependencies]
 client = { path = "../client" }  # ClientMiddleware: sends one request and times it (P6, Sun)
