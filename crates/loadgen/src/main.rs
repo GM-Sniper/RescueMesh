@@ -1,8 +1,10 @@
 //! Load generator (owner: P6): many fake clients send requests to one node at the same time,
 //! and every result is saved as one CSV row for the stats script.
 //!
-//! Run (with a node or the mock server already running):
-//!   cargo run -p loadgen -- --clients 10 --requests 1000 --seed 1 --rate 100
+//! Run (with the node already running). The address comes from the same config file the nodes use:
+//!   cargo run -p loadgen -- --clients 10 --requests 1000 --seed 1 --rate 100                     (node 1 in config/nodes.toml)
+//!   cargo run --release -p loadgen -- --config config/nodes.lab.toml --target 1 --requests 1000  (real machines)
+//!   cargo run -p loadgen -- --node 127.0.0.1:6000 --requests 100                                  (any address, e.g. the mock)
 //!
 //! Output, in the `results/` folder:
 //!   <run_id>.csv       one row per request
@@ -26,9 +28,18 @@ use tokio::time::Instant; // stopwatch that works with tokio's sleep_until
 #[derive(Parser, Debug)]
 #[command(about = "RescueMesh load generator: many clients, one CSV row per request")]
 struct Args {
-    /// Node to send to (Step A: one fixed node).
-    #[arg(long, default_value = "127.0.0.1:50051")]
-    node: String,
+    /// Cluster config to read the node address from (the same file the nodes use).
+    /// On the 3 real machines: config/nodes.lab.toml
+    #[arg(long, default_value = "config/nodes.toml")]
+    config: String,
+
+    /// Which node in the config to send to (Step A: one fixed node).
+    #[arg(long, default_value_t = 1)]
+    target: u32,
+
+    /// Send to this address instead of the config's (e.g. the mock server: 127.0.0.1:6000).
+    #[arg(long)]
+    node: Option<String>,
 
     /// How many fake clients send at the same time.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
@@ -63,6 +74,7 @@ struct Row {
     latency_us: u64,            // send-to-reply time measured by ClientMiddleware
     executor_node: Option<u32>, // node that answered; None if it failed
     status: SubmitStatus,       // ok / timeout / error
+    assigned: Option<bool>,     // true = a resource was assigned, false = empty plan (nothing free), None = no plan
 }
 
 /// How many requests ended each way. Filled in by the CSV writer as it saves rows.
@@ -71,6 +83,7 @@ struct Counts {
     ok: u64,
     timeout: u64,
     error: u64,
+    unassigned: u64, // ok requests whose plan was empty (nothing was free)
 }
 
 #[tokio::main] // starts the async runtime, then runs `main` inside it
@@ -80,14 +93,17 @@ async fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&args.out)?; // make results/ if it doesn't exist yet
     let csv_path = args.out.join(format!("{run_id}.csv"));
     let meta_path = args.out.join(format!("{run_id}.meta.txt"));
+    // The node's address: from --node if given, otherwise node --target in --config.
+    let node_addr = client::target_addr(&args.config, args.target, args.node.as_deref())
+        .map_err(|e| anyhow::anyhow!(e))?;
 
     // Connect every client BEFORE the clock starts, so connection setup isn't counted as request latency.
     // Each client gets its own connection, like separate users would.
     let mut clients = Vec::new();
     for _ in 0..args.clients {
-        clients.push(ClientMiddleware::connect(&args.node, DEFAULT_TIMEOUT).await?);
+        clients.push(ClientMiddleware::connect(&node_addr, DEFAULT_TIMEOUT).await?);
     }
-    println!("{} clients connected to {}, sending {} requests...", args.clients, args.node, args.requests);
+    println!("{} clients connected to {node_addr}, sending {} requests...", args.clients, args.requests);
 
     // The CSV writer runs on its own thread, so slow disk writes never delay a request.
     let (tx, rx) = mpsc::channel::<Row>(); // tx = where tasks drop rows, rx = where the writer picks them up
@@ -121,6 +137,7 @@ async fn main() -> anyhow::Result<()> {
                 let incident = incident_to_pb(&generate_incident(seed + n)); // same seed + n = same incident every run
                 let timestamp_ms = unix_ms(); // when this request was sent
                 let outcome = client.submit(incident).await; // send, wait, time it (never panics)
+                let assigned = outcome.assigned(); // read before outcome's fields are moved into the row
                 let row = Row {
                     timestamp_ms,
                     client_id,
@@ -128,6 +145,7 @@ async fn main() -> anyhow::Result<()> {
                     latency_us: outcome.latency_us,
                     executor_node: outcome.executor_node,
                     status: outcome.status,
+                    assigned,
                 };
                 if tx.send(row).is_err() {
                     break; // the writer stopped (disk error): no point sending more
@@ -147,8 +165,8 @@ async fn main() -> anyhow::Result<()> {
     let secs = elapsed.as_secs_f64();
     let throughput = counts.ok as f64 / secs; // successful requests per second
     println!(
-        "done in {secs:.2} s: {} ok, {} timeout, {} error, {throughput:.1} ok/s",
-        counts.ok, counts.timeout, counts.error
+        "done in {secs:.2} s: {} ok ({} with nothing assigned), {} timeout, {} error, {throughput:.1} ok/s",
+        counts.ok, counts.unassigned, counts.timeout, counts.error
     );
 
     // The metadata file records how to repeat this exact run.
@@ -159,12 +177,12 @@ async fn main() -> anyhow::Result<()> {
          node: {}\nclients: {}\nrequests: {}\nseed: {}\nrate: {}\n\
          git_commit: {}\n\
          duration_s: {secs:.3}\n\
-         ok: {}\ntimeout: {}\nerror: {}\n\
+         ok: {}\nunassigned: {}\ntimeout: {}\nerror: {}\n\
          throughput_ok_per_s: {throughput:.1}\n",
         std::env::args().collect::<Vec<_>>().join(" "), // the exact command that was typed
-        args.node, args.clients, args.requests, args.seed, args.rate,
+        node_addr, args.clients, args.requests, args.seed, args.rate,
         git_commit(),
-        counts.ok, counts.timeout, counts.error,
+        counts.ok, counts.unassigned, counts.timeout, counts.error,
     );
     fs::write(&meta_path, meta)?;
     println!("wrote {} and {}", csv_path.display(), meta_path.display());
@@ -174,7 +192,7 @@ async fn main() -> anyhow::Result<()> {
 /// The CSV writer: takes rows off the channel and writes them until every sender is gone.
 fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Result<Counts> {
     let mut w = BufWriter::new(File::create(path)?); // buffered, so we don't hit the disk on every row
-    writeln!(w, "run_id,timestamp,client_id,request_id,latency_us,executor_node,status")?; // header row
+    writeln!(w, "run_id,timestamp,client_id,request_id,latency_us,executor_node,status,assigned")?; // header row
     let mut counts = Counts::default();
     for row in rx {
         // This loop ends by itself once all tasks are done and the channel is closed.
@@ -183,10 +201,14 @@ fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Res
             SubmitStatus::Timeout => counts.timeout += 1,
             SubmitStatus::Error => counts.error += 1,
         }
+        if row.assigned == Some(false) {
+            counts.unassigned += 1; // the node planned but nothing was free
+        }
         let node = row.executor_node.map_or(String::new(), |n| n.to_string()); // empty cell if no node answered
+        let assigned = row.assigned.map_or(String::new(), |a| a.to_string()); // "true", "false", or empty if no plan
         writeln!(
             w,
-            "{run_id},{},{},{},{},{node},{}",
+            "{run_id},{},{},{},{},{node},{},{assigned}",
             row.timestamp_ms, row.client_id, row.request_id, row.latency_us, row.status.as_str()
         )?;
     }
