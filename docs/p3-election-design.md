@@ -19,7 +19,7 @@ This is the survey's modified Bully (Section 9.2): the load score replaces the f
 3. **Each node fixes its bid:** `Bid{request_id, round, node_id, load_score}`, with `load_score` from `state.load_report()` (P3 load collector). **The bid is computed once per (request, round), the first time the node sees the request**, from the client or from a peer's bid call, and stored in the node's election table. Every later message for this request uses that same value, so all nodes compare the same numbers. `round` starts at 0 (retries, Section 4).
 4. **Bid exchange:** each node sends its bid to the other two through P1's `broadcast()`. **The call also carries the client's request**, so a node whose copy from the client is late or lost still has the incident and can run the planner if it wins. The reply to each call carries the receiver's own bid. Each node therefore gets every peer's bid twice (once as a call, once as a reply), so a single lost message does not hide a bid.
 5. **Decide:** a node decides as soon as it has a bid from every peer the failure detector reports alive, or when the bid timeout **T** expires, whichever comes first. Winner = lowest `(load_score, node_id)` among the bids it holds, its own included.
-6. **Announce:** the winner sends `Coordinator{request_id, node_id}` to the other two (the Bully announcement). Then it runs `plan()` → `store.apply()` → replication (P4) → reply to the client with `executor_node` = itself.
+6. **Announce:** the winner sends `Coordinator{request_id, node_id}` to the other two (the Bully announcement). Then it runs `plan()` → `store.try_apply()` → replication (P4) → reply to the client with `executor_node` = itself.
 7. **Non-winners** reply to the client with `executor_node` = the winner and no plan (open question Q2). They record "request X → winner W" for the logs and the split check (Section 5).
 
 ```
@@ -58,7 +58,7 @@ Client          N1 (0.20)          N2 (0.45)          N3 (0.31)
 | **Late bid** (after the node already decided this round) | Logged and ignored. The decision for a round is never changed afterwards |
 | **Muted node** | With P1's mute hook (PR #10, not merged yet), a muted node neither answers nor sends calls, so it sends no bids. The others elect without it |
 | **Winner fails** before replying | The client times out and retries with the same `request_id`. A node that receives the retry while its recorded winner for that request is reported down by the detector starts **round + 1**: new bids, without the failed node. Same-round messages are still ignored, so a retry while the winner is alive does not start a second election. If the plan was already stored and replicated, the new winner returns it (`duplicate = true`) |
-| **Returning node** | Survey 9.2: it must bring its state up to date before it bids again. In Step B (no recovery yet) it bids at once; Step C adds a "ready" flag that it must have before bidding |
+| **Returning node** | Survey 9.2: it must bring its state up to date before it bids again. Otherwise it plans from a stale snapshot and can assign a resource that is already taken (and its duplicate check can miss a request it never received). So from Step B on, a returning node does not bid until it has fetched the log entries it missed from a peer (`FetchLog`, Q7). Until then it answers bid calls with `ready = false` (Q1), so the others count it as answered and do not wait the full T for it |
 | **Equal scores** | `load_score` is a `double` sent as-is, and every node compares the received values, never a recomputed copy, so equality is exact and the lowest `node_id` wins everywhere |
 
 ## 5. Split decision (two nodes saw different bids)
@@ -76,6 +76,8 @@ Client          N1 (0.20)          N2 (0.45)          N3 (0.31)
 **How we resolve it (deterministic, every node converges):** **the claim from the lower `node_id` wins.**
 - If the higher-ID claimant has not started planning, it drops the request.
 - If both already ran the planner, each node keeps the plan from the lower origin `node_id` when the second plan for the same `request_id` arrives through replication. **Requirement for P4 (Q4):** the store must apply this rule, so all three nodes keep the same plan.
+  - **Step A (current store):** the store keeps the first plan it applied. A later entry for the same `request_id` from another node is logged but does not change the state. This is fine while each request goes to one node, but with splits, nodes can receive the two plans in different orders and keep different ones.
+  - **Step B:** the store applies the lower-origin rule, which means undoing the losing plan if it was applied first. The alternatives (replaying the log, or waiting for `Coordinator` before applying) are written up in P4's `DESIGN_LOG.md`; to be decided with P4 at the start of Step B.
 - The client may have received the losing plan first. This is the duplicate-execution case the survey accepts, as long as idempotent request IDs keep it harmless. We measure how often it happens rather than add a confirmation round to every election, which would cost extra messages and another wait on every request to fix a rare case.
 
 ## 6. Why this metric
@@ -96,15 +98,27 @@ Survey 9.2: the same election selects the node to silence.
 
 ## 8. What to measure (for P6)
 
-Per election, logged by every node: `request_id`, bids received (node and score), winner, election duration (request received → decision), whether it waited the full T, late bids, `split_decision`. From these: election frequency, election duration (normal vs. during an outage), message overhead (8 vs. 6), and split-decision rate, as the brief requires.
+One row per election, logged by every node to `logs/elections-node<N>.csv` (same style as the fault log and `node_metrics`):
+
+```
+run_id,node_id,request_id,round,bids,winner,duration_us,waited_full_t,late_bids,split_decision,bid_calls_sent,wall_ts_us
+```
+
+- `run_id` comes from `--run-id`, so rows join with loadgen's CSV.
+- `bids` lists the bids received, own included, as `node:score` pairs: `1:0.20;2:0.45;3:0.31`.
+- `duration_us`: request received → decision.
+- `bid_calls_sent`: bid calls this node actually sent, including `broadcast()` retries.
+
+From these: election frequency, election duration (normal vs. during an outage), message overhead (8 vs. 6, plus retries), and split-decision rate, as the brief requires. Request latency is measured by the client up to the reply **with a plan**, not the first reply (Q2).
 
 ## 9. Open questions for the review
 
 | # | Question | Proposal | Who |
 |---|---|---|---|
-| Q1 | Proto for the bid exchange | Add `uint32 round = 4;` to `Bid` (adding a field is safe). `rpc ExchangeBid(BidRequest) returns (Bid)` with `BidRequest { Bid bid = 1; SubmitRequest request = 2; }`. `rpc AnnounceWinner(Coordinator) returns (CoordinatorAck)` with `Coordinator { string request_id = 1; uint32 round = 2; uint32 node_id = 3; }` | P1 |
-| Q2 | What do non-winners reply to the client? | `SubmitReply` with `executor_node` = winner and no plan; the client keeps the reply that has a plan. Alternative: non-winners wait for the replicated plan and return it too | P1, P6 |
+| Q1 | Proto for the bid exchange | Add `uint32 round = 4;` and `bool ready = 5;` to `Bid` (adding fields is safe; `ready = false` means a returning node that has not caught up, Section 4). `rpc ExchangeBid(BidRequest) returns (Bid)` with `BidRequest { Bid bid = 1; SubmitRequest request = 2; }`. `rpc AnnounceWinner(Coordinator) returns (CoordinatorAck)` with `Coordinator { string request_id = 1; uint32 round = 2; uint32 node_id = 3; }` | P1 |
+| Q2 | What do non-winners reply to the client? | `SubmitReply` with `executor_node` = winner and no plan; the client keeps the reply that has a plan and measures latency up to that reply, so fast "no plan" replies don't make latency look lower. Alternative: non-winners wait for the replicated plan and return it too | P1, P6 |
 | Q3 | Early return in `broadcast()` | Return when every detector-alive peer has answered, instead of waiting for the slowest call | P1 |
-| Q4 | Same `request_id` applied twice from different origins | Keep the plan from the lower origin `node_id` (Section 5) | P4 |
+| Q4 | Same `request_id` applied twice from different origins | Step A: the store keeps the first plan and logs the later one. Step B: keep the plan from the lower origin `node_id`, undoing the losing one; alternatives in P4's `DESIGN_LOG.md` (Section 5) | P4 |
 | Q5 | Step A sends each request to one fixed node; Step B multicasts to all 3 | Client sends to all 3 in Step B (survey 1.2) | P6 |
 | Q6 | Is T = 300 ms right on the lab network? | Check on Wed Oct 21: measure node-to-node round trips and pick T well above their maximum | All |
+| Q7 | Who owns the `Replicate` and `FetchLog` RPCs? (not in the proto yet) | P4 defines the messages and handlers, since they belong to the store and replication; P1 adds them to the proto and the gRPC wiring, as with `Submit` | P1, P4 |
