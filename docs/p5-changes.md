@@ -1,6 +1,6 @@
 # P5 changes: fault injection and failure detection
 
-Owner: P5. Covers Sat Oct 17 (FaultCommand proto), Sun Oct 18 (failure detector), Mon Oct 19 (injector CLI, fault CSV) and Tue Oct 20 (automatic injector design, finished Wed Oct 21).
+Owner: P5. Covers Sat Oct 17 (FaultCommand proto), Sun Oct 18 (failure detector), Mon Oct 19 (injector CLI, fault CSV), Tue Oct 20 (automatic injector design, finished Wed Oct 21) and, in Step B, Mon Oct 26 (automatic injector).
 
 Rule for this file: old decisions are never rewritten. When one changes, a new entry says so and the old one is marked "Replaced".
 
@@ -183,7 +183,51 @@ Full design: [`p5-auto-injector-design.md`](p5-auto-injector-design.md). Draft f
 
 ---
 
+## Mon Oct 26: automatic injector, fallback version (branch `StepB/P5/auto-injector`)
+
+Step B plan tasks: "Automatic injector" and "Safety rule" (both due Fri Oct 23).
+
+### What was created
+
+| File                                         | What it is                                                                                                           | What you need to know                                                                                    |
+| -------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| `crates/node/src/fault_round.rs`             | The automatic injector: a `Scheduler` (pure logic, fake-time tests) plus a background task that runs it every 100 ms | Does nothing unless `[faults] enabled = true`. 9 tests, including one with 3 real nodes on localhost     |
+| `crates/common/src/config.rs`                | New optional `[faults]` table: `enabled`, `seed`, `min/max_duration_ms`, `min/max_gap_ms`, checked at startup        | Defaults: off, seed 42, 2 to 20 s silence, 10 to 30 s gap. Max duration over 20 s is refused. 1 new test |
+| `config/nodes.toml`, `config/nodes.lab.toml` | The `[faults]` table with `enabled = false` and comments                                                             | Set `enabled = true` on all 3 nodes for fault experiments                                                |
+| `crates/node/src/main.rs`                    | `mod fault_round;` and `fault_round::spawn(state.clone());`                                                          | Two lines                                                                                                |
+| `crates/node/src/service.rs`                 | `handle_inject_fault` is now `pub(crate)`                                                                            | One word: automatic faults reuse the exact same mute path as the CLI                                     |
+
+### How it works
+
+1. **Coordinator** = lowest node ID among this node and the peers its detector reports alive (Bully rule). Only the coordinator schedules faults.
+2. **Safety rule:** the coordinator acts only while it is not muted, every peer is alive, and the previous fault's duration has passed.
+3. It waits a **random gap** (seeded, 10 to 30 s), counted from when everyone is alive. Anyone going down restarts the wait.
+4. It picks the **victim** (any of the 3, itself included, each equally likely) and the **duration** (seeded, 2 to 20 s).
+5. It sends a `FaultCommand` to the victim (`issuer_node` = itself, `term` = round), or calls the handler directly if the victim is itself. The victim logs `MUTE_START` / `MUTE_END` as before.
+
+### Changed decision: fallback coordinator instead of the full fault-round election
+
+|                         |                                                                                                                                                                                                                                                                                                                                                              |
+| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| **Replaces (for now)**  | Design doc Sections 2 to 4 / Tue Oct 20 decisions "The winner silences itself" and "A round needs bids from all three nodes"                                                                                                                                                                                                                                 |
+| **New decision**        | The lowest-ID live node schedules faults and sends the order; the victim is drawn with a seeded generator                                                                                                                                                                                                                                                    |
+| **Why**                 | P3's bid exchange (`ExchangeBid`) is not in `main`, and the Step B plan names this fallback ("P5 uses a simple Bully rule on alive_peers()"). It needs no proto change and reuses the `InjectFault` path that is already tested                                                                                                                              |
+| **What we lose**        | (a) When all 3 are alive, the coordinator is always node 1, so one node always issues the faults (the victims are still spread evenly). (b) The order can be lost on the network; then no fault happens that round, which is harmless. (c) Only the coordinator knows the victim in advance, which is actually closer to a real failure than the full design |
+| **Safety is unchanged** | Two nodes can never be silent at once: only one node injects, only when it sees all alive, and never before the previous fault's duration has passed (`busy_until`). The last condition covers the ~1.5 s before the detector notices the previous victim                                                                                                    |
+| **Upgrade**             | When P3's election lands, only step 1 changes (fault round with seeded bids); steps 2 to 5 stay. Design doc Section 10                                                                                                                                                                                                                                       |
+
+### Tests (all passing)
+
+Pure scheduler, fake time: coordinator is the lowest alive ID · same seed gives the same sequence, another seed a different one · durations and gaps stay in range, and victims are spread evenly (3000 rounds, each node about 1/3) · fires once the gap has passed · only the coordinator injects · never while a peer is down or while muted · a peer going down restarts the gap · no new fault before the last one has ended. End to end, 3 real nodes on localhost with short timings: over 6 s, several faults happen and **two nodes are never silent at the same time** (checked every 5 ms).
+
+### Live check (localhost, 40 s, seed 42, durations 2 to 4 s, gaps 2 to 3 s)
+
+7 automatic faults. Victims in order: 1, 1, 2, 2, 2, 3, 3 (node 1 picked itself twice). No overlap. Both survivors logged `PEER_DOWN` 1.2 to 1.5 s after each `MUTE_START`, and `PEER_UP` after each `MUTE_END`.
+
+---
+
 ## Next
 
-- **Wed Oct 21:** fault tests on the 3 real machines (detection latency, false suspicions with no faults, firewall).
-- **Step B:** implement `fault_round.rs` from the design, after P3's election code lands; switch `fault_id` to the `uuid` crate (P6 added it to the workspace).
+- **Step B, blocked:** "test that the election skips suspected peers" (needs P3's election core) and in-flight tracking (needs P1's client multicast and P3's outcome event). Neither is in `main` as of Oct 26.
+- **Step B:** real-machine test with `enabled = true`, under load.
+- **Later:** switch `fault_id` to the `uuid` crate; replace the fallback coordinator with the fault round once P3's election lands.

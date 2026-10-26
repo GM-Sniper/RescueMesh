@@ -112,3 +112,9 @@ In this design **all three nodes know who the victim is**, because they all comp
 - **Repeatability:** two runs with the same seed and no load produce the same sequence of victims and durations.
 - **Fairness:** over 30 rounds, each node is picked roughly a third of the time.
 - **Lab machines:** the same checks with load running, plus detection latency per fault from the CSVs.
+
+## 10. Implemented first: the fallback version (Mon Oct 26)
+
+P3's bid exchange is not in `main` yet, so `crates/node/src/fault_round.rs` implements the Step B plan's fallback: **the lowest-ID live node (Bully rule on `alive_peers()`) is the coordinator**. It waits a seeded random gap while it sees every node alive, draws the victim and duration from the same seeded generator, and sends a `FaultCommand` (or mutes itself directly if it drew itself).
+
+What stays from this design: the seeded randomness (Section 5, SplitMix64), the `[faults]` config (Section 6), the knowledge rule (Section 7), off by default, and the safety guarantee (never two nodes silent). What changes until the election lands: one node issues the faults instead of all three electing, and the order travels over the network. Reasons and trade-offs: `p5-changes.md`, "Mon Oct 26".

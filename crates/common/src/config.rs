@@ -29,6 +29,9 @@ pub struct ClusterConfig {
     /// Load score inputs and weights (P3). Optional; missing values use the defaults.
     #[serde(default)]
     pub load: LoadConfig,
+    /// Automatic fault injection (P5). Optional; off unless `enabled = true`.
+    #[serde(default)]
+    pub faults: Faults,
 }
 
 /// One `[[nodes]]` entry.
@@ -80,6 +83,51 @@ impl Timing {
     }
 }
 
+/// The `[faults]` table (P5): automatic fault injection. Off by default, so runs
+/// without the table behave exactly as before. Design: `docs/p5-auto-injector-design.md`.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct Faults {
+    /// true = the nodes silence one of themselves on a random schedule.
+    pub enabled: bool,
+    /// Same seed = same victims, durations and gaps, so a run can be repeated.
+    pub seed: u64,
+    /// Shortest and longest silence. The spec caps it at 20 s.
+    pub min_duration_ms: u64,
+    pub max_duration_ms: u64,
+    /// Wait between faults, counted from when every node is alive again.
+    pub min_gap_ms: u64,
+    pub max_gap_ms: u64,
+}
+
+impl Default for Faults {
+    fn default() -> Self {
+        Faults {
+            enabled: false,
+            seed: 42,
+            min_duration_ms: 2_000,
+            max_duration_ms: 20_000,
+            min_gap_ms: 10_000,
+            max_gap_ms: 30_000,
+        }
+    }
+}
+
+impl Faults {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.min_duration_ms == 0 || self.min_duration_ms > self.max_duration_ms {
+            bail!("faults: need 0 < min_duration_ms <= max_duration_ms");
+        }
+        if self.max_duration_ms > 20_000 {
+            bail!("faults.max_duration_ms is over 20000 (the spec allows up to 20 s)");
+        }
+        if self.min_gap_ms == 0 || self.min_gap_ms > self.max_gap_ms {
+            bail!("faults: need 0 < min_gap_ms <= max_gap_ms");
+        }
+        Ok(())
+    }
+}
+
 impl ClusterConfig {
     /// Reads and checks the file. A mistake fails here, at startup, with a clear message.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -116,6 +164,7 @@ impl ClusterConfig {
             bail!("timing.suspect_after_ms must be longer than heartbeat_interval_ms");
         }
         self.load.check()?;
+        self.faults.check()?;
         Ok(())
     }
 
@@ -147,6 +196,26 @@ mod tests {
     "#;
 
     #[test]
+    fn faults_are_off_by_default_and_checked() {
+        let cfg = ClusterConfig::parse(THREE_NODES).unwrap();
+        assert!(!cfg.faults.enabled);
+        let on = format!("{THREE_NODES}\n[faults]\nenabled = true\nseed = 7\n");
+        let cfg = ClusterConfig::parse(&on).unwrap();
+        assert!(cfg.faults.enabled);
+        assert_eq!(cfg.faults.seed, 7);
+        assert_eq!(cfg.faults.max_duration_ms, 20_000); // other values keep their defaults
+        for bad in [
+            "max_duration_ms = 25000",
+            "min_duration_ms = 0",
+            "min_duration_ms = 5000\nmax_duration_ms = 3000",
+            "min_gap_ms = 0",
+        ] {
+            let text = format!("{THREE_NODES}\n[faults]\n{bad}\n");
+            assert!(ClusterConfig::parse(&text).is_err(), "should refuse: {bad}");
+        }
+    }
+
+    #[test]
     fn minimal_file_uses_defaults() {
         let cfg = ClusterConfig::parse(THREE_NODES).unwrap();
         assert_eq!(cfg.timing.heartbeat_interval_ms, 500);
@@ -158,7 +227,8 @@ mod tests {
 
     #[test]
     fn partial_tables_keep_other_defaults() {
-        let text = format!("{THREE_NODES}\n[timing]\nrpc_deadline_ms = 300\n[weights]\nage = 0.9\n");
+        let text =
+            format!("{THREE_NODES}\n[timing]\nrpc_deadline_ms = 300\n[weights]\nage = 0.9\n");
         let cfg = ClusterConfig::parse(&text).unwrap();
         assert_eq!(cfg.timing.rpc_deadline_ms, 300);
         assert_eq!(cfg.timing.heartbeat_interval_ms, 500);
