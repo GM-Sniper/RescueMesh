@@ -88,7 +88,27 @@ impl Node for NodeService {
     // P3: a peer's bid for one request; the reply carries ours (see election.rs).
     async fn exchange_bid(&self, req: Request<BidRequest>) -> Result<Response<Bid>, Status> {
         self.gate().await?;
-        let reply = election::handle_exchange_bid(&self.state, req.into_inner())?;
+        let call = req.into_inner();
+        let request = call.request.clone();
+        let round_of = |id: &str| self.state.election.lock().unwrap().round(id);
+        let before = request.as_ref().and_then(|r| round_of(&r.request_id));
+        let reply = election::handle_exchange_bid(&self.state, call)?;
+        // First we hear of this request (the client's copy is late or lost), or the peer
+        // moved us to a newer round: run Submit for it too. Otherwise, with the lowest
+        // bid, we would be everyone's winner but never plan. The reply has no client
+        // to go to; a client retry finds the committed plan.
+        if let Some(request) = request
+            && (before.is_none() || round_of(&request.request_id) > before)
+        {
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                let _guard = state.start_request(); // real work: it counts in our load
+                let id = request.request_id.clone();
+                if let Err(status) = handle_submit(&state, request).await {
+                    tracing::debug!(request_id = %id, %status, "submit started by a bid failed");
+                }
+            });
+        }
         self.gate().await?; // muted meanwhile: the reply never leaves
         Ok(Response::new(reply))
     }
@@ -674,6 +694,31 @@ mod tests {
         let replies = [r1, r2].map(|r| r.unwrap().into_inner());
         assert_eq!(replies.iter().filter(|r| r.plan.is_some()).count(), 1, "{replies:?}");
         assert!(replies.iter().all(|r| r.executor_node != 3), "a muted node cannot win");
+    }
+
+    #[tokio::test]
+    async fn winner_that_only_got_a_peers_bid_still_plans() {
+        let store = shared_store();
+        let nodes = three_nodes(store.clone()).await;
+        // Only node 1 gets the client's copy. It is busy with it (queue 1), so nodes 2 and
+        // 3 bid a lower load, and node 2 wins (tie with 3) from the bid call alone.
+        let mut c1 = nodes[0].1.clone();
+        let first = c1.submit(submit_req("e4", 7)).await.unwrap().into_inner();
+        assert_eq!(first.executor_node, 2, "{first:?}");
+        assert!(first.plan.is_none());
+
+        // Node 2 plans in the background; the client's retry gets that plan.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let stored = loop {
+            if let Some(plan) = store.lookup_request("e4").await.unwrap() {
+                break plan;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node 2 never planned");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let again = c1.submit(submit_req("e4", 7)).await.unwrap().into_inner();
+        assert!(again.duplicate);
+        assert_eq!(again.plan, Some(plan_to_pb(&stored)));
     }
 
     #[tokio::test]
