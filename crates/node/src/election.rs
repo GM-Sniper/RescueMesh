@@ -11,13 +11,16 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use common::NodeId;
 use common::pb::{self, BidRequest, Coordinator, CoordinatorAck, SubmitRequest};
 use tonic::Status;
 
 use crate::broadcast::{PeerResult, broadcast_until};
+use crate::election_log::ElectionRow;
 use crate::state::NodeState;
 
 /// One node's bid for one request and round, as this node holds it.
@@ -254,6 +257,17 @@ impl ElectionTable {
         }
     }
 
+    /// Every bid held for the current round, own included, smallest node ID first.
+    pub fn bids(&self, request_id: &str) -> Vec<Bid> {
+        let Some(entry) = self.entries.get(request_id) else {
+            return Vec::new();
+        };
+        let mut all: Vec<Bid> = entry.bids.values().copied().collect();
+        all.push(entry.my_bid);
+        all.sort_by_key(|b| b.node_id);
+        all
+    }
+
     /// Split decisions seen in the current round.
     pub fn splits(&self, request_id: &str) -> u32 {
         self.entries.get(request_id).map_or(0, |e| e.splits)
@@ -280,7 +294,11 @@ const BID_TIMEOUT: Duration = Duration::from_millis(300);
 /// round (design doc Section 3: a missing bid means that node is out).
 /// Every peer gets our bid, but we only wait for the peers the failure detector
 /// reports alive, so a peer already marked down does not cost the full timeout.
-pub async fn run_election(state: &NodeState, request: &SubmitRequest) -> Option<NodeId> {
+///
+/// With the election log on, the CSV row is written one bid timeout later
+/// (`write_row_later`); that is why this takes the node's shared `Arc`.
+pub async fn run_election(state: &Arc<NodeState>, request: &SubmitRequest) -> Option<NodeId> {
+    let start = Instant::now();
     let request_id = request.request_id.clone();
 
     // Lock, read, unlock: the table is never locked while we wait on the network.
@@ -294,24 +312,75 @@ pub async fn run_election(state: &NodeState, request: &SubmitRequest) -> Option<
         bid: Some(bid_to_pb(&request_id, round, mine)),
         request: Some(request.clone()),
     };
+    // broadcast() runs this closure once per attempt, its retry included, so
+    // counting here gives the exact number of bid calls sent.
+    let sent = Arc::new(AtomicU32::new(0));
+    let counter = sent.clone();
     let alive = state.alive_peers();
     let results = broadcast_until(state, BID_TIMEOUT, &alive, move |mut client| {
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
         let call = call.clone();
         async move { client.exchange_bid(call).await }
     })
     .await;
 
-    let mut table = state.election.lock().unwrap();
-    for (peer, result) in results {
-        match result {
-            PeerResult::Reply(reply) if reply.request_id == request_id => {
-                let recorded = table.record_bid(&request_id, reply.round, bid_from_pb(&reply));
-                tracing::debug!(%request_id, peer, ?recorded, "bid received");
+    let (winner, bids) = {
+        let mut table = state.election.lock().unwrap();
+        for (peer, result) in results {
+            match result {
+                PeerResult::Reply(reply) if reply.request_id == request_id => {
+                    let recorded = table.record_bid(&request_id, reply.round, bid_from_pb(&reply));
+                    tracing::debug!(%request_id, peer, ?recorded, "bid received");
+                }
+                other => tracing::debug!(%request_id, peer, ?other, "no bid from peer"),
             }
-            other => tracing::debug!(%request_id, peer, ?other, "no bid from peer"),
         }
+        (table.decide(&request_id), table.bids(&request_id))
+    };
+    let duration = start.elapsed();
+
+    if state.election_log.is_some() {
+        let row = ElectionRow {
+            request_id,
+            round,
+            bids,
+            winner,
+            duration,
+            waited_full_t: duration >= BID_TIMEOUT,
+            late_bids: 0,
+            splits: 0,
+            bid_calls_sent: sent.load(AtomicOrdering::Relaxed),
+            wall_ts_us: now_unix_us(),
+        };
+        write_row_later(state.clone(), row);
     }
-    table.decide(&request_id)
+    winner
+}
+
+/// Writes the election's CSV row one bid timeout after the decision, so the late
+/// bids and split announcements that arrive after it are counted too.
+fn write_row_later(state: Arc<NodeState>, mut row: ElectionRow) {
+    tokio::spawn(async move {
+        tokio::time::sleep(BID_TIMEOUT).await;
+        {
+            let table = state.election.lock().unwrap();
+            // A newer round started meanwhile: its counts are not this election's.
+            if table.round(&row.request_id) == Some(row.round) {
+                row.late_bids = table.late_bids(&row.request_id);
+                row.splits = table.splits(&row.request_id);
+            }
+        }
+        if let Some(log) = &state.election_log {
+            log.write(&row);
+        }
+    });
+}
+
+fn now_unix_us() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_micros())
+        .unwrap_or(0)
 }
 
 /// A peer's `ExchangeBid` call (design doc step 4): store its bid, reply with mine.
@@ -974,5 +1043,45 @@ mod tests {
             let err = handle_announce_winner(&n2, bad).unwrap_err();
             assert_eq!(err.code(), tonic::Code::InvalidArgument);
         }
+    }
+
+    // ---- Election CSV ----
+
+    #[tokio::test]
+    async fn csv_row_counts_retries_late_bids_and_splits() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("rescuemesh-test-{}-election", std::process::id()));
+        path.push("elections.csv");
+        let _ = std::fs::remove_file(&path);
+
+        let cfg = three_node_config();
+        serve(2, &cfg).await; // node 3 is not running: its call fails fast and is retried
+        let peers = Peers::new(&cfg, 1).unwrap();
+        let log = crate::election_log::ElectionLog::open(&path, 1, "run7").unwrap();
+        let n1 = Arc::new(NodeState::new(1, cfg.clone(), peers).with_election_log(log));
+
+        // Both idle (score 0): the tie goes to node 1.
+        assert_eq!(run_election(&n1, &request("r7")).await, Some(1));
+        // After the decision, within one bid timeout: a late bid and a split.
+        n1.election
+            .lock()
+            .unwrap()
+            .record_bid("r7", 0, bid(3, 0.31));
+        let rival = Coordinator {
+            request_id: "r7".to_string(),
+            round: 0,
+            node_id: 2,
+        };
+        handle_announce_winner(&n1, rival).unwrap();
+
+        tokio::time::sleep(BID_TIMEOUT + Duration::from_millis(200)).await;
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        let cols: Vec<&str> = lines[1].split(',').collect();
+        // run_id,node_id,request_id,round,bids,winner
+        assert_eq!(cols[..6], ["run7", "1", "r7", "0", "1:0;2:0", "1"]);
+        // waited_full_t,late_bids,split_decision,bid_calls_sent: node 2 once, node 3 twice
+        assert_eq!(cols[7..11], ["false", "1", "1", "3"]);
     }
 }

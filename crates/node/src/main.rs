@@ -11,6 +11,7 @@ mod broadcast;
 // P3: election rule. No caller yet: the bid exchange is the next step.
 #[allow(dead_code)]
 mod election;
+mod election_log;
 mod fault_log;
 mod heartbeat;
 mod load;
@@ -37,6 +38,7 @@ use common::config::ClusterConfig;
 use common::pb::node_server::NodeServer;
 use tracing_subscriber::EnvFilter;
 
+use crate::election_log::ElectionLog;
 use crate::fault_log::FaultLog;
 use crate::peers::Peers;
 use crate::service::NodeService;
@@ -95,7 +97,15 @@ async fn main() -> anyhow::Result<()> {
     let log_path = format!("logs/faults-node{}.csv", args.id);
     let fault_log = FaultLog::open(&log_path, args.id, &run_id)
         .with_context(|| format!("cannot open fault log {log_path}"))?;
-    let state = Arc::new(NodeState::new(args.id, config, peers).with_fault_log(fault_log));
+    // P3: election CSV, same run_id so P6 can join it with the other logs.
+    let election_log_path = format!("logs/elections-node{}.csv", args.id);
+    let election_log = ElectionLog::open(&election_log_path, args.id, &run_id)
+        .with_context(|| format!("cannot open election log {election_log_path}"))?;
+    let state = Arc::new(
+        NodeState::new(args.id, config, peers)
+            .with_fault_log(fault_log)
+            .with_election_log(election_log),
+    );
 
     // 6. Background tasks: CPU sampling for the load score (P3), heartbeats to
     //    each peer, and the detector ticker.
