@@ -110,17 +110,18 @@ impl Node for NodeService {
 const MAX_PLAN_ATTEMPTS: usize = 3;
 
 /// Task 7: one client request, in the order from P4's notes (docs/p4-changes.md):
-/// lookup_request -> incident_from_pb -> snapshot -> plan -> commit -> reply.
+/// lookup_request -> incident_from_pb -> election -> snapshot -> plan -> commit -> reply.
 async fn handle_submit(
-    state: &NodeState,
+    state: &Arc<NodeState>, // Arc: the election and the win announcement keep their own handle
     req: SubmitRequest,
 ) -> Result<Response<SubmitReply>, Status> {
     // 1. Every request needs its ID (idempotency) and an incident (the only kind in Step A).
-    let request_id = req.request_id;
+    let request_id = req.request_id.clone();
     if request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is empty"));
     }
-    let Some(submit_request::Kind::Incident(incident)) = req.kind else {
+    // Cloned, not moved: the election sends the whole request along with our bid.
+    let Some(submit_request::Kind::Incident(incident)) = req.kind.clone() else {
         return Err(Status::invalid_argument("expected an incident"));
     };
     let reply = |plan: &Plan, duplicate: bool| {
@@ -141,7 +142,30 @@ async fn handle_submit(
     let incident = incident_from_pb(incident).map_err(Status::invalid_argument)?;
     let weights = state.config.weights;
 
-    // 4. Snapshot -> plan -> commit. commit re-checks that every planned resource is still
+    // 4. Election (P3): every node that got this request bids, and only the winner plans.
+    match election::elect(state, &req).await {
+        Some(winner) if winner == state.id => {}
+        // Lost: name the winner and send no plan (Q2). "No plan" is not an empty plan;
+        // the client keeps the reply that has one.
+        Some(winner) => {
+            return Ok(Response::new(SubmitReply {
+                request_id,
+                executor_node: winner,
+                plan: None,
+                duplicate: false,
+            }));
+        }
+        // No bid was ready: no node can reach the shared state now. The client retries.
+        None => return Err(Status::unavailable("no node can take this request now; retry")),
+    }
+    // Won: tell the peers before planning, so a rival that also thinks it won can step
+    // aside early (design doc step 6). In the background: the acks carry nothing we need,
+    // so the client's reply never waits for them.
+    let round = state.election.lock().unwrap().round(&request_id).unwrap_or(0);
+    let (announcer, id) = (state.clone(), request_id.clone());
+    tokio::spawn(async move { election::announce_winner(&announcer, &id, round).await });
+
+    // 5. Snapshot -> plan -> commit. commit re-checks that every planned resource is still
     //    free, so a resource taken by another request in between is caught, and we plan again.
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
         let now = now_unix_ms();
