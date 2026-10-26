@@ -575,4 +575,118 @@ mod tests {
         let reply = client.heartbeat(ping()).await.unwrap().into_inner();
         assert_eq!(reply.node_id, 1);
     }
+
+    // ---- Step B task 4: the election in Submit. 3 real nodes on localhost share one
+    // store, standing in for the DFS: with a store each, a second plan would go unnoticed.
+
+    use common::pb::node_client::NodeClient;
+    use common::pb::node_server::NodeServer;
+    use common::shared_state::SharedState;
+    use tonic::transport::Channel;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn shared_store() -> Arc<dyn SharedState> {
+        Arc::new(crate::store::InMemoryStore::with_default_resources())
+    }
+
+    /// Starts 3 real nodes that all use `store`; returns each one's state and a client to it.
+    async fn three_nodes(store: Arc<dyn SharedState>) -> Vec<(Arc<NodeState>, NodeClient<Channel>)> {
+        let cfg = ClusterConfig::parse(&format!(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:{}\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:{}\"\n\
+             [[nodes]]\nid = 3\naddr = \"127.0.0.1:{}\"\n",
+            free_port(),
+            free_port(),
+            free_port()
+        ))
+        .unwrap();
+        let mut nodes = Vec::new();
+        for id in 1..=3 {
+            let peers = Peers::new(&cfg, id).unwrap();
+            let state = Arc::new(NodeState::new(id, cfg.clone(), peers).with_store(store.clone()));
+            let addr: std::net::SocketAddr = cfg.node(id).unwrap().addr.parse().unwrap();
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(NodeServer::new(NodeService::new(state.clone())))
+                    .serve(addr),
+            );
+            let client = loop {
+                match NodeClient::connect(format!("http://{addr}")).await {
+                    Ok(c) => break c,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            };
+            nodes.push((state, client));
+        }
+        nodes
+    }
+
+    #[tokio::test]
+    async fn request_sent_to_all_three_gets_exactly_one_plan() {
+        let store = shared_store();
+        let nodes = three_nodes(store.clone()).await;
+        // The client multicasts: the same request_id to every node at once.
+        let [mut c1, mut c2, mut c3] = [0, 1, 2].map(|i| nodes[i].1.clone());
+        let (r1, r2, r3) = tokio::join!(
+            c1.submit(submit_req("e1", 7)),
+            c2.submit(submit_req("e1", 7)),
+            c3.submit(submit_req("e1", 7)),
+        );
+        let replies = [r1, r2, r3].map(|r| r.unwrap().into_inner());
+
+        let planned: Vec<&SubmitReply> = replies.iter().filter(|r| r.plan.is_some()).collect();
+        assert_eq!(planned.len(), 1, "exactly one node plans: {replies:?}");
+        let winner = planned[0].executor_node;
+        assert!(replies.iter().all(|r| r.executor_node == winner), "same winner everywhere: {replies:?}");
+        assert!(replies.iter().all(|r| !r.duplicate));
+        assert_eq!(store.snapshot().await.unwrap().incidents.len(), 1, "stored once");
+    }
+
+    #[tokio::test]
+    async fn retry_to_a_node_that_lost_returns_the_same_plan() {
+        let nodes = three_nodes(shared_store()).await;
+        let [mut c1, mut c2, mut c3] = [0, 1, 2].map(|i| nodes[i].1.clone());
+        let (r1, r2, r3) = tokio::join!(
+            c1.submit(submit_req("e2", 7)),
+            c2.submit(submit_req("e2", 7)),
+            c3.submit(submit_req("e2", 7)),
+        );
+        let replies = [r1, r2, r3].map(|r| r.unwrap().into_inner());
+        let first = replies.iter().find(|r| r.plan.is_some()).expect("one plan");
+
+        let loser = if first.executor_node == 1 { 2 } else { 1 };
+        let mut client = nodes[loser - 1].1.clone();
+        let again = client.submit(submit_req("e2", 7)).await.unwrap().into_inner();
+        assert!(again.duplicate, "answered from the store, not planned again");
+        assert_eq!(again.plan, first.plan);
+    }
+
+    #[tokio::test]
+    async fn with_one_node_muted_the_other_two_still_give_one_plan() {
+        let nodes = three_nodes(shared_store()).await;
+        nodes[2].0.mute_for(Duration::from_secs(5)); // node 3 goes silent
+        // Node 3's copy from the client would be held by its mute: only 1 and 2 answer.
+        let [mut c1, mut c2] = [0, 1].map(|i| nodes[i].1.clone());
+        let (r1, r2) = tokio::join!(c1.submit(submit_req("e3", 7)), c2.submit(submit_req("e3", 7)));
+        let replies = [r1, r2].map(|r| r.unwrap().into_inner());
+        assert_eq!(replies.iter().filter(|r| r.plan.is_some()).count(), 1, "{replies:?}");
+        assert!(replies.iter().all(|r| r.executor_node != 3), "a muted node cannot win");
+    }
+
+    #[tokio::test]
+    async fn invalid_request_starts_no_election() {
+        let svc = service();
+        let mut bad = incident_to_pb(&generate_incident(7));
+        bad.severity = 0;
+        let req = Request::new(SubmitRequest {
+            request_id: "bad".into(),
+            kind: Some(submit_request::Kind::Incident(bad)),
+        });
+        let err = svc.submit(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(svc.state.election.lock().unwrap().round("bad").is_none(), "no election for it");
+    }
 }
