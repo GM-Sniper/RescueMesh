@@ -218,6 +218,7 @@ name = "common"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "prost",
  "protox",
  "rand",
@@ -668,6 +669,7 @@ name = "node"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clap",
  "common",
  "sysinfo",
