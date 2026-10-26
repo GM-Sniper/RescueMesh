@@ -186,7 +186,7 @@ const MAX_MUTE_MS: u64 = 20_000;
 /// Task 4: check the fault order, go silent for duration_ms, and ack.
 /// Refusals are FaultAcks (accepted = false + reason), not gRPC errors, so the
 /// injector only has to read one kind of answer.
-async fn handle_inject_fault(
+pub(crate) async fn handle_inject_fault(
     state: &Arc<NodeState>, // Arc: the "mute ended" task keeps its own handle
     cmd: FaultCommand,
 ) -> Result<Response<FaultAck>, Status> {
