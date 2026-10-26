@@ -16,6 +16,7 @@ use common::pb::{
 use common::planner;
 use tonic::{Request, Response, Status};
 
+use crate::election;
 use crate::state::NodeState;
 use crate::store::ApplyError;
 
@@ -84,12 +85,15 @@ impl Node for NodeService {
         handle_inject_fault(&self.state, req.into_inner()).await
     }
 
-    // P3: election calls. Placeholders until the bid exchange is wired (StepB/P3-election).
-    async fn exchange_bid(&self, _req: Request<BidRequest>) -> Result<Response<Bid>, Status> {
+    // P3: a peer's bid for one request; the reply carries ours (see election.rs).
+    async fn exchange_bid(&self, req: Request<BidRequest>) -> Result<Response<Bid>, Status> {
         self.gate().await?;
-        Err(Status::unimplemented("election not wired yet"))
+        let reply = election::handle_exchange_bid(&self.state, req.into_inner())?;
+        self.gate().await?; // muted meanwhile: the reply never leaves
+        Ok(Response::new(reply))
     }
 
+    // P3: placeholder until the winner announcement is built (StepB/P3-election).
     async fn announce_winner(
         &self,
         _req: Request<Coordinator>,

@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use common::NodeId;
 use common::pb::{self, BidRequest, SubmitRequest};
+use tonic::Status;
 
 use crate::broadcast::{PeerResult, broadcast};
 use crate::state::NodeState;
@@ -192,8 +193,8 @@ const BID_TIMEOUT: Duration = Duration::from_millis(300);
 ///
 /// A peer that fails, times out or is not reached simply has no bid in this
 /// round (design doc Section 3: a missing bid means that node is out).
-/// Not yet: stopping early for peers marked down (part 2), answering peers'
-/// calls (part 3), following a peer into a newer round (part 4).
+/// Not yet: stopping early for peers marked down (part 2), following a peer
+/// into a newer round (part 4).
 pub async fn run_election(state: &NodeState, request: &SubmitRequest) -> Option<NodeId> {
     let request_id = request.request_id.clone();
 
@@ -225,6 +226,35 @@ pub async fn run_election(state: &NodeState, request: &SubmitRequest) -> Option<
         }
     }
     table.decide(&request_id)
+}
+
+/// A peer's `ExchangeBid` call (design doc step 4): store its bid, reply with mine.
+///
+/// If this is the first we hear of the request (the client's copy is late or
+/// lost), this is where our bid gets fixed; the client's copy later reuses it.
+pub fn handle_exchange_bid(state: &NodeState, call: BidRequest) -> Result<pb::Bid, Status> {
+    let Some(theirs) = call.bid else {
+        return Err(Status::invalid_argument("bid is missing"));
+    };
+    let Some(request) = call.request else {
+        return Err(Status::invalid_argument("request is missing"));
+    };
+    if theirs.request_id.is_empty() || theirs.request_id != request.request_id {
+        return Err(Status::invalid_argument(
+            "bid and request must carry the same non-empty request_id",
+        ));
+    }
+    let request_id = theirs.request_id.clone();
+
+    let mut table = state.election.lock().unwrap();
+    // TODO(P3, bid hook with P1): if we had never seen this request, also start our
+    // own election here. Otherwise, when we have the lowest bid, the peers decide we
+    // won but we never plan, and the client has to time out and retry.
+    let mine = table.my_bid(&request_id, || own_bid(state));
+    let recorded = table.record_bid(&request_id, theirs.round, bid_from_pb(&theirs));
+    tracing::debug!(%request_id, from = theirs.node_id, ?recorded, "bid call received");
+    let round = table.round(&request_id).unwrap_or(0);
+    Ok(bid_to_pb(&request_id, round, mine))
 }
 
 /// My bid right now, from P3's load collector.
@@ -435,9 +465,13 @@ mod tests {
 
     // ---- run_election over a real network (localhost) ----
 
+    use std::sync::Arc;
+
     use common::config::ClusterConfig;
+    use common::pb::node_server::NodeServer;
 
     use crate::peers::Peers;
+    use crate::service::NodeService;
 
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")
@@ -460,9 +494,30 @@ mod tests {
         .unwrap()
     }
 
-    fn state_for(id: NodeId, cfg: &ClusterConfig) -> NodeState {
+    fn state_for(id: NodeId, cfg: &ClusterConfig) -> Arc<NodeState> {
         let peers = Peers::new(cfg, id).unwrap();
-        NodeState::new(id, cfg.clone(), peers)
+        Arc::new(NodeState::new(id, cfg.clone(), peers))
+    }
+
+    /// A real server for node `id`, in the background.
+    async fn serve(id: NodeId, cfg: &ClusterConfig) -> Arc<NodeState> {
+        let state = state_for(id, cfg);
+        let addr = cfg.node(id).unwrap().addr.parse().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(NodeServer::new(NodeService::new(state.clone())))
+                .serve(addr),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it start listening
+        state
+    }
+
+    /// The pb bid that `from` would send for `request_id`, round 0.
+    fn call(request_id: &str, from: NodeId, load_score: f64) -> BidRequest {
+        BidRequest {
+            bid: Some(bid_to_pb(request_id, 0, bid(from, load_score))),
+            request: Some(request(request_id)),
+        }
     }
 
     fn request(request_id: &str) -> SubmitRequest {
@@ -479,5 +534,100 @@ mod tests {
         assert_eq!(run_election(&node1, &request("r7")).await, Some(1));
         // The decision is stored in the table.
         assert_eq!(node1.election.lock().unwrap().winner("r7"), Some(1));
+    }
+
+    #[tokio::test]
+    async fn three_nodes_agree_on_one_winner() {
+        let cfg = three_node_config();
+        let (n1, n2, n3) = (
+            serve(1, &cfg).await,
+            serve(2, &cfg).await,
+            serve(3, &cfg).await,
+        );
+        let r = request("r7");
+        let winners = tokio::join!(
+            run_election(&n1, &r),
+            run_election(&n2, &r),
+            run_election(&n3, &r)
+        );
+        assert!(winners.0.is_some());
+        assert_eq!(winners.0, winners.1);
+        assert_eq!(winners.0, winners.2);
+    }
+
+    #[tokio::test]
+    async fn least_loaded_node_wins() {
+        let cfg = three_node_config();
+        let (n1, n2, n3) = (
+            serve(1, &cfg).await,
+            serve(2, &cfg).await,
+            serve(3, &cfg).await,
+        );
+        // Requests in progress raise the queue part of the score. Node 3 stays idle.
+        let _busy1 = [n1.start_request(), n1.start_request()];
+        let _busy2 = n2.start_request();
+        let r = request("r7");
+        let winners = tokio::join!(
+            run_election(&n1, &r),
+            run_election(&n2, &r),
+            run_election(&n3, &r)
+        );
+        assert_eq!(winners, (Some(3), Some(3), Some(3)));
+    }
+
+    #[tokio::test]
+    async fn muted_node_is_left_out() {
+        let cfg = three_node_config();
+        let (n1, n2, n3) = (
+            serve(1, &cfg).await,
+            serve(2, &cfg).await,
+            serve(3, &cfg).await,
+        );
+        // Node 3 would win (idle), but it is muted.
+        let _busy1 = [n1.start_request(), n1.start_request()];
+        let _busy2 = n2.start_request();
+        n3.mute_for(Duration::from_secs(5));
+        let r = request("r7");
+        let winners = tokio::join!(run_election(&n1, &r), run_election(&n2, &r));
+        assert_eq!(winners, (Some(2), Some(2)));
+    }
+
+    #[tokio::test]
+    async fn peer_call_first_fixes_our_bid_for_the_client_copy() {
+        let cfg = three_node_config();
+        let n2 = state_for(2, &cfg);
+        // Node 1's call arrives before the client's copy: node 2 fixes its bid now.
+        let reply = handle_exchange_bid(&n2, call("r7", 1, 0.20)).unwrap();
+        assert_eq!((reply.node_id, reply.round), (2, 0));
+
+        // Node 2 gets busier, then node 3's call arrives: same bid as before.
+        let _busy = n2.start_request();
+        let again = handle_exchange_bid(&n2, call("r7", 3, 0.31)).unwrap();
+        assert_eq!(again.load_score, reply.load_score);
+        // Node 2 was idle when its bid was fixed (score 0.0), so it beats 0.20 and 0.31.
+        assert_eq!(n2.election.lock().unwrap().decide("r7"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn bad_bid_calls_are_rejected() {
+        let cfg = three_node_config();
+        let n2 = state_for(2, &cfg);
+        let mut mismatched = call("r7", 1, 0.20);
+        mismatched.request = Some(request("r8"));
+        let mut no_bid = call("r7", 1, 0.20);
+        no_bid.bid = None;
+        let mut no_request = call("r7", 1, 0.20);
+        no_request.request = None;
+        for bad in [mismatched, no_bid, no_request, call("", 1, 0.20)] {
+            let err = handle_exchange_bid(&n2, bad).unwrap_err();
+            assert_eq!(
+                err.code(),
+                tonic::Code::InvalidArgument,
+                "{}",
+                err.message()
+            );
+        }
+        // Nothing was stored for any of them.
+        assert_eq!(n2.election.lock().unwrap().round("r7"), None);
     }
 }
