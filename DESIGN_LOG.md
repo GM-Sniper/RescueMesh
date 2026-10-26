@@ -51,6 +51,8 @@ Checked: the plan's worked example (queue 4, CPU 50 %, service 20 ms) gives 0.39
 
 ## P4: Store and Change Log
 
+**SUPERSEDED on Oct 21** by "P4: Shared state in a distributed file system" at the end of this file. The log, `applied` map and replication path described here were removed from the code. Kept for history; the code is on branch `p4/backup-step-a-store`.
+
 Code and usage: `crates/node/src/store.rs`, `docs/p4-changes.md`. This section holds the decisions only.
 
 | Decision | Alternatives | Why |
@@ -85,3 +87,58 @@ P3's Q4: keep the plan from the lower origin `node_id`. Step A: **first applied 
 | **Undo** | Apply as now. On a late lower-origin entry, release the loser's assignments, reset its incident, keep its log entry | Works with the current state. Needs a reversible apply, and the winner's resources may have been taken meanwhile |
 | **Replay** | Rebuild the state from the log with "lowest origin per request_id counts" | Needs a clock-free canonical order of entries. We do not have one |
 | **Avoid** | Wait for Coordinator confirmation before `try_apply` | Adds delay to every request, and a late Coordinator still leaves the problem |
+
+
+## P4: Shared state in a distributed file system (DRAFT, for Yasmina to edit)
+
+Code and usage: `crates/common/src/shared_state.rs`, `docs/p4-changes.md`. Replaces the section "P4: Store and Change Log" above. Status as of Oct 23: **SeaweedFS is the chosen candidate, pending the spike. The spike has run; its result changes how SeaweedFS can be used (see the last table).**
+
+### What changed and what stayed
+
+On Oct 21 the design changed: shared state lives in an existing distributed file system (DFS) instead of per-node stores kept equal by our own replicated log. Removed from the code: the log, the `applied` map, `entries_since`, `apply_remote`. Kept:
+
+| Idea | Where it is now |
+|---|---|
+| `request_id` is the dedup key, because a client retry can land on a different node | `SharedState::commit` is create-if-absent on `request_id`; `lookup_request` reads it |
+| Ordering comes from versions or counters, never from clocks | Left to the backend. The interface has no timestamps |
+| The write path re-checks that every planned resource is still free, because `snapshot()` is a copy | `commit` returns `ResourceTaken` and writes nothing |
+| A request with no free resource is recorded as `Open` with an empty plan | Same, and a retry gets the same empty plan |
+
+### Decisions
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| The interface is an `async` trait whose methods can fail | A synchronous, infallible trait (simplest for the in-memory store) | A DFS write is a network call and can fail. A synchronous trait now would make P1, P3 and P6 rewrite every call site later |
+| `#[async_trait]` (boxed futures) | Native `async fn` in traits | Nodes hold `Arc<dyn SharedState>` so the backend is chosen at start-up. Native async fn in traits cannot be used behind `dyn` |
+| `commit` returns an enum with four cases: `Committed`, `AlreadyCommitted(plan)`, `ResourceTaken`, `StateUnavailable` | `Result<Plan, Error>`; separate calls for "create" and "check" | Each case needs different caller behavior, and an enum makes the compiler force every caller to handle all four. A separate check-then-create has a gap in which two nodes both pass the check |
+| `commit(request_id, incident, plan)`: the incident is a parameter | `commit(request_id, plan)` as first specified | A `Plan` holds only an incident id, and the stored state needs the incident (as `Open` when the plan is empty). Open question 1 in `docs/p4-changes.md` |
+| An unknown resource is reported as `ResourceTaken` | A fifth variant for "unknown resource" | The spec had four variants and the caller's cure is the same (snapshot, plan again). Open question 2 |
+| In-memory store stays behind the trait for now | Wait for the DFS backend before landing the interface | The interface unblocks P1, P2, P3 and P6 today. Each node's in-memory copy is NOT shared, so no cross-node guarantee exists until the DFS backend does |
+
+### Report note (ready to paste)
+
+SeaweedFS is a service we use. The consistency rules are ours: how create-if-absent is used on `request_id`, why a retry is safe (idempotency), and how a retry is answered with the stored plan. SeaweedFS stores the bytes; our code decides what a correct write is.
+
+### DFS decision: SeaweedFS (chosen pending the spike) and the alternatives
+
+| Alternative | Why it was ruled out |
+|---|---|
+| **Our own thin replication layer** with a file API | It is the replication we already had (a log and sync between nodes), plus the work of defining a file protocol. It moves the same problem rather than removing it |
+| **GlusterFS, Ceph, Lustre, BeeGFS** | Linux-only or too heavy to install and run on the team's mixed lab machines. Platform support: UNVERIFIED for each, not checked in detail |
+| **Windows DFS Replication** | Windows Server only, multi-master, and no atomic create-if-absent |
+| **JuiceFS** | Keeps its metadata in a separate database (Redis, MySQL and similar), which centralizes the state |
+| **XtreemFS** | Server runs only on Linux and Solaris. Maintenance status: UNVERIFIED |
+| **etcd, ZooKeeper** | Strong atomic operations, but they are coordination stores, not file systems |
+| **NFS** | One central server |
+| **Syncthing** | Eventual consistency only: no atomic create |
+| **Google Drive** | Central service; ruled out by Yasmina |
+| **SeaweedFS** (chosen, pending the spike) | Runs as a single binary on Windows and Linux (Windows run verified on 4.48). Each filer can keep its own local metadata store (verified), so no central database is needed. Used over HTTP; nothing is mounted |
+
+### Spike result that affects the decision (Oct 23, SeaweedFS 4.48, Windows 11, localhost)
+
+| Finding | Evidence | Consequence |
+|---|---|---|
+| Plain filer HTTP `PUT` with `If-None-Match: *` does **not** create-if-absent | Second create returned 201 and overwrote the file | Cannot be used for `commit` |
+| 24 concurrent creates over 3 filers all succeeded, and the filers sometimes ended up holding different winners | 0 of 8 rounds had exactly one winner; filers disagreed in 3 of 8 (4 of 8 and 6 of 8 in earlier runs) | The filers replicate metadata asynchronously, so writes to different filers are last-writer-wins |
+| 3 filers with their own local stores do share metadata, with no central database | A write on one filer was readable on the others after 3 to 28 ms (median 7 ms, localhost) | Check passes, but the sharing is asynchronous |
+| The **S3 gateway's** `If-None-Match: *` did give exactly one winner over two gateways on different filers | 8 of 8 scripted rounds, 11 of 11 earlier manual rounds, and 4 of 4 rounds with a filer killed | The only tested way to get create-if-absent from SeaweedFS. Why it works is UNVERIFIED (likely a shared lock among filers). **Needs Yasmina's decision**: use the S3 gateway, test the filer gRPC exclusive-create (UNVERIFIED), or reconsider |

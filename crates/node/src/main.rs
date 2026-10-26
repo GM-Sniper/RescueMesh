@@ -20,9 +20,7 @@ mod node_metrics;
 mod peers;
 mod service;
 mod state;
-// P4: store and change log. Used by the Submit handler; the replication functions
-// (apply_remote, entries_since, applied) are not called until Step B.
-#[allow(dead_code)]
+// P4: in-memory implementation of the shared-state interface (common::shared_state).
 mod store;
 
 use std::net::SocketAddr;

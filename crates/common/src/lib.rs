@@ -15,3 +15,4 @@ pub mod domain;
 pub mod generators;
 pub mod load;
 pub mod planner;
+pub mod shared_state;
