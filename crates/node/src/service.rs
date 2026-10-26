@@ -93,13 +93,15 @@ impl Node for NodeService {
         Ok(Response::new(reply))
     }
 
-    // P3: placeholder until the winner announcement is built (StepB/P3-election).
+    // P3: a peer announces it won an election; we check it against ours (see election.rs).
     async fn announce_winner(
         &self,
-        _req: Request<Coordinator>,
+        req: Request<Coordinator>,
     ) -> Result<Response<CoordinatorAck>, Status> {
         self.gate().await?;
-        Err(Status::unimplemented("election not wired yet"))
+        let ack = election::handle_announce_winner(&self.state, req.into_inner())?;
+        self.gate().await?; // muted meanwhile: the reply never leaves
+        Ok(Response::new(ack))
     }
 }
 

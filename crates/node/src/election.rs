@@ -14,7 +14,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use common::NodeId;
-use common::pb::{self, BidRequest, SubmitRequest};
+use common::pb::{self, BidRequest, Coordinator, CoordinatorAck, SubmitRequest};
 use tonic::Status;
 
 use crate::broadcast::{PeerResult, broadcast_until};
@@ -80,6 +80,10 @@ struct Entry {
     winner: Option<NodeId>,
     /// Bids that arrived after the decision (election metrics, design doc Section 8).
     late_bids: u32,
+    /// Announcements from a winner other than ours (design doc Section 5).
+    splits: u32,
+    /// We believed we won, but a lower node ID announced too: we do not plan.
+    stepped_aside: bool,
 }
 
 impl Entry {
@@ -90,8 +94,29 @@ impl Entry {
             bids: BTreeMap::new(),
             winner: None,
             late_bids: 0,
+            splits: 0,
+            stepped_aside: false,
         }
     }
+}
+
+/// What a peer's winner announcement meant to us (design doc Section 5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Announced {
+    /// We decided the same winner.
+    Agrees,
+    /// We have not decided this round yet; our own decision still counts.
+    BeforeDecision,
+    /// We decided a different winner: a split decision. `step_aside` is true when
+    /// we believed we won and the announcer has a lower node ID, so it keeps the
+    /// request and we do not plan.
+    Split { step_aside: bool },
+    /// For an earlier round: ignored.
+    OldRound,
+    /// For a later round than ours: ignored (we join rounds through bids).
+    NewerRound,
+    /// We have no election for this request: ignored.
+    UnknownRequest,
 }
 
 /// Every election this node has taken part in, by `request_id`.
@@ -199,6 +224,47 @@ impl ElectionTable {
     pub fn late_bids(&self, request_id: &str) -> u32 {
         self.entries.get(request_id).map_or(0, |e| e.late_bids)
     }
+
+    /// A peer announced it won `round` of the request. Compares it with our own
+    /// decision and counts a split if they differ. Between two nodes that both
+    /// believe they won, the lower node ID keeps the request: every node applies
+    /// the same rule, so the split settles without more messages.
+    pub fn note_announcement(&mut self, request_id: &str, round: u32, from: NodeId) -> Announced {
+        let Some(entry) = self.entries.get_mut(request_id) else {
+            return Announced::UnknownRequest;
+        };
+        if round < entry.round {
+            return Announced::OldRound;
+        }
+        if round > entry.round {
+            return Announced::NewerRound;
+        }
+        match entry.winner {
+            None => Announced::BeforeDecision,
+            Some(winner) if winner == from => Announced::Agrees,
+            Some(winner) => {
+                entry.splits += 1;
+                let me = entry.my_bid.node_id;
+                let step_aside = winner == me && from < me;
+                if step_aside {
+                    entry.stepped_aside = true;
+                }
+                Announced::Split { step_aside }
+            }
+        }
+    }
+
+    /// Split decisions seen in the current round.
+    pub fn splits(&self, request_id: &str) -> u32 {
+        self.entries.get(request_id).map_or(0, |e| e.splits)
+    }
+
+    /// True if we stepped aside in the current round and must not plan.
+    pub fn stepped_aside(&self, request_id: &str) -> bool {
+        self.entries
+            .get(request_id)
+            .is_some_and(|e| e.stepped_aside)
+    }
 }
 
 // ---- Network part ----
@@ -283,6 +349,59 @@ pub fn handle_exchange_bid(state: &NodeState, call: BidRequest) -> Result<pb::Bi
     tracing::debug!(%request_id, from = theirs.node_id, ?recorded, "bid call received");
     let round = table.round(&request_id).unwrap_or(0);
     Ok(bid_to_pb(&request_id, round, mine))
+}
+
+/// The winner tells its peers it is handling `round` of the request (the Bully
+/// announcement, design doc step 6). Waits only for alive peers; the acks carry
+/// nothing we need, so failures are only logged.
+pub async fn announce_winner(state: &NodeState, request_id: &str, round: u32) {
+    let announcement = Coordinator {
+        request_id: request_id.to_string(),
+        round,
+        node_id: state.id,
+    };
+    let alive = state.alive_peers();
+    let results = broadcast_until(state, BID_TIMEOUT, &alive, move |mut client| {
+        let announcement = announcement.clone();
+        async move { client.announce_winner(announcement).await }
+    })
+    .await;
+    for (peer, result) in results {
+        if !matches!(result, PeerResult::Reply(_)) {
+            tracing::debug!(%request_id, peer, ?result, "announcement not acknowledged");
+        }
+    }
+}
+
+/// A peer's `AnnounceWinner` call: compare it with our decision, reply with an ack.
+pub fn handle_announce_winner(
+    state: &NodeState,
+    announcement: Coordinator,
+) -> Result<CoordinatorAck, Status> {
+    if announcement.request_id.is_empty() || announcement.node_id == 0 {
+        return Err(Status::invalid_argument(
+            "announcement needs a request_id and a winner node_id",
+        ));
+    }
+    let request_id = &announcement.request_id;
+    let announced = state.election.lock().unwrap().note_announcement(
+        request_id,
+        announcement.round,
+        announcement.node_id,
+    );
+    match announced {
+        Announced::Split { step_aside } => tracing::warn!(
+            %request_id,
+            round = announcement.round,
+            from = announcement.node_id,
+            step_aside,
+            "split_decision"
+        ),
+        other => {
+            tracing::debug!(%request_id, from = announcement.node_id, ?other, "announcement received")
+        }
+    }
+    Ok(CoordinatorAck { node_id: state.id })
 }
 
 /// My bid right now, from P3's load collector.
@@ -489,6 +608,85 @@ mod tests {
         assert_eq!(table.join_round("r7", 0, || bid(2, 0.99)), None);
         assert_eq!(table.join_round("r8", 1, || bid(2, 0.99)), None);
         assert_eq!(table.winner("r7"), Some(3));
+    }
+
+    // ---- Winner announcements (node 2's view) ----
+
+    /// Node 2's table for r7 after deciding `winner`: our bid is 0.45, plus one
+    /// peer bid that either beats it (that peer wins) or loses to it (we win).
+    fn decided(winner: NodeId) -> ElectionTable {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || bid(2, 0.45));
+        let peer_bid = if winner == 2 {
+            bid(1, 0.90)
+        } else {
+            bid(winner, 0.10)
+        };
+        table.record_bid("r7", 0, peer_bid);
+        assert_eq!(table.decide("r7"), Some(winner));
+        table
+    }
+
+    #[test]
+    fn announcement_from_our_winner_agrees() {
+        let mut table = decided(1);
+        assert_eq!(table.note_announcement("r7", 0, 1), Announced::Agrees);
+        assert_eq!(table.splits("r7"), 0);
+    }
+
+    #[test]
+    fn announcement_before_we_decide_changes_nothing() {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || bid(2, 0.45));
+        assert_eq!(
+            table.note_announcement("r7", 0, 1),
+            Announced::BeforeDecision
+        );
+        assert_eq!(table.decide("r7"), Some(2)); // our own decision still counts
+        assert_eq!(table.splits("r7"), 0);
+    }
+
+    #[test]
+    fn split_with_a_lower_id_announcer_we_step_aside() {
+        let mut table = decided(2); // we believe we won
+        assert_eq!(
+            table.note_announcement("r7", 0, 1),
+            Announced::Split { step_aside: true }
+        );
+        assert_eq!(table.splits("r7"), 1);
+        assert!(table.stepped_aside("r7"));
+    }
+
+    #[test]
+    fn split_with_a_higher_id_announcer_we_keep_going() {
+        let mut table = decided(2);
+        assert_eq!(
+            table.note_announcement("r7", 0, 3),
+            Announced::Split { step_aside: false }
+        );
+        assert_eq!(table.splits("r7"), 1);
+        assert!(!table.stepped_aside("r7"));
+
+        // We decided node 1, node 3 announces: a split, but we were not planning.
+        let mut table = decided(1);
+        assert_eq!(
+            table.note_announcement("r7", 0, 3),
+            Announced::Split { step_aside: false }
+        );
+        assert_eq!(table.splits("r7"), 1);
+    }
+
+    #[test]
+    fn announcement_for_another_round_or_request_is_ignored() {
+        let mut table = decided(2);
+        table.start_next_round("r7", || bid(2, 0.45));
+        assert_eq!(table.note_announcement("r7", 0, 1), Announced::OldRound);
+        assert_eq!(table.note_announcement("r7", 2, 1), Announced::NewerRound);
+        assert_eq!(
+            table.note_announcement("r8", 0, 1),
+            Announced::UnknownRequest
+        );
+        assert_eq!((table.splits("r7"), table.stepped_aside("r7")), (0, false));
     }
 
     #[test]
@@ -737,5 +935,44 @@ mod tests {
         }
         // Nothing was stored for any of them.
         assert_eq!(n2.election.lock().unwrap().round("r7"), None);
+    }
+
+    #[tokio::test]
+    async fn announcement_reaches_peers_and_exposes_a_split() {
+        let cfg = three_node_config();
+        let (n2, n3) = (serve(2, &cfg).await, serve(3, &cfg).await);
+        let n1 = state_for(1, &cfg);
+        {
+            // Node 2 missed node 1's bid and picked itself; node 3 picked node 1.
+            let mut t2 = n2.election.lock().unwrap();
+            t2.my_bid("r7", || bid(2, 0.30));
+            assert_eq!(t2.decide("r7"), Some(2));
+            let mut t3 = n3.election.lock().unwrap();
+            t3.my_bid("r7", || bid(3, 0.50));
+            t3.record_bid("r7", 0, bid(1, 0.10));
+            assert_eq!(t3.decide("r7"), Some(1));
+        }
+
+        announce_winner(&n1, "r7", 0).await;
+
+        let t2 = n2.election.lock().unwrap();
+        assert_eq!((t2.splits("r7"), t2.stepped_aside("r7")), (1, true));
+        let t3 = n3.election.lock().unwrap();
+        assert_eq!((t3.splits("r7"), t3.stepped_aside("r7")), (0, false));
+    }
+
+    #[tokio::test]
+    async fn bad_announcements_are_rejected() {
+        let cfg = three_node_config();
+        let n2 = state_for(2, &cfg);
+        for (request_id, node_id) in [("", 1), ("r7", 0)] {
+            let bad = Coordinator {
+                request_id: request_id.to_string(),
+                round: 0,
+                node_id,
+            };
+            let err = handle_announce_winner(&n2, bad).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        }
     }
 }
