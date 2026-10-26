@@ -10,8 +10,8 @@ use common::conversions::{incident_from_pb, plan_to_pb};
 use common::domain::Plan;
 use common::pb::node_server::Node;
 use common::pb::{
-    FaultAck, FaultCommand, HeartbeatReply, HeartbeatRequest, SubmitReply, SubmitRequest,
-    submit_request,
+    Bid, BidRequest, Coordinator, CoordinatorAck, FaultAck, FaultCommand, HeartbeatReply,
+    HeartbeatRequest, SubmitReply, SubmitRequest, submit_request,
 };
 use common::planner;
 use tonic::{Request, Response, Status};
@@ -82,6 +82,20 @@ impl Node for NodeService {
         self.gate().await?; // a muted node ignores new fault orders too
         // No gate before replying: this handler mutes the node itself and must still ack.
         handle_inject_fault(&self.state, req.into_inner()).await
+    }
+
+    // P3: election calls. Placeholders until the bid exchange is wired (StepB/P3-election).
+    async fn exchange_bid(&self, _req: Request<BidRequest>) -> Result<Response<Bid>, Status> {
+        self.gate().await?;
+        Err(Status::unimplemented("election not wired yet"))
+    }
+
+    async fn announce_winner(
+        &self,
+        _req: Request<Coordinator>,
+    ) -> Result<Response<CoordinatorAck>, Status> {
+        self.gate().await?;
+        Err(Status::unimplemented("election not wired yet"))
     }
 }
 

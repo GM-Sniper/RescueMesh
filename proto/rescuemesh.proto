@@ -1,6 +1,7 @@
 // RescueMesh wire protocol (owner: P1).
 // v0 (Fri Oct 16): Heartbeat only, to prove the build and gRPC work.
 // v1 (Mon Oct 19): adds Submit, domain types, Bid, Replicate, FetchLog, FaultCommand.
+// v2 (Mon Oct 26): election calls ExchangeBid and AnnounceWinner; Bid gets round and ready (P3, agreed with P1 in Q1).
 // Rule: every state-changing message carries request_id.
 // Rule: never change or reuse a field number once it is merged.
 syntax = "proto3";
@@ -17,6 +18,12 @@ service Node {
 
   // The call the fault-injector CLI makes: send a FaultCommand to the node, get a FaultAck back.
   rpc InjectFault(FaultCommand) returns (FaultAck);
+
+  // Election, node to node: send my bid, get the peer's bid back in the reply.
+  rpc ExchangeBid(BidRequest) returns (Bid);
+
+  // Election, node to node: the winner tells the others it is handling the request.
+  rpc AnnounceWinner(Coordinator) returns (CoordinatorAck);
 }
 
 message HeartbeatRequest {
@@ -135,6 +142,26 @@ message Bid {
   string request_id = 1;  // the request being bid on; bids for different requests never mix
   uint32 node_id = 2;     // bidder's ID (starts at 1)
   double load_score = 3;  // bidder's LoadReport score, normalized 0-1; lower = less loaded
+  uint32 round = 4;       // election number for this request: 0, then +1 for each re-election after a failed winner
+  bool ready = 5;         // false = bidder cannot reach the shared state; counts as an answer but cannot win
+}
+
+// ExchangeBid's call. Carries the client's request too, so a peer whose copy from
+// the client is late or lost can still bid, and run the planner if it wins.
+message BidRequest {
+  Bid bid = 1;
+  SubmitRequest request = 2;
+}
+
+// AnnounceWinner's call: "I won this round of this request and I'm handling it".
+message Coordinator {
+  string request_id = 1;
+  uint32 round = 2;
+  uint32 node_id = 3;     // the winner
+}
+
+message CoordinatorAck {
+  uint32 node_id = 1;     // replier's ID, like HeartbeatReply
 }
 
 // ---- Change log and replication (owner: P4) ----
