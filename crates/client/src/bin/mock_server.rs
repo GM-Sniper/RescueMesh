@@ -66,6 +66,16 @@ impl Node for MockNode {
     async fn inject_fault(&self, _request: Request<pb::FaultCommand>) -> Result<Response<pb::FaultAck>, Status> {
         Err(Status::unimplemented("mock server has no fault injection"))
     }
+
+    /// Not needed by the client; the election is P3's.
+    async fn exchange_bid(&self, _request: Request<pb::BidRequest>) -> Result<Response<pb::Bid>, Status> {
+        Err(Status::unimplemented("mock server has no election"))
+    }
+
+    /// Not needed by the client; the election is P3's.
+    async fn announce_winner(&self, _request: Request<pb::Coordinator>) -> Result<Response<pb::CoordinatorAck>, Status> {
+        Err(Status::unimplemented("mock server has no election"))
+    }
 }
 
 #[tokio::main] // starts the async runtime, then runs `main` inside it
