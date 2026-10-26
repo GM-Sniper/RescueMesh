@@ -9,6 +9,8 @@
 //!   missing answer means.
 //! - Deadlines are ours (`tokio::time::timeout`), not tonic's.
 //! - While this node is muted nothing is sent (`peer_for_sending`).
+//! - `broadcast_until` (Step B, election): same calls, but stops waiting once the
+//!   given peers have finished, instead of waiting for every peer.
 //! - Retry policy: at most one retry, only after a fast `Unavailable` (could not
 //!   reach the peer, e.g. a connection broken by a restart), and only with the time
 //!   left before the deadline. Timeouts and other errors are final. Retrying is safe
@@ -38,6 +40,9 @@ pub enum PeerResult<T> {
     TimedOut,
     /// This node is muted, so nothing was sent.
     NotSent,
+    /// `broadcast_until` stopped waiting before this peer finished (it was not in
+    /// `wait_for`), and its call was cancelled. Not `TimedOut`: we chose to stop.
+    Abandoned,
 }
 
 /// Calls `call` on every peer at once and returns one result per peer, sorted by ID.
@@ -56,6 +61,76 @@ where
     Fut: Future<Output = Result<Response<T>, Status>> + Send + 'static,
     T: Send + 'static,
 {
+    let (mut results, mut tasks) = start_calls(state, deadline, call);
+    // Collected as they finish, not in start order.
+    while let Some(joined) = tasks.join_next().await {
+        collect(&mut results, joined);
+    }
+    results.sort_by_key(|(peer, _)| *peer);
+    results
+}
+
+/// Like `broadcast`, but returns as soon as every peer in `wait_for` has finished
+/// (replied or failed), or at the deadline, whichever comes first. Every peer still
+/// gets the call; the election passes the detector-alive peers as `wait_for`, so a
+/// peer known to be down no longer costs the full deadline (P3 design, Q3).
+/// Peers still running when we stop are cancelled and reported as `Abandoned`.
+pub async fn broadcast_until<T, F, Fut>(
+    state: &NodeState,
+    deadline: Duration,
+    wait_for: &[NodeId],
+    call: F,
+) -> Vec<(NodeId, PeerResult<T>)>
+where
+    F: Fn(NodeClient<Channel>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Response<T>, Status>> + Send + 'static,
+    T: Send + 'static,
+{
+    let (mut results, mut tasks) = start_calls(state, deadline, call);
+    // Only peers that got the call can answer; a NotSent one is already final.
+    let mut waiting: Vec<NodeId> = state
+        .peers
+        .ids()
+        .filter(|p| wait_for.contains(p) && !results.iter().any(|(r, _)| r == p))
+        .collect();
+    // Each call ends by the deadline, so this loop does too. A panicked call never
+    // leaves `waiting`; the loop then runs until every task is done.
+    while !waiting.is_empty() {
+        let Some(joined) = tasks.join_next().await else { break };
+        if let Ok((peer, _)) = &joined {
+            waiting.retain(|p| p != peer);
+        }
+        collect(&mut results, joined);
+    }
+    // Keep answers that arrived at the same moment instead of throwing them away.
+    while let Some(joined) = tasks.try_join_next() {
+        collect(&mut results, joined);
+    }
+    drop(tasks); // cancels the calls still running
+    for peer in state.peers.ids() {
+        if !results.iter().any(|(r, _)| *r == peer) {
+            results.push((peer, PeerResult::Abandoned));
+        }
+    }
+    results.sort_by_key(|(peer, _)| *peer);
+    results
+}
+
+/// One peer's finished task, as `JoinSet` hands it back.
+type Joined<T> = Result<(NodeId, PeerResult<T>), tokio::task::JoinError>;
+
+/// Starts `call` on every peer, each in its own task. Peers we cannot send to
+/// (this node is muted) go straight into the results as `NotSent`.
+fn start_calls<T, F, Fut>(
+    state: &NodeState,
+    deadline: Duration,
+    call: F,
+) -> (Vec<(NodeId, PeerResult<T>)>, JoinSet<(NodeId, PeerResult<T>)>)
+where
+    F: Fn(NodeClient<Channel>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Response<T>, Status>> + Send + 'static,
+    T: Send + 'static,
+{
     let mut results = Vec::new();
     let mut tasks = JoinSet::new();
     for peer in state.peers.ids() {
@@ -66,16 +141,15 @@ where
         let call = call.clone();
         tasks.spawn(async move { (peer, call_with_retry(peer, client, deadline, call).await) });
     }
-    // Collected as they finish, not in start order.
-    while let Some(joined) = tasks.join_next().await {
-        match joined {
-            Ok((peer, result)) => results.push((peer, result)),
-            // A bug (panic) in one call must not lose the other peers' results.
-            Err(e) => tracing::error!(error = %e, "broadcast call panicked"),
-        }
+    (results, tasks)
+}
+
+fn collect<T>(results: &mut Vec<(NodeId, PeerResult<T>)>, joined: Joined<T>) {
+    match joined {
+        Ok((peer, result)) => results.push((peer, result)),
+        // A bug (panic) in one call must not lose the other peers' results.
+        Err(e) => tracing::error!(error = %e, "broadcast call panicked"),
     }
-    results.sort_by_key(|(peer, _)| *peer);
-    results
 }
 
 /// One peer's part: the call, plus at most one retry if it failed fast with
@@ -242,6 +316,64 @@ mod tests {
         assert!(matches!(results[..], [(2, PeerResult::TimedOut), (3, PeerResult::TimedOut)]));
         // One after another would take 2 x 300 ms; in parallel it is about 300 ms.
         assert!(took < Duration::from_millis(450), "took {took:?}: calls did not run in parallel");
+    }
+
+    // ---- Step B: broadcast_until, for the election's early stop (P3 design, Q3).
+
+    #[tokio::test]
+    async fn until_returns_at_reply_speed_when_all_answer() {
+        let cfg = three_node_config();
+        serve(2, &cfg).await;
+        serve(3, &cfg).await;
+        let node1 = state_for(1, &cfg);
+
+        let start = Instant::now();
+        let results = broadcast_until(&node1, SHORT, &[2, 3], heartbeat).await;
+        let took = start.elapsed();
+        assert!(matches!(results[..], [(2, PeerResult::Reply(_)), (3, PeerResult::Reply(_))]));
+        assert!(took < Duration::from_millis(150), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn until_does_not_wait_for_a_peer_left_out() {
+        let cfg = three_node_config();
+        serve(2, &cfg).await;
+        serve(3, &cfg).await.mute_for(Duration::from_secs(5)); // known down: not in wait_for
+        let node1 = state_for(1, &cfg);
+
+        let start = Instant::now();
+        let results = broadcast_until(&node1, SHORT, &[2], heartbeat).await;
+        let took = start.elapsed();
+        assert!(matches!(results[0], (2, PeerResult::Reply(_))), "{:?}", results[0]);
+        assert!(matches!(results[1], (3, PeerResult::Abandoned)), "{:?}", results[1]);
+        assert!(took < Duration::from_millis(150), "took {took:?}: waited for node 3");
+    }
+
+    #[tokio::test]
+    async fn until_waits_the_deadline_for_a_silent_peer_it_waits_for() {
+        let cfg = three_node_config();
+        serve(2, &cfg).await;
+        serve(3, &cfg).await.mute_for(Duration::from_secs(5)); // not suspected yet
+        let node1 = state_for(1, &cfg);
+
+        let start = Instant::now();
+        let results = broadcast_until(&node1, SHORT, &[2, 3], heartbeat).await;
+        let took = start.elapsed();
+        assert!(matches!(results[1], (3, PeerResult::TimedOut)), "{:?}", results[1]);
+        assert!(took >= SHORT && took < SHORT + Duration::from_millis(150), "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn until_counts_a_failed_peer_as_finished() {
+        let cfg = three_node_config();
+        serve(2, &cfg).await; // node 3 is not running: its call fails fast
+        let node1 = state_for(1, &cfg);
+
+        let start = Instant::now();
+        let results = broadcast_until(&node1, DEADLINE, &[2, 3], heartbeat).await;
+        assert!(matches!(results[0], (2, PeerResult::Reply(_))));
+        assert!(matches!(results[1], (3, PeerResult::Failed(_))), "{:?}", results[1]);
+        assert!(start.elapsed() < DEADLINE, "took {:?}", start.elapsed());
     }
 
     // ---- 6c: retry policy, with fake calls (no network) that count their attempts.
