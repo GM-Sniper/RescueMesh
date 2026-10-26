@@ -113,12 +113,7 @@ async fn handle_submit(
     };
 
     // 2. Already handled: the same answer again, never a second plan.
-    if let Some(stored) = state
-        .store
-        .lookup_request(&request_id)
-        .await
-        .map_err(unavailable)?
-    {
+    if let Some(stored) = state.store.lookup_request(&request_id).await.map_err(unavailable)? {
         return Ok(reply(&stored, true));
     }
 
@@ -134,16 +129,13 @@ async fn handle_submit(
         let to_plan = incident.clone();
         // The planner is CPU work: run it off the async threads so it can never
         // delay heartbeats (which would cause false PeerDowns).
-        let plan =
-            tokio::task::spawn_blocking(move || planner::plan(&to_plan, &snapshot, &weights, now))
-                .await
-                .map_err(|e| Status::internal(format!("planner failed: {e}")))?;
+        let plan = tokio::task::spawn_blocking(move || {
+            planner::plan(&to_plan, &snapshot, &weights, now)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("planner failed: {e}")))?;
 
-        match state
-            .store
-            .commit(&request_id, incident.clone(), plan.clone())
-            .await
-        {
+        match state.store.commit(&request_id, incident.clone(), plan.clone()).await {
             CommitOutcome::Committed => {
                 tracing::debug!(
                     %request_id,
@@ -199,10 +191,7 @@ pub(crate) async fn handle_inject_fault(
     cmd: FaultCommand,
 ) -> Result<Response<FaultAck>, Status> {
     let refusal = if cmd.target_node != state.id {
-        Some(format!(
-            "this is node {}, not node {}",
-            state.id, cmd.target_node
-        ))
+        Some(format!("this is node {}, not node {}", state.id, cmd.target_node))
     } else if cmd.duration_ms == 0 {
         Some("duration must be at least 1 ms".to_string())
     } else if cmd.duration_ms > MAX_MUTE_MS {
@@ -268,10 +257,7 @@ mod tests {
     async fn heartbeat_replies_with_own_id_and_echoes_seq() {
         let svc = service();
         let reply = svc
-            .heartbeat(Request::new(HeartbeatRequest {
-                from_node: 2,
-                seq: 7,
-            }))
+            .heartbeat(Request::new(HeartbeatRequest { from_node: 2, seq: 7 }))
             .await
             .unwrap()
             .into_inner();
@@ -299,9 +285,7 @@ mod tests {
     fn submit_req(request_id: &str, seed: u64) -> Request<SubmitRequest> {
         Request::new(SubmitRequest {
             request_id: request_id.into(),
-            kind: Some(submit_request::Kind::Incident(incident_to_pb(
-                &generate_incident(seed),
-            ))),
+            kind: Some(submit_request::Kind::Incident(incident_to_pb(&generate_incident(seed)))),
         })
     }
 
@@ -314,11 +298,7 @@ mod tests {
         assert!(!reply.duplicate);
         let plan = reply.plan.expect("a plan");
         assert_eq!(plan.incident_id, generate_incident(7).id);
-        assert_eq!(
-            plan.assignments.len(),
-            1,
-            "a free resource exists, so one is assigned"
-        );
+        assert_eq!(plan.assignments.len(), 1, "a free resource exists, so one is assigned");
         assert_eq!(svc.state.store.snapshot().await.unwrap().incidents.len(), 1);
     }
 
@@ -341,10 +321,7 @@ mod tests {
         bad_incident.severity = 0;
         let cases = [
             submit_req("", 7), // empty request_id
-            Request::new(SubmitRequest {
-                request_id: "r2".into(),
-                kind: None,
-            }),
+            Request::new(SubmitRequest { request_id: "r2".into(), kind: None }),
             Request::new(SubmitRequest {
                 request_id: "r3".into(),
                 kind: Some(submit_request::Kind::Incident(bad_incident)),
@@ -352,22 +329,9 @@ mod tests {
         ];
         for req in cases {
             let err = svc.submit(req).await.unwrap_err();
-            assert_eq!(
-                err.code(),
-                tonic::Code::InvalidArgument,
-                "{}",
-                err.message()
-            );
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}", err.message());
         }
-        assert!(
-            svc.state
-                .store
-                .snapshot()
-                .await
-                .unwrap()
-                .incidents
-                .is_empty()
-        );
+        assert!(svc.state.store.snapshot().await.unwrap().incidents.is_empty());
         assert_eq!(svc.state.in_flight(), 0);
     }
 
@@ -399,11 +363,7 @@ mod tests {
         let total = resources.len();
         resources.sort();
         resources.dedup();
-        assert_eq!(
-            resources.len(),
-            total,
-            "a resource was given to two incidents"
-        );
+        assert_eq!(resources.len(), total, "a resource was given to two incidents");
         assert_eq!(total, 10, "all 10 resources end up assigned, once each");
         assert_eq!(snap.incidents.len(), 20, "every request is stored once");
     }
@@ -424,20 +384,13 @@ mod tests {
     }
 
     fn ping() -> Request<HeartbeatRequest> {
-        Request::new(HeartbeatRequest {
-            from_node: 2,
-            seq: 1,
-        })
+        Request::new(HeartbeatRequest { from_node: 2, seq: 1 })
     }
 
     #[tokio::test(start_paused = true)]
     async fn fault_order_is_accepted_and_mutes() {
         let svc = service();
-        let ack = svc
-            .inject_fault(order(1, 10_000))
-            .await
-            .unwrap()
-            .into_inner();
+        let ack = svc.inject_fault(order(1, 10_000)).await.unwrap().into_inner();
         assert!(ack.accepted);
         assert_eq!(ack.fault_id, "f1");
         assert!(svc.state.is_muted());
@@ -447,21 +400,13 @@ mod tests {
     async fn refuses_bad_orders() {
         for (target, ms) in [(2, 10_000), (1, 0), (1, 20_001)] {
             let svc = service();
-            let ack = svc
-                .inject_fault(order(target, ms))
-                .await
-                .unwrap()
-                .into_inner();
+            let ack = svc.inject_fault(order(target, ms)).await.unwrap().into_inner();
             assert!(!ack.accepted, "target {target}, {ms} ms should be refused");
             assert!(!ack.reason.is_empty());
             assert!(!svc.state.is_muted());
         }
         let svc = service();
-        let ack = svc
-            .inject_fault(order(1, 20_000))
-            .await
-            .unwrap()
-            .into_inner();
+        let ack = svc.inject_fault(order(1, 20_000)).await.unwrap().into_inner();
         assert!(ack.accepted, "exactly 20 s is allowed");
     }
 
@@ -470,11 +415,7 @@ mod tests {
         let svc = service();
         svc.inject_fault(order(1, 10_000)).await.unwrap();
         // No answer at all within 9 s: no quick error.
-        assert!(
-            timeout(Duration::from_secs(9), svc.heartbeat(ping()))
-                .await
-                .is_err()
-        );
+        assert!(timeout(Duration::from_secs(9), svc.heartbeat(ping())).await.is_err());
     }
 
     #[tokio::test(start_paused = true)]
@@ -502,10 +443,7 @@ mod tests {
         let svc = service();
         svc.inject_fault(order(1, 10_000)).await.unwrap();
         let second = timeout(Duration::from_secs(5), svc.inject_fault(order(1, 1_000))).await;
-        assert!(
-            second.is_err(),
-            "a muted node must not answer a new fault order"
-        );
+        assert!(second.is_err(), "a muted node must not answer a new fault order");
     }
 
     // ---- Task 7d: the mute hook writes P5's fault CSV.
@@ -545,16 +483,10 @@ mod tests {
         let svc = NodeService::new(Arc::new(NodeState::new(1, cfg, peers)));
 
         tokio::time::sleep(Duration::from_millis(1500)).await; // node 2 silent for 1.5 s
-        assert_eq!(
-            svc.state.check_peers(),
-            vec![crate::failure_detector::PeerEvent::PeerDown(2)]
-        );
+        assert_eq!(svc.state.check_peers(), vec![crate::failure_detector::PeerEvent::PeerDown(2)]);
 
         svc.heartbeat(ping()).await.unwrap(); // node 2's own heartbeat arrives
-        assert_eq!(
-            svc.state.check_peers(),
-            vec![crate::failure_detector::PeerEvent::PeerUp(2)]
-        );
+        assert_eq!(svc.state.check_peers(), vec![crate::failure_detector::PeerEvent::PeerUp(2)]);
     }
 
     // ---- Task 4f: the same mute, end to end over a real network, with the real clock.
@@ -584,25 +516,15 @@ mod tests {
                 Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
             }
         };
-        assert_eq!(
-            client.heartbeat(ping()).await.unwrap().into_inner().node_id,
-            1
-        );
+        assert_eq!(client.heartbeat(ping()).await.unwrap().into_inner().node_id, 1);
 
         // 3. Mute for 500 ms; the ack still comes back over the network.
-        let ack = client
-            .inject_fault(order(1, 500))
-            .await
-            .unwrap()
-            .into_inner();
+        let ack = client.inject_fault(order(1, 500)).await.unwrap().into_inner();
         assert!(ack.accepted);
 
         // 4. Heartbeat with a 200 ms deadline: silence, not a quick error.
         let muted = timeout(Duration::from_millis(200), client.heartbeat(ping())).await;
-        assert!(
-            muted.is_err(),
-            "muted node must not answer at all, got {muted:?}"
-        );
+        assert!(muted.is_err(), "muted node must not answer at all, got {muted:?}");
 
         // 5. After the mute, it answers normally again.
         tokio::time::sleep(Duration::from_millis(400)).await;

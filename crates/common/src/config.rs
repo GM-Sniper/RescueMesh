@@ -227,8 +227,7 @@ mod tests {
 
     #[test]
     fn partial_tables_keep_other_defaults() {
-        let text =
-            format!("{THREE_NODES}\n[timing]\nrpc_deadline_ms = 300\n[weights]\nage = 0.9\n");
+        let text = format!("{THREE_NODES}\n[timing]\nrpc_deadline_ms = 300\n[weights]\nage = 0.9\n");
         let cfg = ClusterConfig::parse(&text).unwrap();
         assert_eq!(cfg.timing.rpc_deadline_ms, 300);
         assert_eq!(cfg.timing.heartbeat_interval_ms, 500);

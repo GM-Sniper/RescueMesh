@@ -101,11 +101,8 @@ async fn main() -> anyhow::Result<()> {
     heartbeat::spawn_ticker(state.clone());
     fault_round::spawn(state.clone());
     // P6 (SEE NOTE AT THE TOP, P1): ONE ROW PER SECOND TO logs/node_metrics-node<ID>.CSV
-    node_metrics::spawn(
-        state.clone(),
-        format!("logs/node_metrics-node{}.csv", args.id),
-    )
-    .context("cannot open the node_metrics log")?;
+    node_metrics::spawn(state.clone(), format!("logs/node_metrics-node{}.csv", args.id))
+        .context("cannot open the node_metrics log")?;
 
     // 7. Open the doors: serve the Node service until Ctrl+C.
     tracing::info!(id = args.id, %listen, peers = ?peer_ids, %run_id, fault_log = %log_path, "node listening");
