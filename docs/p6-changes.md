@@ -386,6 +386,47 @@ Almost every plan is empty because P4's store starts with only 10 resources and 
 
 ---
 
+## 11. Step B, Mon Oct 26: ramping load generator (branch `StepB/p6`)
+
+Plan task: "stages (clients 1 to N), duration per stage, stage column in the CSV".
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--stages` | none | Clients per stage, e.g. `1,2,4,8`. Turns on ramp mode; can't be combined with `--clients`, `--requests` or `--rate` |
+| `--stage-secs` | `30` | How long each stage lasts |
+
+```rust
+for (s, &stage_clients) in stages.iter().enumerate() {          // stages run one after another
+    let stage = s as u32 + 1;                                    // numbered from 1
+    let stage_end = ramp.then(|| Instant::now() + stage_len);    // ramp mode: when this stage stops sending
+    for (i, client) in clients.iter().take(stage_clients as usize).enumerate() { // the first k connections
+        tasks.push(tokio::spawn(ClientJob { /* client, stage, stage_end, ... */ }.run())); // one task per client
+    }
+    for task in tasks { task.await?; }                           // next stage starts when this one is done
+}
+```
+
+- Ramp mode is **closed loop**: each client sends its next request as soon as the previous one returns, so more clients = more load.
+- A request still in flight when its stage ends finishes and is recorded in that stage, so a stage can run slightly over `--stage-secs`.
+- All connections (as many as the biggest stage) open before the clock starts.
+- Without `--stages`, the run is one stage and behaves exactly as in Step A.
+- CSV: new last column `stage`. `.meta.txt`: new `mode`, `stages`, `stage_secs`.
+- Stats: when a CSV has more than one stage, a per-stage table (clients, requests, ok, mean, p50, p95, p99, ok/s). Older CSVs still work. New test: `ramp_runs_are_split_by_stage`.
+
+Example run (laptop, release, real node 2, `--stages 1,2,4,8 --stage-secs 5`):
+
+```text
+  stage  clients  requests      ok       mean        p50        p95        p99      ok/s   # header
+      1        1       989     989    5.05 ms    4.23 ms    8.13 ms   12.30 ms     197.7   # 1 client
+      2        2      1525    1525    6.55 ms    6.33 ms    9.44 ms   13.09 ms     304.9   # 2 clients
+      3        4     18988   18988    1.04 ms    0.48 ms    7.23 ms   10.58 ms    3793.6   # 4 clients
+      4        8     13452   13452    2.96 ms    1.51 ms    9.14 ms    9.93 ms    2687.0   # 8 clients
+```
+
+Laptop numbers jump around (one machine runs the node and all the clients); the real ramp needs the lab machines and planner v2. Once the 10 starting resources are taken, plans are empty and cheap, which also flattens latency.
+
+---
+
 ## How to run everything
 
 ```bash

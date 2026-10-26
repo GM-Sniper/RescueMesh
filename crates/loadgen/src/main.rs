@@ -6,6 +6,10 @@
 //!   cargo run --release -p loadgen -- --config config/nodes.lab.toml --target 1 --requests 1000  (real machines)
 //!   cargo run -p loadgen -- --node 127.0.0.1:6000 --requests 100                                  (any address, e.g. the mock)
 //!
+//! Ramp mode (Step B): the load grows in stages, e.g. 1, 2, 4 then 8 clients for 30 s each.
+//! Every row gets a `stage` column, so the stats script can show latency per stage:
+//!   cargo run --release -p loadgen -- --stages 1,2,4,8 --stage-secs 30
+//!
 //! Output, in the `results/` folder:
 //!   <run_id>.csv       one row per request
 //!   <run_id>.meta.txt  how the run was made (flags, seed, git commit) and its totals
@@ -57,6 +61,16 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     rate: f64,
 
+    /// Ramp mode: number of clients in each stage, e.g. "1,2,4,8". Each stage lasts --stage-secs, and every
+    /// client sends its next request as soon as the previous one returns. Replaces --clients, --requests and --rate.
+    /// Without --stages, the run is a single stage of --clients clients sending --requests requests (Step A mode).
+    #[arg(long, value_delimiter = ',', conflicts_with_all = ["clients", "requests", "rate"])]
+    stages: Vec<u64>,
+
+    /// Ramp mode: how long each stage lasts, in seconds.
+    #[arg(long, default_value_t = 30.0)]
+    stage_secs: f64,
+
     /// Folder for the CSV and metadata files.
     #[arg(long, default_value = "results")]
     out: PathBuf,
@@ -75,6 +89,58 @@ struct Row {
     executor_node: Option<u32>, // node that answered; None if it failed
     status: SubmitStatus,       // ok / timeout / error
     assigned: Option<bool>,     // true = a resource was assigned, false = empty plan (nothing free), None = no plan
+    stage: u32,                 // which stage sent it (1, 2, ...); always 1 without --stages
+}
+
+/// Everything one client task needs. One per client per stage.
+struct ClientJob {
+    client: ClientMiddleware,   // this client's connection (cheap clone, shared with other stages)
+    client_id: u64,             // 1..=clients in this stage
+    stage: u32,                 // written into every row this client sends
+    next: Arc<AtomicU64>,       // shared request counter: request n sends generate_incident(seed + n)
+    tx: mpsc::Sender<Row>,      // where finished rows go (the CSV writer)
+    seed: u64,
+    max_requests: Option<u64>,  // fixed mode: stop once this many requests have been taken
+    stage_end: Option<Instant>, // ramp mode: stop sending new requests at this time
+    interval: Option<Duration>, // --rate: request n is due at start + n × interval
+    start: Instant,             // when the run started (for --rate)
+}
+
+impl ClientJob {
+    /// Sends requests until the job's limit (request count or stage end) is reached.
+    async fn run(self) {
+        loop {
+            if self.stage_end.is_some_and(|end| Instant::now() >= end) {
+                break; // ramp mode: this stage is over. A request already in flight still finishes and is recorded
+            }
+            let n = self.next.fetch_add(1, Ordering::Relaxed); // take the next request number (0, 1, 2, ...)
+            if self.max_requests.is_some_and(|max| n >= max) {
+                break; // fixed mode: all requests are taken, so this client is done
+            }
+            if let Some(gap) = self.interval {
+                // Request n is due at start + n × gap, which spreads requests evenly at --rate per second.
+                // If the node is slower than that, requests start late and the achieved rate drops (shown at the end).
+                tokio::time::sleep_until(self.start + gap.mul_f64(n as f64)).await;
+            }
+            let incident = incident_to_pb(&generate_incident(self.seed + n)); // same seed + n = same incident every run
+            let timestamp_ms = unix_ms(); // when this request was sent
+            let outcome = self.client.submit(incident).await; // send, wait, time it (never panics)
+            let assigned = outcome.assigned(); // read before outcome's fields are moved into the row
+            let row = Row {
+                timestamp_ms,
+                client_id: self.client_id,
+                request_id: outcome.request_id,
+                latency_us: outcome.latency_us,
+                executor_node: outcome.executor_node,
+                status: outcome.status,
+                assigned,
+                stage: self.stage,
+            };
+            if self.tx.send(row).is_err() {
+                break; // the writer stopped (disk error): no point sending more
+            }
+        }
+    }
 }
 
 /// How many requests ended each way. Filled in by the CSV writer as it saves rows.
@@ -97,13 +163,29 @@ async fn main() -> anyhow::Result<()> {
     let node_addr = client::target_addr(&args.config, args.target, args.node.as_deref())
         .map_err(|e| anyhow::anyhow!(e))?;
 
+    // The stages to run. Ramp mode: one per --stages value. Fixed mode: a single stage of --clients clients.
+    let ramp = !args.stages.is_empty();
+    let stages: Vec<u64> = if ramp { args.stages.clone() } else { vec![args.clients] };
+    if stages.contains(&0) {
+        anyhow::bail!("every stage needs at least 1 client (got --stages {:?})", args.stages);
+    }
+    if ramp && args.stage_secs <= 0.0 {
+        anyhow::bail!("--stage-secs must be more than 0");
+    }
+    let stage_len = Duration::from_secs_f64(args.stage_secs);
+    let max_clients = *stages.iter().max().expect("at least one stage"); // the biggest stage sets how many connections we need
+
     // Connect every client BEFORE the clock starts, so connection setup isn't counted as request latency.
-    // Each client gets its own connection, like separate users would.
+    // Each client gets its own connection, like separate users would; a stage with k clients uses the first k.
     let mut clients = Vec::new();
-    for _ in 0..args.clients {
+    for _ in 0..max_clients {
         clients.push(ClientMiddleware::connect(&node_addr, DEFAULT_TIMEOUT).await?);
     }
-    println!("{} clients connected to {node_addr}, sending {} requests...", args.clients, args.requests);
+    if ramp {
+        println!("{max_clients} clients connected to {node_addr}; ramp {stages:?} clients, {} s per stage", args.stage_secs);
+    } else {
+        println!("{max_clients} clients connected to {node_addr}, sending {} requests...", args.requests);
+    }
 
     // The CSV writer runs on its own thread, so slow disk writes never delay a request.
     let (tx, rx) = mpsc::channel::<Row>(); // tx = where tasks drop rows, rx = where the writer picks them up
@@ -112,52 +194,39 @@ async fn main() -> anyhow::Result<()> {
         move || write_csv(&csv_path, &run_id, rx)
     });
 
-    let next = Arc::new(AtomicU64::new(0)); // number of the next request to send; shared by all clients
+    let next = Arc::new(AtomicU64::new(0)); // number of the next request to send; shared by all clients and stages
     let interval = (args.rate > 0.0).then(|| Duration::from_secs_f64(1.0 / args.rate)); // gap between requests, if --rate is set
     let started_at_ms = unix_ms(); // wall-clock start, for the metadata file
     let start = Instant::now(); // stopwatch for the whole run
 
-    // Start one tokio task per client. They all run at the same time.
-    let mut tasks = Vec::new();
-    for (i, client) in clients.into_iter().enumerate() {
-        let client_id = i as u64 + 1; // client IDs start at 1
-        let (next, tx) = (next.clone(), tx.clone()); // each task gets its own handle to the counter and channel
-        let (total, seed) = (args.requests, args.seed);
-        tasks.push(tokio::spawn(async move {
-            loop {
-                let n = next.fetch_add(1, Ordering::Relaxed); // take the next request number (0, 1, 2, ...)
-                if n >= total {
-                    break; // all requests are taken: this client is done
-                }
-                if let Some(gap) = interval {
-                    // Request n is due at start + n × gap, which spreads requests evenly at --rate per second.
-                    // If the node is slower than that, requests start late and the achieved rate drops (shown at the end).
-                    tokio::time::sleep_until(start + gap.mul_f64(n as f64)).await;
-                }
-                let incident = incident_to_pb(&generate_incident(seed + n)); // same seed + n = same incident every run
-                let timestamp_ms = unix_ms(); // when this request was sent
-                let outcome = client.submit(incident).await; // send, wait, time it (never panics)
-                let assigned = outcome.assigned(); // read before outcome's fields are moved into the row
-                let row = Row {
-                    timestamp_ms,
-                    client_id,
-                    request_id: outcome.request_id,
-                    latency_us: outcome.latency_us,
-                    executor_node: outcome.executor_node,
-                    status: outcome.status,
-                    assigned,
-                };
-                if tx.send(row).is_err() {
-                    break; // the writer stopped (disk error): no point sending more
-                }
-            }
-        }));
+    // Run the stages one after another. Within a stage, one tokio task per client, all at the same time.
+    for (s, &stage_clients) in stages.iter().enumerate() {
+        let stage = s as u32 + 1; // stages are numbered from 1
+        let stage_end = ramp.then(|| Instant::now() + stage_len); // ramp mode: when this stage stops sending
+        if ramp {
+            println!("stage {stage}/{}: {stage_clients} clients for {} s", stages.len(), args.stage_secs);
+        }
+        let mut tasks = Vec::new();
+        for (i, client) in clients.iter().take(stage_clients as usize).enumerate() {
+            let job = ClientJob {
+                client: client.clone(),
+                client_id: i as u64 + 1, // client IDs start at 1
+                stage,
+                next: next.clone(),
+                tx: tx.clone(),
+                seed: args.seed,
+                max_requests: (!ramp).then_some(args.requests),
+                stage_end,
+                interval,
+                start,
+            };
+            tasks.push(tokio::spawn(job.run()));
+        }
+        for task in tasks {
+            task.await?; // the next stage starts only when every client of this one is done
+        }
     }
     drop(tx); // drop main's copy; the writer finishes once every task has dropped theirs too
-
-    for task in tasks {
-        task.await?; // wait for every client to finish
-    }
     let elapsed = start.elapsed(); // total run time
     let counts = writer.join().expect("CSV writer thread panicked")?; // wait for the last rows to be saved
 
@@ -174,13 +243,19 @@ async fn main() -> anyhow::Result<()> {
         "run_id: {run_id}\n\
          started_at_ms: {started_at_ms}\n\
          command: {}\n\
-         node: {}\nclients: {}\nrequests: {}\nseed: {}\nrate: {}\n\
+         mode: {}\nnode: {}\nstages: {}\nstage_secs: {}\nclients: {}\nrequests: {}\nseed: {}\nrate: {}\n\
          git_commit: {}\n\
          duration_s: {secs:.3}\n\
          ok: {}\nunassigned: {}\ntimeout: {}\nerror: {}\n\
          throughput_ok_per_s: {throughput:.1}\n",
         std::env::args().collect::<Vec<_>>().join(" "), // the exact command that was typed
-        node_addr, args.clients, args.requests, args.seed, args.rate,
+        if ramp { "ramp" } else { "fixed" },
+        node_addr,
+        stages.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","), // clients per stage, e.g. "1,2,4,8"
+        if ramp { args.stage_secs.to_string() } else { "-".to_string() },
+        max_clients,
+        if ramp { "-".to_string() } else { args.requests.to_string() }, // ramp mode runs by time, not by count
+        args.seed, args.rate,
         git_commit(),
         counts.ok, counts.unassigned, counts.timeout, counts.error,
     );
@@ -192,7 +267,7 @@ async fn main() -> anyhow::Result<()> {
 /// The CSV writer: takes rows off the channel and writes them until every sender is gone.
 fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Result<Counts> {
     let mut w = BufWriter::new(File::create(path)?); // buffered, so we don't hit the disk on every row
-    writeln!(w, "run_id,timestamp,client_id,request_id,latency_us,executor_node,status,assigned")?; // header row
+    writeln!(w, "run_id,timestamp,client_id,request_id,latency_us,executor_node,status,assigned,stage")?; // header row
     let mut counts = Counts::default();
     for row in rx {
         // This loop ends by itself once all tasks are done and the channel is closed.
@@ -208,8 +283,8 @@ fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Res
         let assigned = row.assigned.map_or(String::new(), |a| a.to_string()); // "true", "false", or empty if no plan
         writeln!(
             w,
-            "{run_id},{},{},{},{},{node},{},{assigned}",
-            row.timestamp_ms, row.client_id, row.request_id, row.latency_us, row.status.as_str()
+            "{run_id},{},{},{},{},{node},{},{assigned},{}",
+            row.timestamp_ms, row.client_id, row.request_id, row.latency_us, row.status.as_str(), row.stage
         )?;
     }
     w.flush()?; // save whatever is still in the buffer
