@@ -5,12 +5,19 @@
 //! `node_id`. Nodes that see the same bids therefore pick the same winner, with no
 //! coordinator.
 //!
-//! This file is pure logic, like the failure detector: no clock, no network.
+//! The rule (`pick_winner`) and the notebook (`ElectionTable`) are pure logic,
+//! like the failure detector: no clock, no network. `run_election` at the end is
+//! the network part: it exchanges bids with the peers and decides.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
 
 use common::NodeId;
+use common::pb::{self, BidRequest, SubmitRequest};
+
+use crate::broadcast::{PeerResult, broadcast};
+use crate::state::NodeState;
 
 /// One node's bid for one request and round, as this node holds it.
 /// Separate from the proto `Bid` (the wire format), like P2's domain types.
@@ -171,6 +178,80 @@ impl ElectionTable {
     /// Late bids counted in the current round.
     pub fn late_bids(&self, request_id: &str) -> u32 {
         self.entries.get(request_id).map_or(0, |e| e.late_bids)
+    }
+}
+
+// ---- Network part ----
+
+/// How long to wait for the peers' bids (design doc Section 3).
+/// TODO(P3): move to config as `[election] bid_timeout_ms`.
+const BID_TIMEOUT: Duration = Duration::from_millis(300);
+
+/// One election for `request`, from this node's side: fix my bid, send it to
+/// every peer, store the bids that come back, decide.
+///
+/// A peer that fails, times out or is not reached simply has no bid in this
+/// round (design doc Section 3: a missing bid means that node is out).
+/// Not yet: stopping early for peers marked down (part 2), answering peers'
+/// calls (part 3), following a peer into a newer round (part 4).
+pub async fn run_election(state: &NodeState, request: &SubmitRequest) -> Option<NodeId> {
+    let request_id = request.request_id.clone();
+
+    // Lock, read, unlock: the table is never locked while we wait on the network.
+    let (round, mine) = {
+        let mut table = state.election.lock().unwrap();
+        let mine = table.my_bid(&request_id, || own_bid(state));
+        (table.round(&request_id).unwrap_or(0), mine)
+    };
+
+    let call = BidRequest {
+        bid: Some(bid_to_pb(&request_id, round, mine)),
+        request: Some(request.clone()),
+    };
+    let results = broadcast(state, BID_TIMEOUT, move |mut client| {
+        let call = call.clone();
+        async move { client.exchange_bid(call).await }
+    })
+    .await;
+
+    let mut table = state.election.lock().unwrap();
+    for (peer, result) in results {
+        match result {
+            PeerResult::Reply(reply) if reply.request_id == request_id => {
+                let recorded = table.record_bid(&request_id, reply.round, bid_from_pb(&reply));
+                tracing::debug!(%request_id, peer, ?recorded, "bid received");
+            }
+            other => tracing::debug!(%request_id, peer, ?other, "no bid from peer"),
+        }
+    }
+    table.decide(&request_id)
+}
+
+/// My bid right now, from P3's load collector.
+fn own_bid(state: &NodeState) -> Bid {
+    Bid {
+        node_id: state.id,
+        load_score: state.load_report().load_score,
+        // TODO(P3): false while the shared state (P4's DFS) cannot be reached.
+        ready: true,
+    }
+}
+
+fn bid_to_pb(request_id: &str, round: u32, bid: Bid) -> pb::Bid {
+    pb::Bid {
+        request_id: request_id.to_string(),
+        node_id: bid.node_id,
+        load_score: bid.load_score,
+        round,
+        ready: bid.ready,
+    }
+}
+
+fn bid_from_pb(bid: &pb::Bid) -> Bid {
+    Bid {
+        node_id: bid.node_id,
+        load_score: bid.load_score,
+        ready: bid.ready,
     }
 }
 
@@ -350,5 +431,53 @@ mod tests {
         // Not fixed: a ready bid that arrives later can still be used.
         assert_eq!(table.record_bid("r7", 0, bid(3, 0.31)), Recorded::Stored);
         assert_eq!(table.decide("r7"), Some(3));
+    }
+
+    // ---- run_election over a real network (localhost) ----
+
+    use common::config::ClusterConfig;
+
+    use crate::peers::Peers;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    }
+
+    fn three_node_config() -> ClusterConfig {
+        ClusterConfig::parse(&format!(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:{}\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:{}\"\n\
+             [[nodes]]\nid = 3\naddr = \"127.0.0.1:{}\"\n\
+             [timing]\nconnect_timeout_ms = 200\n",
+            free_port(),
+            free_port(),
+            free_port()
+        ))
+        .unwrap()
+    }
+
+    fn state_for(id: NodeId, cfg: &ClusterConfig) -> NodeState {
+        let peers = Peers::new(cfg, id).unwrap();
+        NodeState::new(id, cfg.clone(), peers)
+    }
+
+    fn request(request_id: &str) -> SubmitRequest {
+        SubmitRequest {
+            request_id: request_id.to_string(),
+            kind: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn with_no_peer_reachable_a_node_elects_itself() {
+        let cfg = three_node_config(); // nodes 2 and 3 are not running
+        let node1 = state_for(1, &cfg);
+        assert_eq!(run_election(&node1, &request("r7")).await, Some(1));
+        // The decision is stored in the table.
+        assert_eq!(node1.election.lock().unwrap().winner("r7"), Some(1));
     }
 }

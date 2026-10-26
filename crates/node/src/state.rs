@@ -14,6 +14,7 @@ use tonic::transport::Channel;
 // Also used by the in-flight guard to time requests (P3's service-time average).
 use tokio::time::{Instant, sleep_until};
 
+use crate::election::ElectionTable;
 use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
@@ -41,6 +42,9 @@ pub struct NodeState {
     detector: Mutex<FailureDetector>,
     /// P5's fault CSV (MUTE_START/END, PEER_DOWN/UP). None in tests, so they write no files.
     pub fault_log: Option<FaultLog>,
+    /// P3: every election this node has taken part in (see election.rs).
+    /// Locked only briefly, never across a network call.
+    pub election: Mutex<ElectionTable>,
 }
 
 impl NodeState {
@@ -58,6 +62,7 @@ impl NodeState {
             muted_until: Mutex::new(None),
             detector: Mutex::new(detector),
             fault_log: None,
+            election: Mutex::new(ElectionTable::new()),
         }
     }
 
