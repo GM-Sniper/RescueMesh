@@ -63,7 +63,7 @@ pub enum Recorded {
     /// From an earlier round: ignored.
     OldRound,
     /// From a later round than ours (the peer already re-elected). Not stored;
-    /// the caller decides whether to follow it into that round.
+    /// the caller follows it into that round with `join_round`, then records again.
     NewerRound,
     /// No election for this request yet: the caller fixes its own bid (`my_bid`) first.
     UnknownRequest,
@@ -166,6 +166,25 @@ impl ElectionTable {
         Some(entry.round)
     }
 
+    /// Follows a peer into a newer round of the request: the peer saw the winner
+    /// fail before we did. Like Raft's term (design doc Section 1), a newer round
+    /// replaces ours. Fresh own bid from `current`, old bids and winner cleared.
+    /// Returns the new own bid, or `None` if the request is unknown or `round`
+    /// is not newer than ours.
+    pub fn join_round(
+        &mut self,
+        request_id: &str,
+        round: u32,
+        current: impl FnOnce() -> Bid,
+    ) -> Option<Bid> {
+        let entry = self.entries.get_mut(request_id)?;
+        if round <= entry.round {
+            return None;
+        }
+        *entry = Entry::new(round, current());
+        Some(entry.my_bid)
+    }
+
     /// The current round of the request, if this node has seen it.
     pub fn round(&self, request_id: &str) -> Option<u32> {
         self.entries.get(request_id).map(|e| e.round)
@@ -195,7 +214,6 @@ const BID_TIMEOUT: Duration = Duration::from_millis(300);
 /// round (design doc Section 3: a missing bid means that node is out).
 /// Every peer gets our bid, but we only wait for the peers the failure detector
 /// reports alive, so a peer already marked down does not cost the full timeout.
-/// Not yet: following a peer into a newer round (part 4).
 pub async fn run_election(state: &NodeState, request: &SubmitRequest) -> Option<NodeId> {
     let request_id = request.request_id.clone();
 
@@ -249,11 +267,19 @@ pub fn handle_exchange_bid(state: &NodeState, call: BidRequest) -> Result<pb::Bi
     let request_id = theirs.request_id.clone();
 
     let mut table = state.election.lock().unwrap();
-    // TODO(P3, bid hook with P1): if we had never seen this request, also start our
-    // own election here. Otherwise, when we have the lowest bid, the peers decide we
-    // won but we never plan, and the client has to time out and retry.
-    let mine = table.my_bid(&request_id, || own_bid(state));
-    let recorded = table.record_bid(&request_id, theirs.round, bid_from_pb(&theirs));
+    // TODO(P3, bid hook with P1): if we had never seen this request, or we just
+    // joined a newer round below, also start our own election here. Otherwise, when
+    // we have the lowest bid, the peers decide we won but we never plan, and the
+    // client has to time out and retry.
+    let mut mine = table.my_bid(&request_id, || own_bid(state));
+    let mut recorded = table.record_bid(&request_id, theirs.round, bid_from_pb(&theirs));
+    if recorded == Recorded::NewerRound {
+        // The peer saw the winner fail before we did: follow it (part 4, option A).
+        if let Some(fresh) = table.join_round(&request_id, theirs.round, || own_bid(state)) {
+            mine = fresh;
+            recorded = table.record_bid(&request_id, theirs.round, bid_from_pb(&theirs));
+        }
+    }
     tracing::debug!(%request_id, from = theirs.node_id, ?recorded, "bid call received");
     let round = table.round(&request_id).unwrap_or(0);
     Ok(bid_to_pb(&request_id, round, mine))
@@ -439,6 +465,30 @@ mod tests {
             Recorded::NewerRound
         );
         assert_eq!(table.decide("r7"), Some(2));
+    }
+
+    #[test]
+    fn joining_a_newer_round_clears_old_bids_and_ignores_older_rounds() {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || bid(2, 0.45));
+        table.record_bid("r7", 0, bid(1, 0.20));
+        assert_eq!(table.decide("r7"), Some(1));
+
+        // Node 3 already re-elected without node 1: follow it into round 1.
+        assert_eq!(
+            table.join_round("r7", 1, || bid(2, 0.60)),
+            Some(bid(2, 0.60))
+        );
+        assert_eq!((table.round("r7"), table.winner("r7")), (Some(1), None));
+        assert_eq!(table.record_bid("r7", 1, bid(3, 0.31)), Recorded::Stored);
+        assert_eq!(table.record_bid("r7", 0, bid(1, 0.20)), Recorded::OldRound);
+        assert_eq!(table.decide("r7"), Some(3));
+
+        // Not newer, or unknown request: nothing changes.
+        assert_eq!(table.join_round("r7", 1, || bid(2, 0.99)), None);
+        assert_eq!(table.join_round("r7", 0, || bid(2, 0.99)), None);
+        assert_eq!(table.join_round("r8", 1, || bid(2, 0.99)), None);
+        assert_eq!(table.winner("r7"), Some(3));
     }
 
     #[test]
@@ -646,6 +696,24 @@ mod tests {
         assert_eq!(again.load_score, reply.load_score);
         // Node 2 was idle when its bid was fixed (score 0.0), so it beats 0.20 and 0.31.
         assert_eq!(n2.election.lock().unwrap().decide("r7"), Some(2));
+    }
+
+    #[tokio::test]
+    async fn peer_call_from_a_newer_round_makes_us_join_it() {
+        let cfg = three_node_config();
+        let n2 = state_for(2, &cfg);
+        handle_exchange_bid(&n2, call("r7", 1, 0.20)).unwrap(); // round 0
+
+        // Node 3 saw node 1 fail first and calls with its round-1 bid.
+        let mut round1 = call("r7", 3, 0.31);
+        round1.bid.as_mut().unwrap().round = 1;
+        let reply = handle_exchange_bid(&n2, round1).unwrap();
+        assert_eq!((reply.node_id, reply.round), (2, 1));
+
+        let mut table = n2.election.lock().unwrap();
+        assert_eq!(table.round("r7"), Some(1));
+        // Node 1's round-0 bid no longer counts.
+        assert_eq!(table.record_bid("r7", 0, bid(1, 0.20)), Recorded::OldRound);
     }
 
     #[tokio::test]
