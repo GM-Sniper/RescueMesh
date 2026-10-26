@@ -56,6 +56,26 @@ where
     Fut: Future<Output = Result<Response<T>, Status>> + Send + 'static,
     T: Send + 'static,
 {
+    let everyone: Vec<NodeId> = state.peers.ids().collect();
+    broadcast_until(state, deadline, &everyone, call).await
+}
+
+/// Like `broadcast`, but returns as soon as every peer in `wait_for` has a result
+/// (P3's Q3, agreed with P1). Every peer still gets the call; calls still pending
+/// when it returns are cancelled and those peers are left out of the results.
+/// The election passes the peers the detector reports alive, so a peer already
+/// marked down does not cost the full deadline.
+pub async fn broadcast_until<T, F, Fut>(
+    state: &NodeState,
+    deadline: Duration,
+    wait_for: &[NodeId],
+    call: F,
+) -> Vec<(NodeId, PeerResult<T>)>
+where
+    F: Fn(NodeClient<Channel>) -> Fut + Clone + Send + 'static,
+    Fut: Future<Output = Result<Response<T>, Status>> + Send + 'static,
+    T: Send + 'static,
+{
     let mut results = Vec::new();
     let mut tasks = JoinSet::new();
     for peer in state.peers.ids() {
@@ -66,8 +86,17 @@ where
         let call = call.clone();
         tasks.spawn(async move { (peer, call_with_retry(peer, client, deadline, call).await) });
     }
-    // Collected as they finish, not in start order.
-    while let Some(joined) = tasks.join_next().await {
+    let all_waited_for_have_answered = |results: &Vec<(NodeId, PeerResult<T>)>| {
+        wait_for
+            .iter()
+            .all(|p| results.iter().any(|(peer, _)| peer == p))
+    };
+    // Collected as they finish, not in start order. Dropping `tasks` on an early
+    // return cancels the calls still pending.
+    while !all_waited_for_have_answered(&results) {
+        let Some(joined) = tasks.join_next().await else {
+            break;
+        };
         match joined {
             Ok((peer, result)) => results.push((peer, result)),
             // A bug (panic) in one call must not lose the other peers' results.

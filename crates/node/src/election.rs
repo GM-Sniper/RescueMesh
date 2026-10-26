@@ -17,7 +17,7 @@ use common::NodeId;
 use common::pb::{self, BidRequest, SubmitRequest};
 use tonic::Status;
 
-use crate::broadcast::{PeerResult, broadcast};
+use crate::broadcast::{PeerResult, broadcast_until};
 use crate::state::NodeState;
 
 /// One node's bid for one request and round, as this node holds it.
@@ -193,8 +193,9 @@ const BID_TIMEOUT: Duration = Duration::from_millis(300);
 ///
 /// A peer that fails, times out or is not reached simply has no bid in this
 /// round (design doc Section 3: a missing bid means that node is out).
-/// Not yet: stopping early for peers marked down (part 2), following a peer
-/// into a newer round (part 4).
+/// Every peer gets our bid, but we only wait for the peers the failure detector
+/// reports alive, so a peer already marked down does not cost the full timeout.
+/// Not yet: following a peer into a newer round (part 4).
 pub async fn run_election(state: &NodeState, request: &SubmitRequest) -> Option<NodeId> {
     let request_id = request.request_id.clone();
 
@@ -209,7 +210,8 @@ pub async fn run_election(state: &NodeState, request: &SubmitRequest) -> Option<
         bid: Some(bid_to_pb(&request_id, round, mine)),
         request: Some(request.clone()),
     };
-    let results = broadcast(state, BID_TIMEOUT, move |mut client| {
+    let alive = state.alive_peers();
+    let results = broadcast_until(state, BID_TIMEOUT, &alive, move |mut client| {
         let call = call.clone();
         async move { client.exchange_bid(call).await }
     })
@@ -486,7 +488,8 @@ mod tests {
             "[[nodes]]\nid = 1\naddr = \"127.0.0.1:{}\"\n\
              [[nodes]]\nid = 2\naddr = \"127.0.0.1:{}\"\n\
              [[nodes]]\nid = 3\naddr = \"127.0.0.1:{}\"\n\
-             [timing]\nconnect_timeout_ms = 200\n",
+             [timing]\nconnect_timeout_ms = 200\n\
+             heartbeat_interval_ms = 50\nsuspect_after_ms = 100\n",
             free_port(),
             free_port(),
             free_port()
@@ -590,6 +593,43 @@ mod tests {
         let r = request("r7");
         let winners = tokio::join!(run_election(&n1, &r), run_election(&n2, &r));
         assert_eq!(winners, (Some(2), Some(2)));
+    }
+
+    // ---- Part 2: waiting only for peers the detector reports alive ----
+
+    #[tokio::test]
+    async fn peer_marked_down_costs_no_wait() {
+        let cfg = three_node_config();
+        serve(2, &cfg).await;
+        serve(3, &cfg).await.mute_for(Duration::from_secs(5));
+        let n1 = state_for(1, &cfg);
+        // Let node 3's silence pass suspect_after (100 ms here); node 2 was heard.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        n1.heard_from(2);
+        n1.check_peers();
+        assert_eq!(n1.alive_peers(), vec![2]);
+
+        let start = std::time::Instant::now();
+        assert_eq!(run_election(&n1, &request("r7")).await, Some(1));
+        let took = start.elapsed();
+        assert!(took < BID_TIMEOUT / 2, "took {took:?}");
+    }
+
+    #[tokio::test]
+    async fn muted_peer_not_yet_marked_down_costs_the_full_timeout() {
+        let cfg = three_node_config();
+        serve(2, &cfg).await;
+        serve(3, &cfg).await.mute_for(Duration::from_secs(5));
+        let n1 = state_for(1, &cfg);
+        assert_eq!(n1.alive_peers(), vec![2, 3]); // the detector has not noticed yet
+
+        let start = std::time::Instant::now();
+        assert_eq!(run_election(&n1, &request("r7")).await, Some(1));
+        let took = start.elapsed();
+        assert!(
+            took >= BID_TIMEOUT && took < BID_TIMEOUT + Duration::from_millis(150),
+            "took {took:?}"
+        );
     }
 
     #[tokio::test]
