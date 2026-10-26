@@ -287,6 +287,31 @@ impl ElectionTable {
 /// TODO(P3): move to config as `[election] bid_timeout_ms`.
 const BID_TIMEOUT: Duration = Duration::from_millis(300);
 
+/// The election entry point for a client request, first copy or retry (design
+/// doc step 2 and Section 4, "Winner fails"):
+/// - a winner already decided and still alive (or us) keeps the request: no new election;
+/// - a winner already decided but reported down: next round, without it;
+/// - otherwise (new request, or an election still running): run the election.
+///
+/// Checking for an already stored plan (P4's `lookup_request`) is the request
+/// handler's job, before it calls this.
+pub async fn elect(state: &Arc<NodeState>, request: &SubmitRequest) -> Option<NodeId> {
+    let request_id = &request.request_id;
+    let decided = state.election.lock().unwrap().winner(request_id);
+    if let Some(winner) = decided {
+        if winner == state.id || state.alive_peers().contains(&winner) {
+            return Some(winner);
+        }
+        let round = state
+            .election
+            .lock()
+            .unwrap()
+            .start_next_round(request_id, || own_bid(state));
+        tracing::info!(%request_id, failed = winner, ?round, "winner reported down: re-electing");
+    }
+    run_election(state, request).await
+}
+
 /// One election for `request`, from this node's side: fix my bid, send it to
 /// every peer, store the bids that come back, decide.
 ///
@@ -1043,6 +1068,76 @@ mod tests {
             let err = handle_announce_winner(&n2, bad).unwrap_err();
             assert_eq!(err.code(), tonic::Code::InvalidArgument);
         }
+    }
+
+    // ---- elect: first request and client retries ----
+
+    #[tokio::test]
+    async fn first_request_runs_a_normal_election() {
+        let cfg = three_node_config(); // no peers running
+        let n1 = state_for(1, &cfg);
+        assert_eq!(elect(&n1, &request("r7")).await, Some(1));
+        assert_eq!(n1.election.lock().unwrap().round("r7"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn retry_with_the_winner_alive_keeps_it() {
+        let cfg = three_node_config();
+        let n1 = state_for(1, &cfg);
+        {
+            let mut table = n1.election.lock().unwrap();
+            table.my_bid("r7", || bid(1, 0.45));
+            table.record_bid("r7", 0, bid(2, 0.10));
+            assert_eq!(table.decide("r7"), Some(2));
+        }
+        assert!(n1.alive_peers().contains(&2));
+        // Node 2 is still working on it: same winner, same round, same bids.
+        assert_eq!(elect(&n1, &request("r7")).await, Some(2));
+        let table = n1.election.lock().unwrap();
+        assert_eq!(table.round("r7"), Some(0));
+        assert_eq!(table.bids("r7"), vec![bid(1, 0.45), bid(2, 0.10)]);
+    }
+
+    #[tokio::test]
+    async fn retry_when_we_are_the_winner_keeps_it() {
+        let cfg = three_node_config();
+        let n1 = state_for(1, &cfg);
+        {
+            let mut table = n1.election.lock().unwrap();
+            table.my_bid("r7", || bid(1, 0.10));
+            assert_eq!(table.decide("r7"), Some(1));
+        }
+        assert_eq!(elect(&n1, &request("r7")).await, Some(1));
+        assert_eq!(n1.election.lock().unwrap().round("r7"), Some(0));
+    }
+
+    #[tokio::test]
+    async fn retry_after_the_winner_fails_elects_a_new_one_in_round_1() {
+        let cfg = three_node_config();
+        let (n1, n2, n3) = (
+            serve(1, &cfg).await,
+            serve(2, &cfg).await,
+            serve(3, &cfg).await,
+        );
+        let r = request("r7");
+        // Round 0: all idle, the tie goes to node 1.
+        let winners = tokio::join!(elect(&n1, &r), elect(&n2, &r), elect(&n3, &r));
+        assert_eq!(winners, (Some(1), Some(1), Some(1)));
+
+        // Node 1 fails; nodes 2 and 3 mark it down (and keep hearing each other).
+        n1.mute_for(Duration::from_secs(5));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        n2.heard_from(3);
+        n3.heard_from(2);
+        n2.check_peers();
+        n3.check_peers();
+        assert_eq!((n2.alive_peers(), n3.alive_peers()), (vec![3], vec![2]));
+
+        // The client retries: round 1 between nodes 2 and 3, tie goes to node 2.
+        let winners = tokio::join!(elect(&n2, &r), elect(&n3, &r));
+        assert_eq!(winners, (Some(2), Some(2)));
+        assert_eq!(n2.election.lock().unwrap().round("r7"), Some(1));
+        assert_eq!(n3.election.lock().unwrap().round("r7"), Some(1));
     }
 
     // ---- Election CSV ----
