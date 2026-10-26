@@ -8,6 +8,9 @@ mod failure_detector;
 // Task 6. No caller in Step A: the election and replication use it in Step B.
 #[allow(dead_code)]
 mod broadcast;
+// P3: election rule. No caller yet: the bid exchange is the next step.
+#[allow(dead_code)]
+mod election;
 mod fault_log;
 mod heartbeat;
 mod load;
