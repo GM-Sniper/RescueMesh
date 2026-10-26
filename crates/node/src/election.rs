@@ -8,6 +8,7 @@
 //! This file is pure logic, like the failure detector: no clock, no network.
 
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap};
 
 use common::NodeId;
 
@@ -42,6 +43,135 @@ fn compare(a: &Bid, b: &Bid) -> Ordering {
     a.load_score
         .total_cmp(&b.load_score)
         .then(a.node_id.cmp(&b.node_id))
+}
+
+/// What `record_bid` did with a peer's bid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recorded {
+    /// Stored: it counts in this round's decision.
+    Stored,
+    /// Arrived after this round was decided: counted as late, not used.
+    Late,
+    /// From an earlier round: ignored.
+    OldRound,
+    /// From a later round than ours (the peer already re-elected). Not stored;
+    /// the caller decides whether to follow it into that round.
+    NewerRound,
+    /// No election for this request yet: the caller fixes its own bid (`my_bid`) first.
+    UnknownRequest,
+}
+
+/// One request's election, as this node sees it.
+struct Entry {
+    round: u32,
+    /// Fixed once per round, so every peer compares the same number from us.
+    my_bid: Bid,
+    /// Peers' bids for this round. The first copy of each is kept.
+    bids: BTreeMap<NodeId, Bid>,
+    /// Set by `decide` and never changed for this round.
+    winner: Option<NodeId>,
+    /// Bids that arrived after the decision (election metrics, design doc Section 8).
+    late_bids: u32,
+}
+
+impl Entry {
+    fn new(round: u32, my_bid: Bid) -> Self {
+        Entry {
+            round,
+            my_bid,
+            bids: BTreeMap::new(),
+            winner: None,
+            late_bids: 0,
+        }
+    }
+}
+
+/// Every election this node has taken part in, by `request_id`.
+///
+/// Entries are never removed: fine for experiment-sized runs (thousands of
+/// requests), but it grows without limit in a long run. TODO(P3): drop old entries.
+#[derive(Default)]
+pub struct ElectionTable {
+    entries: HashMap<String, Entry>,
+}
+
+impl ElectionTable {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// This node's bid for the request. The first call fixes it from `current`
+    /// (the load score right now); every later call returns the same bid, whether
+    /// the request came from the client or from a peer's bid call.
+    pub fn my_bid(&mut self, request_id: &str, current: impl FnOnce() -> Bid) -> Bid {
+        self.entries
+            .entry(request_id.to_string())
+            .or_insert_with(|| Entry::new(0, current()))
+            .my_bid
+    }
+
+    /// Stores a peer's bid for `round` of the request, unless it is too old, too
+    /// late, or a repeat (the first copy is kept).
+    pub fn record_bid(&mut self, request_id: &str, round: u32, bid: Bid) -> Recorded {
+        let Some(entry) = self.entries.get_mut(request_id) else {
+            return Recorded::UnknownRequest;
+        };
+        if round < entry.round {
+            return Recorded::OldRound;
+        }
+        if round > entry.round {
+            return Recorded::NewerRound;
+        }
+        if entry.winner.is_some() {
+            entry.late_bids += 1;
+            return Recorded::Late;
+        }
+        if bid.node_id != entry.my_bid.node_id {
+            entry.bids.entry(bid.node_id).or_insert(bid);
+        }
+        Recorded::Stored
+    }
+
+    /// Decides the current round from the bids held now (own bid included) and
+    /// keeps that answer: later calls return the same winner. `None` if the
+    /// request is unknown or no bid is ready; nothing is fixed in that case.
+    pub fn decide(&mut self, request_id: &str) -> Option<NodeId> {
+        let entry = self.entries.get_mut(request_id)?;
+        if entry.winner.is_none() {
+            let mut all: Vec<Bid> = entry.bids.values().copied().collect();
+            all.push(entry.my_bid);
+            entry.winner = pick_winner(&all);
+        }
+        entry.winner
+    }
+
+    /// Re-election after the winner failed (design doc Section 4, "Winner fails"):
+    /// round + 1, a fresh own bid from `current`, old bids and winner cleared.
+    /// Returns the new round, or `None` if the request is unknown.
+    pub fn start_next_round(
+        &mut self,
+        request_id: &str,
+        current: impl FnOnce() -> Bid,
+    ) -> Option<u32> {
+        let entry = self.entries.get_mut(request_id)?;
+        *entry = Entry::new(entry.round + 1, current());
+        Some(entry.round)
+    }
+
+    /// The current round of the request, if this node has seen it.
+    pub fn round(&self, request_id: &str) -> Option<u32> {
+        self.entries.get(request_id).map(|e| e.round)
+    }
+
+    /// The decided winner of the current round, if any.
+    pub fn winner(&self, request_id: &str) -> Option<NodeId> {
+        self.entries.get(request_id).and_then(|e| e.winner)
+    }
+
+    /// Late bids counted in the current round.
+    pub fn late_bids(&self, request_id: &str) -> u32 {
+        self.entries.get(request_id).map_or(0, |e| e.late_bids)
+    }
 }
 
 #[cfg(test)]
@@ -125,5 +255,100 @@ mod tests {
     fn nan_score_loses_to_any_real_score() {
         assert_eq!(pick_winner(&[bid(1, f64::NAN), bid(2, 0.99)]), Some(2));
         assert_eq!(pick_winner(&[bid(2, 0.99), bid(1, f64::NAN)]), Some(2));
+    }
+
+    // ---- Election table. Node 2's view in every test. ----
+
+    #[test]
+    fn own_bid_is_fixed_once() {
+        let mut table = ElectionTable::new();
+        assert_eq!(table.my_bid("r7", || bid(2, 0.45)), bid(2, 0.45));
+        // Load changed since, but the bid for r7 does not.
+        assert_eq!(table.my_bid("r7", || bid(2, 0.90)), bid(2, 0.45));
+    }
+
+    #[test]
+    fn worked_example_and_the_decision_never_changes() {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || bid(2, 0.45));
+        assert_eq!(table.record_bid("r7", 0, bid(1, 0.20)), Recorded::Stored);
+        assert_eq!(table.record_bid("r7", 0, bid(3, 0.31)), Recorded::Stored);
+        assert_eq!(table.decide("r7"), Some(1));
+
+        // Node 3's second copy arrives after the decision: counted, not used.
+        assert_eq!(table.record_bid("r7", 0, bid(3, 0.01)), Recorded::Late);
+        assert_eq!(table.late_bids("r7"), 1);
+        assert_eq!(table.decide("r7"), Some(1));
+        assert_eq!(table.winner("r7"), Some(1));
+    }
+
+    #[test]
+    fn first_copy_of_a_peer_bid_is_kept() {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || bid(2, 0.45));
+        table.record_bid("r7", 0, bid(1, 0.50));
+        table.record_bid("r7", 0, bid(1, 0.10)); // a changed repeat must not count
+        assert_eq!(table.decide("r7"), Some(2));
+    }
+
+    #[test]
+    fn bid_for_an_unknown_request_is_not_stored() {
+        let mut table = ElectionTable::new();
+        assert_eq!(
+            table.record_bid("r7", 0, bid(1, 0.20)),
+            Recorded::UnknownRequest
+        );
+        assert_eq!(table.decide("r7"), None);
+    }
+
+    #[test]
+    fn next_round_clears_old_bids_and_ignores_old_round_bids() {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || bid(2, 0.45));
+        table.record_bid("r7", 0, bid(1, 0.20));
+        assert_eq!(table.decide("r7"), Some(1));
+
+        // Node 1 failed: round 1 without it, with a fresh own bid.
+        assert_eq!(table.start_next_round("r7", || bid(2, 0.60)), Some(1));
+        assert_eq!(table.round("r7"), Some(1));
+        assert_eq!(table.winner("r7"), None);
+        assert_eq!(table.record_bid("r7", 0, bid(1, 0.20)), Recorded::OldRound);
+        assert_eq!(table.record_bid("r7", 1, bid(3, 0.31)), Recorded::Stored);
+        assert_eq!(table.decide("r7"), Some(3));
+    }
+
+    #[test]
+    fn bid_from_a_newer_round_is_not_stored() {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || bid(2, 0.45));
+        assert_eq!(
+            table.record_bid("r7", 1, bid(3, 0.31)),
+            Recorded::NewerRound
+        );
+        assert_eq!(table.decide("r7"), Some(2));
+    }
+
+    #[test]
+    fn requests_do_not_mix() {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || bid(2, 0.45));
+        table.my_bid("r8", || bid(2, 0.45));
+        table.record_bid("r7", 0, bid(1, 0.20));
+        assert_eq!(table.decide("r7"), Some(1));
+        assert_eq!(table.decide("r8"), Some(2));
+    }
+
+    #[test]
+    fn not_ready_alone_decides_nothing_yet() {
+        let mut table = ElectionTable::new();
+        table.my_bid("r7", || Bid {
+            node_id: 2,
+            load_score: 0.1,
+            ready: false,
+        });
+        assert_eq!(table.decide("r7"), None);
+        // Not fixed: a ready bid that arrives later can still be used.
+        assert_eq!(table.record_bid("r7", 0, bid(3, 0.31)), Recorded::Stored);
+        assert_eq!(table.decide("r7"), Some(3));
     }
 }
