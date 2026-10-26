@@ -556,7 +556,9 @@ dependencies = [
  "clap",
  "client",
  "common",
+ "serde",
  "tokio",
+ "toml",
 ]
 
 [[package]]

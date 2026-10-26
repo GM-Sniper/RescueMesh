@@ -427,6 +427,46 @@ Laptop numbers jump around (one machine runs the node and all the clients); the 
 
 ---
 
+## 12. Step B, Mon Oct 26: experiment runner (branch `StepB/p6`)
+
+Plan task: "one command runs a config (clients, duration, seed) and gathers CSVs from all 3 nodes".
+
+```bash
+cargo build --release                                                    # builds node, loadgen, stats and experiment
+cargo run --release -p loadgen --bin experiment -- experiments/ramp-local.toml
+```
+
+An experiment is a small TOML file in `experiments/`:
+
+```toml
+name = "ramp-local"              # the run is called <name>-<unix seconds>
+cluster = "config/nodes.toml"    # which nodes (config/nodes.lab.toml on the real machines)
+start_nodes = true               # true: start every node on this machine; false: they already run (lab)
+target = 1                       # node the load goes to (until P1's multicast)
+seed = 1                         # same seed = same incidents
+stages = [1, 2, 4, 8]            # ramp; or clients / requests / rate for a fixed run
+stage_secs = 10                  # seconds per stage
+```
+
+What one command does, in local mode:
+
+1. Checks the node ports are free (so it never measures an old node or the mock by mistake), starts every node with the run's `--run-id`, inside the run folder, and waits until each accepts connections.
+2. Runs `loadgen` with the file's settings, writing straight into the run folder.
+3. Stops the nodes. They are also stopped if any step fails, so none are left running.
+4. Runs `stats`, prints it and saves it as `summary.txt`.
+
+Everything lands in `results/<run_id>/`: `experiment.toml` (copy of the config), the request CSV and `.meta.txt`, `summary.txt`, `node<N>.log`, and `logs/faults-node<N>.csv` + `logs/node_metrics-node<N>.csv` for each node. Because each node runs inside the run folder, its logs belong to that run only, not appended to older runs.
+
+Lab mode (`start_nodes = false`, `experiments/ramp-lab.toml`): prints the exact command to start each node with the right `--run-id`, waits for Enter, runs the load and stats, then lists which node files to copy into the run folder. Copying them automatically needs a shared folder or ssh between the machines, which is not set up yet.
+
+Example configs: `experiments/ramp-local.toml` (40 s ramp on one laptop), `experiments/ramp-lab.toml` (2.5 min ramp on the lab machines), `experiments/fixed-local.toml` (Step A style: 10 clients, 1000 requests at 100/s).
+
+Tested on one laptop: 3 nodes started, 4-stage ramp, 13 files gathered, no node left running afterwards.
+
+**Open observation for P1/P4:** on the first run after a fresh `cargo build`, a fresh node answered every request with an empty plan (0 of 12723 assigned). Every later run on the same binary assigned the 10 starting resources as expected. Seen 3 times. `assigned` comes straight from the node's reply, so the cause is on the node side; not investigated further.
+
+---
+
 ## How to run everything
 
 ```bash

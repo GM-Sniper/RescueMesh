@@ -1,0 +1,11 @@
+# Step A style run on one laptop: 10 clients, 1000 requests at 100 per second.
+#   cargo run --release -p loadgen --bin experiment -- experiments/fixed-local.toml
+
+name = "fixed-local"
+cluster = "config/nodes.toml"
+start_nodes = true
+target = 1
+seed = 1
+clients = 10        # fixed mode: no `stages`
+requests = 1000
+rate = 100          # requests per second across all clients; leave out for "as fast as possible"

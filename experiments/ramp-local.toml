@@ -1,0 +1,12 @@
+# Ramp experiment on one laptop: the runner starts all 3 nodes itself.
+#   cargo build --release
+#   cargo run --release -p loadgen --bin experiment -- experiments/ramp-local.toml
+# Results: results/ramp-local-<unix seconds>/
+
+name = "ramp-local"              # the run is called <name>-<unix seconds>
+cluster = "config/nodes.toml"    # 3 nodes on 127.0.0.1, ports 50051-50053
+start_nodes = true               # start every node in the cluster file on this machine, stop them at the end
+target = 1                       # node the load goes to (until P1's multicast sends to all 3)
+seed = 1                         # incident seed: same seed = same incidents
+stages = [1, 2, 4, 8]            # clients per stage
+stage_secs = 10                  # seconds per stage, so 40 s in total
