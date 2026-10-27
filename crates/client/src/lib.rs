@@ -351,9 +351,14 @@ mod tests {
 
     /// Starts fake nodes 1, 2, 3... on localhost; returns their (id, address) and what each saw.
     async fn start(acts: &[fn(u32) -> Act]) -> (Vec<(NodeId, String)>, Vec<Arc<Mutex<Vec<String>>>>) {
+        start_at(1, acts).await
+    }
+
+    /// Like `start`, numbering the fakes from `first_id`.
+    async fn start_at(first_id: NodeId, acts: &[fn(u32) -> Act]) -> (Vec<(NodeId, String)>, Vec<Arc<Mutex<Vec<String>>>>) {
         let (mut nodes, mut seen) = (Vec::new(), Vec::new());
         for (i, &act) in acts.iter().enumerate() {
-            let id = i as NodeId + 1;
+            let id = first_id + i as NodeId;
             let log = Arc::new(Mutex::new(Vec::new()));
             let fake = Fake { id, act, calls: AtomicU32::new(0), seen: log.clone() };
             // Listening before the server task starts: on Windows, connecting to a port that
@@ -444,5 +449,54 @@ mod tests {
         assert_eq!(out.status, SubmitStatus::Error, "every node answered, none with a plan: {out:?}");
         // Not 3 tries in a few ms: each retry waits for the attempt deadline first.
         assert!(started.elapsed() >= 2 * FAST.attempt_timeout, "retried too fast: {:?}", started.elapsed());
+    }
+
+    // ---- Step B plan: the three client failure cases. Each ends in a retry with the same
+    // request_id that a node which is up answers with a plan.
+
+    #[tokio::test]
+    async fn network_cut_send_fails_and_the_retry_gets_the_stored_plan() {
+        // Node 1 (the winner) is cut off: nothing answers at its address, so sending fails.
+        // It had already committed; on the retry, node 2 finds that plan in the shared state.
+        let (mut nodes, _) = start_at(2, &[
+            |n| if n == 1 { Act::NoPlan { winner: 1 } } else { Act::Plan { after_ms: 0, duplicate: true } },
+            |_| Act::NoPlan { winner: 1 },
+        ])
+        .await;
+        nodes.insert(0, (1, free_addr()));
+        let out = client(&nodes, FAST).submit(pb::Incident::default()).await;
+        assert_eq!(out.status, SubmitStatus::Ok, "{out:?}");
+        assert_eq!((out.attempts, out.executor_node, out.duplicate), (2, Some(2), true));
+    }
+
+    #[tokio::test]
+    async fn winner_took_the_request_then_died_and_the_retry_is_re_elected() {
+        // Node 1 won and went silent before replying. The others name it until they
+        // suspect it; the retry's election skips it, and node 2 plans.
+        let (nodes, seen) = start(&[
+            |_| Act::Hang,
+            |n| if n == 1 { Act::NoPlan { winner: 1 } } else { Act::Plan { after_ms: 0, duplicate: false } },
+            |n| if n == 1 { Act::NoPlan { winner: 1 } } else { Act::NoPlan { winner: 2 } },
+        ])
+        .await;
+        let out = client(&nodes, FAST).submit(pb::Incident::default()).await;
+        assert_eq!(out.status, SubmitStatus::Ok, "{out:?}");
+        assert_eq!((out.attempts, out.executor_node, out.duplicate), (2, Some(2), false));
+        assert_eq!(seen[0].lock().unwrap().len(), 2, "the retry still goes to node 1 too");
+    }
+
+    #[tokio::test]
+    async fn slow_request_hits_the_deadline_and_the_retry_gets_the_stored_plan() {
+        // Node 1 wins but its plan takes longer than the attempt deadline. By the retry it
+        // has committed, so it answers at once with the stored plan.
+        let (nodes, _) = start(&[
+            |n| if n == 1 { Act::Plan { after_ms: 500, duplicate: false } } else { Act::Plan { after_ms: 0, duplicate: true } },
+            |_| Act::NoPlan { winner: 1 },
+            |_| Act::NoPlan { winner: 1 },
+        ])
+        .await;
+        let out = client(&nodes, FAST).submit(pb::Incident::default()).await;
+        assert_eq!(out.status, SubmitStatus::Ok, "{out:?}");
+        assert_eq!((out.attempts, out.executor_node, out.duplicate), (2, Some(1), true));
     }
 }
