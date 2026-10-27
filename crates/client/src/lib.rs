@@ -154,53 +154,68 @@ impl ClientMiddleware {
             kind: Some(submit_request::Kind::Incident(incident)),        // the proto's `oneof kind`; Step A only sends incidents
         };
         let start = Instant::now(); // start the stopwatch right before the first send
-        let mut no_plan_replies = 0; // losers' replies seen so far
-        let mut silent = false; // a node gave no answer in time: decides Timeout vs Error at the end
+        let mut no_plan_replies = 0; // losers' replies seen so far, all attempts together
+        let mut silent = false; // a node gave no answer in the last attempt: decides Timeout vs Error
         let mut last_error = String::from("no node returned a plan"); // why it failed, if it does
 
-        let deadline = tokio::time::Instant::now() + self.policy.attempt_timeout; // one deadline for the whole attempt
-        let mut calls = self.send_to_all(&message, deadline); // every node at once, so nobody waits on the slowest
-        while let Some(joined) = calls.join_next().await { // answers in the order they arrive
-            let Ok((node_id, result)) = joined else { continue }; // a call task panicked: nothing to read
-            match result {
-                // This node gave no answer before the deadline (muted, crashed, or just slow).
-                Err(_elapsed) => {
-                    silent = true;
-                    last_error = format!("node {node_id}: no reply before the deadline");
-                }
-                // This node (or the network to it) answered with a gRPC error.
-                Ok(Err(status)) => last_error = format!("node {node_id}: {:?}: {}", status.code(), status.message()),
-                // This node answered normally.
-                Ok(Ok(response)) => {
-                    let reply = response.into_inner(); // strip the gRPC wrapper, keep the SubmitReply
-                    if reply.request_id != request_id {
-                        // A reply for some other request would make the measurement meaningless.
-                        last_error = format!("node {node_id}: reply is for request {}", reply.request_id);
-                        continue;
+        for attempt in 1..=self.policy.attempts {
+            if attempt > 1 {
+                // A short random pause (0-50 ms), so many clients retrying together don't all hit the nodes at once.
+                let pause_ms = Uuid::new_v4().as_bytes()[0] as u64 % 51; // a random byte; avoids a new dependency
+                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+            }
+            silent = false; // only the last attempt decides the final status
+            let deadline = tokio::time::Instant::now() + self.policy.attempt_timeout; // one deadline for the whole attempt
+            let mut calls = self.send_to_all(&message, deadline); // every node at once, so nobody waits on the slowest
+            while let Some(joined) = calls.join_next().await { // answers in the order they arrive
+                let Ok((node_id, result)) = joined else { continue }; // a call task panicked: nothing to read
+                match result {
+                    // This node gave no answer before the deadline (muted, crashed, or just slow).
+                    Err(_elapsed) => {
+                        silent = true;
+                        last_error = format!("node {node_id}: no reply before the deadline");
                     }
-                    let Some(plan) = reply.plan else {
-                        no_plan_replies += 1; // a loser naming the winner: keep waiting for the winner's plan
-                        continue;
-                    };
-                    // The first plan is the answer. Any later plan is counted, not used.
-                    self.count_late_plans(calls);
-                    return SubmitOutcome {
-                        request_id,
-                        latency_us: micros_since(start), // up to the reply WITH a plan (P6's Q2 rule)
-                        status: SubmitStatus::Ok,
-                        executor_node: Some(reply.executor_node), // the node that ran the planner
-                        plan: Some(plan),
-                        duplicate: reply.duplicate,
-                        error: None,
-                        attempts: 1,
-                        no_plan_replies,
-                    };
+                    // This node (or the network to it) answered with a gRPC error.
+                    Ok(Err(status)) => last_error = format!("node {node_id}: {:?}: {}", status.code(), status.message()),
+                    // This node answered normally.
+                    Ok(Ok(response)) => {
+                        let reply = response.into_inner(); // strip the gRPC wrapper, keep the SubmitReply
+                        if reply.request_id != request_id {
+                            // A reply for some other request would make the measurement meaningless.
+                            last_error = format!("node {node_id}: reply is for request {}", reply.request_id);
+                            continue;
+                        }
+                        let Some(plan) = reply.plan else {
+                            no_plan_replies += 1; // a loser naming the winner: keep waiting for the winner's plan
+                            continue;
+                        };
+                        // The first plan is the answer. Any later plan is counted, not used.
+                        self.count_late_plans(calls);
+                        return SubmitOutcome {
+                            request_id,
+                            latency_us: micros_since(start), // up to the reply WITH a plan (P6's Q2 rule)
+                            status: SubmitStatus::Ok,
+                            executor_node: Some(reply.executor_node), // the node that ran the planner
+                            plan: Some(plan),
+                            duplicate: reply.duplicate,
+                            error: None,
+                            attempts: attempt,
+                            no_plan_replies,
+                        };
+                    }
                 }
             }
+            // No plan in this attempt. Wait out its deadline before retrying, even if every node
+            // already answered: if the winner just died, the others still call it alive for up to
+            // 1.5 s, and a retry before then would only hear "no plan" again.
+            if attempt < self.policy.attempts {
+                tokio::time::sleep_until(deadline).await;
+            }
         }
-        // Every node answered or timed out, and none had a plan.
+        // No attempt brought a plan.
         let status = if silent { SubmitStatus::Timeout } else { SubmitStatus::Error };
         let mut outcome = SubmitOutcome::failed(request_id, micros_since(start), status, last_error);
+        outcome.attempts = self.policy.attempts;
         outcome.no_plan_replies = no_plan_replies;
         outcome
     }
@@ -393,5 +408,41 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(1200)).await; // the slow plan arrives meanwhile
         assert_eq!(client.late_plans(), 1, "the later plan is counted, not used");
+    }
+
+    #[tokio::test]
+    async fn a_retry_sends_the_same_request_id_to_every_node() {
+        let (nodes, seen) = start(&[
+            |n| if n == 1 { Act::NoPlan { winner: 3 } } else { Act::Plan { after_ms: 0, duplicate: true } },
+            |_| Act::NoPlan { winner: 3 },
+            |_| Act::NoPlan { winner: 3 },
+        ])
+        .await;
+        let out = client(&nodes, FAST).submit(pb::Incident::default()).await;
+        assert_eq!(out.status, SubmitStatus::Ok, "{out:?}");
+        assert_eq!(out.attempts, 2);
+        for log in &seen {
+            assert_eq!(*log.lock().unwrap(), vec![out.request_id.clone(); 2], "same ID, both attempts");
+        }
+    }
+
+    #[tokio::test]
+    async fn no_plan_in_any_attempt_is_a_timeout() {
+        let (nodes, _) = start(&[|_| Act::Hang, |_| Act::Hang, |_| Act::Hang]).await;
+        let started = Instant::now();
+        let out = client(&nodes, FAST).submit(pb::Incident::default()).await;
+        assert_eq!(out.status, SubmitStatus::Timeout, "{out:?}");
+        assert_eq!(out.attempts, 3);
+        assert!(started.elapsed() >= 3 * FAST.attempt_timeout, "gave up early: {:?}", started.elapsed());
+    }
+
+    #[tokio::test]
+    async fn fast_failures_still_wait_out_each_attempt() {
+        let (nodes, _) = start(&[|_| Act::Fail, |_| Act::Fail, |_| Act::Fail]).await;
+        let started = Instant::now();
+        let out = client(&nodes, FAST).submit(pb::Incident::default()).await;
+        assert_eq!(out.status, SubmitStatus::Error, "every node answered, none with a plan: {out:?}");
+        // Not 3 tries in a few ms: each retry waits for the attempt deadline first.
+        assert!(started.elapsed() >= 2 * FAST.attempt_timeout, "retried too fast: {:?}", started.elapsed());
     }
 }
