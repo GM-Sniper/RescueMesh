@@ -244,3 +244,12 @@ A request that passed the entry gate and is then muted has its reply dropped at 
 **Alternatives.** One file per run; logging from inside the failure detector.
 **Why.** Appending keeps a restarted node's rows in the same file (P5's `open` writes the header only once), and the run ID column separates runs. The ticker already turns detector changes into log lines, so the CSV rows are written at the same point; the detector stays a pure data structure. The log is optional in `NodeState`, so unit tests write no files.
 **Evidence.** 3 real nodes, node 2 muted for 3 s by the injector: node 2 wrote `MUTE_START` and `MUTE_END` 3.01 s apart; node 3 wrote `PEER_DOWN` 1.14 s and node 1 1.53 s after the mute started; both wrote `PEER_UP` 0.15 to 0.2 s after it ended. A unit test checks the two mute rows on a fake clock.
+
+---
+
+## 11. Proto v3: replication messages removed (Step B)
+
+**What.** `LogEntry`, `ApplyPlan`, `ReplicateRequest`, `ReplicateReply`, `FetchLogRequest` and `FetchLogReply` are deleted from `proto/rescuemesh.proto` (v3). They belonged to P4's Step A design, where each node kept its own store and pushed a change log to its peers.
+**Alternatives.** Keep them unused in case Step C needs them; mark them deprecated with a comment.
+**Why.** Shared state moved to a DFS (team decision Q8, P3 election design), and P4's PR #18 removed the log, `applied`, `apply_remote` and the replication code. No `rpc` ever used these messages and no code refers to them, so nothing on the wire changes. Unused messages in the proto would suggest that nodes still replicate to each other, which is no longer the design. The "never reuse a field number" rule is about fields of messages still in use; it does not apply to whole messages removed before any rpc carried them. If Step C needs a message for a returning node, it gets a new one designed for the DFS, not the old log format.
+**Evidence.** A search of `crates/` and `proto/` finds no use of the six messages besides one stale comment in `broadcast.rs` (fixed). The workspace builds with no warnings and all tests pass as before.
