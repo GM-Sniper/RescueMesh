@@ -14,11 +14,11 @@ use common::pb::{
     HeartbeatRequest, SubmitReply, SubmitRequest, submit_request,
 };
 use common::planner;
+use common::shared_state::{CommitOutcome, StateUnavailable};
 use tonic::{Request, Response, Status};
 
 use crate::election;
 use crate::state::NodeState;
-use crate::store::ApplyError;
 
 pub struct NodeService {
     /// Shared with the background tasks (heartbeat loop, detector ticker).
@@ -110,7 +110,7 @@ impl Node for NodeService {
 const MAX_PLAN_ATTEMPTS: usize = 3;
 
 /// Task 7: one client request, in the order from P4's notes (docs/p4-changes.md):
-/// lookup_request -> incident_from_pb -> snapshot -> plan -> try_apply -> reply.
+/// lookup_request -> incident_from_pb -> snapshot -> plan -> commit -> reply.
 async fn handle_submit(
     state: &NodeState,
     req: SubmitRequest,
@@ -133,7 +133,7 @@ async fn handle_submit(
     };
 
     // 2. Already handled: the same answer again, never a second plan.
-    if let Some(stored) = state.store.lookup_request(&request_id) {
+    if let Some(stored) = state.store.lookup_request(&request_id).await.map_err(unavailable)? {
         return Ok(reply(&stored, true));
     }
 
@@ -141,11 +141,11 @@ async fn handle_submit(
     let incident = incident_from_pb(incident).map_err(Status::invalid_argument)?;
     let weights = state.config.weights;
 
-    // 4. Snapshot -> plan -> try_apply. try_apply re-checks under the store's lock, so a
-    //    resource taken by another request in between is caught, and we plan again.
+    // 4. Snapshot -> plan -> commit. commit re-checks that every planned resource is still
+    //    free, so a resource taken by another request in between is caught, and we plan again.
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
         let now = now_unix_ms();
-        let snapshot = state.store.snapshot();
+        let snapshot = state.store.snapshot().await.map_err(unavailable)?;
         let to_plan = incident.clone();
         // The planner is CPU work: run it off the async threads so it can never
         // delay heartbeats (which would cause false PeerDowns).
@@ -155,25 +155,26 @@ async fn handle_submit(
         .await
         .map_err(|e| Status::internal(format!("planner failed: {e}")))?;
 
-        match state.store.try_apply(&request_id, incident.clone(), plan, now) {
-            Ok(applied) => {
+        match state.store.commit(&request_id, incident.clone(), plan.clone()).await {
+            CommitOutcome::Committed => {
                 tracing::debug!(
                     %request_id,
-                    assigned = applied.plan.assignments.len(),
-                    duplicate = applied.duplicate,
+                    assigned = plan.assignments.len(),
                     attempt,
-                    "submit applied"
+                    "submit committed"
                 );
-                return Ok(reply(&applied.plan, applied.duplicate));
+                return Ok(reply(&plan, false));
             }
-            Err(ApplyError::ResourceTaken { resource_id }) => {
+            // Another request (maybe on another node) committed this request_id first:
+            // its plan is the answer, ours is discarded.
+            CommitOutcome::AlreadyCommitted(stored) => {
+                tracing::debug!(%request_id, attempt, "submit already committed; returning stored plan");
+                return Ok(reply(&stored, true));
+            }
+            CommitOutcome::ResourceTaken { resource_id } => {
                 tracing::debug!(%request_id, attempt, resource_id, "resource taken meanwhile; planning again");
             }
-            Err(ApplyError::UnknownResource { resource_id }) => {
-                return Err(Status::internal(format!(
-                    "plan names resource {resource_id}, which the store does not have"
-                )));
-            }
+            CommitOutcome::StateUnavailable(why) => return Err(unavailable(why)),
         }
     }
     // Conflicts every time: the client may retry with the same request_id.
@@ -182,6 +183,13 @@ async fn handle_submit(
     Err(Status::aborted(format!(
         "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
     )))
+}
+
+/// A shared-state failure as a gRPC error. `Unavailable` tells the client the same
+/// request_id can be retried: commit is create-if-absent, so a retry cannot double-book.
+fn unavailable(why: StateUnavailable) -> Status {
+    tracing::warn!(%why, "shared state unavailable");
+    Status::unavailable(why.to_string())
 }
 
 /// The node's wall clock in Unix milliseconds (the planner's `now`, the log entry's timestamp).
@@ -198,7 +206,7 @@ const MAX_MUTE_MS: u64 = 20_000;
 /// Task 4: check the fault order, go silent for duration_ms, and ack.
 /// Refusals are FaultAcks (accepted = false + reason), not gRPC errors, so the
 /// injector only has to read one kind of answer.
-async fn handle_inject_fault(
+pub(crate) async fn handle_inject_fault(
     state: &Arc<NodeState>, // Arc: the "mute ended" task keeps its own handle
     cmd: FaultCommand,
 ) -> Result<Response<FaultAck>, Status> {
@@ -311,7 +319,7 @@ mod tests {
         let plan = reply.plan.expect("a plan");
         assert_eq!(plan.incident_id, generate_incident(7).id);
         assert_eq!(plan.assignments.len(), 1, "a free resource exists, so one is assigned");
-        assert_eq!(svc.state.store.applied().get(&1), Some(&1)); // one log entry
+        assert_eq!(svc.state.store.snapshot().await.unwrap().incidents.len(), 1);
     }
 
     #[tokio::test]
@@ -321,8 +329,9 @@ mod tests {
         let again = svc.submit(submit_req("r1", 7)).await.unwrap().into_inner();
         assert!(again.duplicate);
         assert_eq!(again.plan, first.plan);
-        assert_eq!(svc.state.store.applied().get(&1), Some(&1)); // still one log entry
-        assert_eq!(svc.state.store.snapshot().assignments.len(), 1);
+        let snapshot = svc.state.store.snapshot().await.unwrap();
+        assert_eq!(snapshot.incidents.len(), 1); // still one record
+        assert_eq!(snapshot.assignments.len(), 1);
     }
 
     #[tokio::test]
@@ -342,7 +351,7 @@ mod tests {
             let err = svc.submit(req).await.unwrap_err();
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "{}", err.message());
         }
-        assert!(svc.state.store.applied().is_empty());
+        assert!(svc.state.store.snapshot().await.unwrap().incidents.is_empty());
         assert_eq!(svc.state.in_flight(), 0);
     }
 
@@ -369,14 +378,14 @@ mod tests {
             svc.submit(submit_req(&format!("r{i}"), i)).await.unwrap();
         }
 
-        let snap = svc.state.store.snapshot();
+        let snap = svc.state.store.snapshot().await.unwrap();
         let mut resources: Vec<u64> = snap.assignments.iter().map(|a| a.resource_id).collect();
         let total = resources.len();
         resources.sort();
         resources.dedup();
         assert_eq!(resources.len(), total, "a resource was given to two incidents");
         assert_eq!(total, 10, "all 10 resources end up assigned, once each");
-        assert_eq!(svc.state.store.applied().get(&1), Some(&20)); // every request logged once
+        assert_eq!(snap.incidents.len(), 20, "every request is stored once");
     }
 
     // ---- Task 4: mute hook. `start_paused` = fake clock that jumps ahead whenever

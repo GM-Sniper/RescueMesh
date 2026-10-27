@@ -13,6 +13,8 @@ mod broadcast;
 mod election;
 mod election_log;
 mod fault_log;
+// P5: automatic fault injector (Step B). Does nothing unless [faults] enabled = true.
+mod fault_round;
 mod heartbeat;
 mod load;
 // P6: NODE_METRICS LOG (ONE CSV ROW PER SECOND: QUEUE, CPU, SERVICE TIME, LOAD SCORE).
@@ -22,9 +24,7 @@ mod node_metrics;
 mod peers;
 mod service;
 mod state;
-// P4: store and change log. Used by the Submit handler; the replication functions
-// (apply_remote, entries_since, applied) are not called until Step B.
-#[allow(dead_code)]
+// P4: in-memory implementation of the shared-state interface (common::shared_state).
 mod store;
 
 use std::net::SocketAddr;
@@ -112,6 +112,7 @@ async fn main() -> anyhow::Result<()> {
     load::spawn_sampler(state.clone());
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
+    fault_round::spawn(state.clone());
     // P6 (SEE NOTE AT THE TOP, P1): ONE ROW PER SECOND TO logs/node_metrics-node<ID>.CSV
     node_metrics::spawn(state.clone(), format!("logs/node_metrics-node{}.csv", args.id))
         .context("cannot open the node_metrics log")?;

@@ -1,0 +1,25 @@
+# The filers started by start_local_cluster.sh. Copy this file and change the URLs to run
+# the same checks against the real machines (see run_checks.py).
+[cluster]
+# One entry per filer, in the form http://host:port. Use at least 2 (3 for the real test).
+filer_urls = ["http://127.0.0.1:8888", "http://127.0.0.1:8889", "http://127.0.0.1:8890"]
+# Directory the checks create their files in. Each run adds a unique sub-directory.
+base_path = "/spike"
+
+[race]
+concurrent_creates = 24   # how many creates of the SAME path are fired at once
+rounds = 8                # how many times the race is repeated (a new path each time)
+
+[visibility]
+samples = 10              # how many write-on-A, read-on-B-and-C measurements
+timeout_seconds = 30      # give up waiting for a file to appear on another filer after this
+
+[latency]
+samples = 50              # sequential writes and reads per filer
+
+# Optional: S3 gateways (check 5). Leave out [s3] to skip the check. Each gateway should sit in
+# front of a different filer. Anonymous access is used, so the gateways must run without
+# credentials configured; if the real machines use credentials, check 5 needs signing added.
+[s3]
+endpoint_urls = ["http://127.0.0.1:8333", "http://127.0.0.1:8334"]
+bucket = "spikebucket"
