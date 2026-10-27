@@ -10,13 +10,14 @@ use common::conversions::{incident_from_pb, plan_to_pb};
 use common::domain::Plan;
 use common::pb::node_server::Node;
 use common::pb::{
-    FaultAck, FaultCommand, HeartbeatReply, HeartbeatRequest, SubmitReply, SubmitRequest,
-    submit_request,
+    Bid, BidRequest, Coordinator, CoordinatorAck, FaultAck, FaultCommand, HeartbeatReply,
+    HeartbeatRequest, SubmitReply, SubmitRequest, submit_request,
 };
 use common::planner;
 use common::shared_state::{CommitOutcome, StateUnavailable};
 use tonic::{Request, Response, Status};
 
+use crate::election;
 use crate::state::NodeState;
 
 pub struct NodeService {
@@ -82,6 +83,25 @@ impl Node for NodeService {
         self.gate().await?; // a muted node ignores new fault orders too
         // No gate before replying: this handler mutes the node itself and must still ack.
         handle_inject_fault(&self.state, req.into_inner()).await
+    }
+
+    // P3: a peer's bid for one request; the reply carries ours (see election.rs).
+    async fn exchange_bid(&self, req: Request<BidRequest>) -> Result<Response<Bid>, Status> {
+        self.gate().await?;
+        let reply = election::handle_exchange_bid(&self.state, req.into_inner())?;
+        self.gate().await?; // muted meanwhile: the reply never leaves
+        Ok(Response::new(reply))
+    }
+
+    // P3: a peer announces it won an election; we check it against ours (see election.rs).
+    async fn announce_winner(
+        &self,
+        req: Request<Coordinator>,
+    ) -> Result<Response<CoordinatorAck>, Status> {
+        self.gate().await?;
+        let ack = election::handle_announce_winner(&self.state, req.into_inner())?;
+        self.gate().await?; // muted meanwhile: the reply never leaves
+        Ok(Response::new(ack))
     }
 }
 
