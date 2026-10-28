@@ -10,3 +10,5 @@ common = { path = "../common" }  # P2's generate_incident and incident_to_pb
 tokio.workspace = true           # runs many fake clients at once, and the rate timer
 clap.workspace = true            # reads --clients --requests --seed --rate from the command line
 anyhow.workspace = true          # simple error handling in main
+serde.workspace = true           # experiment runner: reads the experiment config file into a struct
+toml.workspace = true            # experiment runner: the config file is TOML, like config/nodes.toml

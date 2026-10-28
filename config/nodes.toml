@@ -43,3 +43,14 @@ service_ewma_alpha = 0.2   # newest request's share of the service-time average
 workload_incidents = 10
 workload_resources = 20
 iterations = 1
+
+
+# Automatic fault injection (P5, Step B). Optional; off unless enabled = true.
+# Use the same values on all 3 nodes. Design: docs/p5-auto-injector-design.md
+[faults]
+enabled = false        # true = nodes silence one of themselves on a random schedule
+seed = 42              # same seed = same victims, durations and gaps
+min_duration_ms = 2000 # shortest silence (faults under ~1.5 s are never detected)
+max_duration_ms = 20000 # longest silence; the spec allows up to 20 s
+min_gap_ms = 10000     # wait between faults, counted from when all nodes are alive again
+max_gap_ms = 30000

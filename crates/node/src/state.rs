@@ -1,24 +1,27 @@
 //! State shared by every request handler and background task of one node.
 //! Shared as `Arc<NodeState>`: cheap to clone, all clones point to the same struct.
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::NodeId;
 use common::config::ClusterConfig;
 use common::load::LoadReport;
+use common::shared_state::SharedState;
 use common::pb::node_client::NodeClient;
 use tonic::transport::Channel;
 // tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
 // Also used by the in-flight guard to time requests (P3's service-time average).
 use tokio::time::{Instant, sleep_until};
 
+use crate::election::ElectionTable;
+use crate::election_log::ElectionLog;
 use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
 use crate::peers::Peers;
-use crate::store::Store;
+use crate::store::InMemoryStore;
 
 pub struct NodeState {
     pub id: NodeId,
@@ -29,8 +32,9 @@ pub struct NodeState {
     in_flight: AtomicUsize,
     /// P3: CPU and service-time samples behind this node's load score (see load.rs).
     pub load: LoadCollector,
-    /// P4: incidents, resources, assignments and the change log (see store.rs).
-    pub store: Store,
+    /// P4: incidents, resources and assignments, behind the shared-state interface.
+    /// `dyn` so the in-memory store can later be swapped for the DFS-backed one (see store.rs).
+    pub store: Arc<dyn SharedState>,
     /// When the current mute ends; None = never muted (task 4).
     /// An end time instead of an on/off flag: nothing has to switch it back off,
     /// and overlapping mutes just keep the later end.
@@ -41,6 +45,11 @@ pub struct NodeState {
     detector: Mutex<FailureDetector>,
     /// P5's fault CSV (MUTE_START/END, PEER_DOWN/UP). None in tests, so they write no files.
     pub fault_log: Option<FaultLog>,
+    /// P3: every election this node has taken part in (see election.rs).
+    /// Locked only briefly, never across a network call.
+    pub election: Mutex<ElectionTable>,
+    /// P3's election CSV (see election_log.rs). None in tests, so they write no files.
+    pub election_log: Option<ElectionLog>,
 }
 
 impl NodeState {
@@ -54,16 +63,24 @@ impl NodeState {
             peers,
             in_flight: AtomicUsize::new(0),
             load,
-            store: Store::with_default_resources(id),
+            store: Arc::new(InMemoryStore::with_default_resources()),
             muted_until: Mutex::new(None),
             detector: Mutex::new(detector),
             fault_log: None,
+            election: Mutex::new(ElectionTable::new()),
+            election_log: None,
         }
     }
 
     /// Turns on the fault CSV (main does this; tests leave it off).
     pub fn with_fault_log(mut self, log: FaultLog) -> Self {
         self.fault_log = Some(log);
+        self
+    }
+
+    /// Turns on P3's election CSV (main does this; most tests leave it off).
+    pub fn with_election_log(mut self, log: ElectionLog) -> Self {
+        self.election_log = Some(log);
         self
     }
 
