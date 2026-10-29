@@ -1,0 +1,563 @@
+{
+  "before": {
+    "creates": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.01,
+        "error": null
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.03,
+        "error": null
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "error": null
+      }
+    ],
+    "reads_through_gateways": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "reads_through_filers": [
+      {
+        "filer": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ]
+  },
+  "one_master_down_after_5s": {
+    "creates": [
+      {
+        "gateway": 0,
+        "status": 0,
+        "seconds": 25.0,
+        "error": "timeout"
+      },
+      {
+        "gateway": 1,
+        "status": 0,
+        "seconds": 25.02,
+        "error": "timeout"
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 8.16,
+        "error": null
+      }
+    ],
+    "reads_through_gateways": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "reads_through_filers": [
+      {
+        "filer": 0,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      },
+      {
+        "filer": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 2,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      }
+    ],
+    "big_object_read": {
+      "status": 200,
+      "seconds": 0.0,
+      "right_size": true
+    },
+    "leader_seen": "127.0.0.1:9334.19334"
+  },
+  "one_master_down_after_15s": {
+    "creates": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.03,
+        "error": null
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.03,
+        "error": null
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "error": null
+      }
+    ],
+    "reads_through_gateways": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "reads_through_filers": [
+      {
+        "filer": 0,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      },
+      {
+        "filer": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "big_object_read": {
+      "status": 200,
+      "seconds": 0.03,
+      "right_size": true
+    },
+    "leader_seen": "127.0.0.1:9334.19334"
+  },
+  "one_master_down_after_30s": {
+    "creates": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.02,
+        "error": null
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.03,
+        "error": null
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "error": null
+      }
+    ],
+    "reads_through_gateways": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.02,
+        "right_value": true
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.02,
+        "right_value": true
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "reads_through_filers": [
+      {
+        "filer": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "big_object_read": {
+      "status": 200,
+      "seconds": 0.0,
+      "right_size": true
+    },
+    "leader_seen": "127.0.0.1:9334.19334"
+  },
+  "races_with_one_master_down": [
+    1,
+    1,
+    1
+  ],
+  "two_masters_down_after_5s": {
+    "creates": [
+      {
+        "gateway": 0,
+        "status": 0,
+        "seconds": 25.04,
+        "error": "timeout"
+      },
+      {
+        "gateway": 1,
+        "status": 0,
+        "seconds": 25.01,
+        "error": "timeout"
+      },
+      {
+        "gateway": 2,
+        "status": 0,
+        "seconds": 25.01,
+        "error": "timeout"
+      }
+    ],
+    "reads_through_gateways": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.02,
+        "right_value": true
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "reads_through_filers": [
+      {
+        "filer": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "big_object_read": {
+      "status": 200,
+      "seconds": 0.0,
+      "right_size": true
+    }
+  },
+  "two_masters_down_after_30s": {
+    "creates": [
+      {
+        "gateway": 0,
+        "status": 0,
+        "seconds": 25.02,
+        "error": "timeout"
+      },
+      {
+        "gateway": 1,
+        "status": 0,
+        "seconds": 25.02,
+        "error": "timeout"
+      },
+      {
+        "gateway": 2,
+        "status": 0,
+        "seconds": 25.02,
+        "error": "timeout"
+      }
+    ],
+    "reads_through_gateways": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.03,
+        "right_value": true
+      }
+    ],
+    "reads_through_filers": [
+      {
+        "filer": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 1,
+        "status": 200,
+        "seconds": 0.03,
+        "right_value": true
+      },
+      {
+        "filer": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "big_object_read": {
+      "status": 200,
+      "seconds": 0.02,
+      "right_size": true
+    }
+  },
+  "two_masters_down_after_90s": {
+    "creates": [
+      {
+        "gateway": 0,
+        "status": 0,
+        "seconds": 25.02,
+        "error": "timeout"
+      },
+      {
+        "gateway": 1,
+        "status": 0,
+        "seconds": 25.01,
+        "error": "timeout"
+      },
+      {
+        "gateway": 2,
+        "status": 0,
+        "seconds": 25.01,
+        "error": "timeout"
+      }
+    ],
+    "reads_through_gateways": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      }
+    ],
+    "reads_through_filers": [
+      {
+        "filer": 0,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      },
+      {
+        "filer": 1,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      },
+      {
+        "filer": 2,
+        "status": 200,
+        "seconds": 0.01,
+        "right_value": true
+      }
+    ],
+    "big_object_read": {
+      "status": 200,
+      "seconds": 0.02,
+      "right_size": true
+    }
+  },
+  "two_masters_down_filer_listing_status": 200,
+  "after_restart_probe": {
+    "creates": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.01,
+        "error": null
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.01,
+        "error": null
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.01,
+        "error": null
+      }
+    ],
+    "reads_through_gateways": [
+      {
+        "gateway": 0,
+        "status": 200,
+        "seconds": 0.02,
+        "right_value": true
+      },
+      {
+        "gateway": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "gateway": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ],
+    "reads_through_filers": [
+      {
+        "filer": 0,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 1,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      },
+      {
+        "filer": 2,
+        "status": 200,
+        "seconds": 0.0,
+        "right_value": true
+      }
+    ]
+  },
+  "recovered_after_s": 34.7,
+  "races_after_recovery_winners": [
+    1,
+    1,
+    1
+  ],
+  "old_object_after_recovery": [
+    {
+      "gateway": 0,
+      "status": 200,
+      "seconds": 0.0,
+      "right_value": true
+    },
+    {
+      "gateway": 1,
+      "status": 200,
+      "seconds": 0.01,
+      "right_value": true
+    },
+    {
+      "gateway": 2,
+      "status": 200,
+      "seconds": 0.0,
+      "right_value": true
+    }
+  ]
+}

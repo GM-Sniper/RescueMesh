@@ -1,0 +1,638 @@
+######## experiment 1 and 4: kill filer1+gateway1, 5 s down (exp1)
+
+=== restart run 1/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 2/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 3/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 2.1 s
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 4/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 5/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 6/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 7/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 8/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 9/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 2.7 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 10/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 4.2 s
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== summary of C:/Users/LEGION~1/AppData/Local/Temp/claude/d--University-12--Fall-2026-Distributed-RescueMesh/54f07a39-65ba-424f-8f18-22fe106d1709/scratchpad/exp1.jsonl: 120 rounds in 10 runs ===
+rounds with 2+ winners: 0/120; with 0 winners: 0
+runs with any two-winner round: 0/10
+by planned offset after the restart (rounds, two-winner rounds, filers disagreeing, runs affected):
+    0s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+    2s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+    5s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   10s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   30s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   60s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+experiment 4, read-back on rounds with 2+ winners:
+  caught via the second gateway: 0/0; via either other gateway: 0/0; missed while filers still disagreed at the end: 0
+  false alarms (single-winner rounds where a read-back mismatched): 0/120
+
+######## experiment 1 and 4: 90 s down, 20 creates meanwhile (exp1b)
+
+=== restart run 1/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 2.2 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 2/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 2.2 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 3/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 2.2 s
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 4/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 2.2 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 5/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 6/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 7/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 8/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 2.7 s
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 9/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== restart run 10/10 ===
+   [control] stop s3gateway1
+   [control] stop filer1
+   [control] start filer1
+   [control] start s3gateway1
+   gateway 1 answers after 1.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== summary of C:/Users/LEGION~1/AppData/Local/Temp/claude/d--University-12--Fall-2026-Distributed-RescueMesh/54f07a39-65ba-424f-8f18-22fe106d1709/scratchpad/exp1b.jsonl: 120 rounds in 10 runs ===
+rounds with 2+ winners: 0/120; with 0 winners: 0
+runs with any two-winner round: 0/10
+by planned offset after the restart (rounds, two-winner rounds, filers disagreeing, runs affected):
+    0s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+    2s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+    5s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   10s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   30s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   60s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+experiment 4, read-back on rounds with 2+ winners:
+  caught via the second gateway: 0/0; via either other gateway: 0/0; missed while filers still disagreed at the end: 0
+  false alarms (single-winner rounds where a read-back mismatched): 0/120
+
+######## experiment 2: mute (suspend) 10 s / 20 s (exp2)
+
+=== mute run 1/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 2/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 3/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 4/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 5/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 6/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 7/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 8/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 9/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== mute run 10/10 ===
+   [control] pause s3gateway1
+   [control] pause filer1
+   [control] resume filer1
+   [control] resume s3gateway1
+   gateway 1 answers after 0.0 s
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   2s (started   2.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   0s (started   0.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset   5s (started   5.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  10s (started  10.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  30s (started  30.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+   offset  60s (started  60.0s after ready): 200=1 412=23 none=0 other=[] filers_agree=True all_agree=True readback_caught=False
+
+=== summary of C:/Users/LEGION~1/AppData/Local/Temp/claude/d--University-12--Fall-2026-Distributed-RescueMesh/54f07a39-65ba-424f-8f18-22fe106d1709/scratchpad/exp2.jsonl: 120 rounds in 10 runs ===
+rounds with 2+ winners: 0/120; with 0 winners: 0
+runs with any two-winner round: 0/10
+by planned offset after the restart (rounds, two-winner rounds, filers disagreeing, runs affected):
+    0s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+    2s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+    5s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   10s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   30s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+   60s:  20 rounds,  0 with 2+ winners,  0 with filers disagreeing, runs []
+experiment 4, read-back on rounds with 2+ winners:
+  caught via the second gateway: 0/0; via either other gateway: 0/0; missed while filers still disagreed at the end: 0
+  false alarms (single-winner rounds where a read-back mismatched): 0/120
+
+######## experiment 3: masters (exp3)
+creating an object before any master dies: 200
+creating a 1 MB object: 200
+0 masters down: creates [200, 200, 200] ([0.01, 0.03, 0.0] s); gateway reads [200, 200, 200]; filer reads [200, 200, 200]
+   [control] stop master0
+1 master down (master0 stopped), 5s later: creates [0, 0, 200] ([25.0, 25.02, 8.16] s); gateway reads [200, 200, 200]; filer reads [200, 200, 200]; 1 MB read {'status': 200, 'seconds': 0.0, 'right_size': True}; leader 127.0.0.1:9334.19334
+1 master down (master0 stopped), 15s later: creates [200, 200, 200] ([0.03, 0.03, 0.0] s); gateway reads [200, 200, 200]; filer reads [200, 200, 200]; 1 MB read {'status': 200, 'seconds': 0.03, 'right_size': True}; leader 127.0.0.1:9334.19334
+1 master down (master0 stopped), 30s later: creates [200, 200, 200] ([0.02, 0.03, 0.0] s); gateway reads [200, 200, 200]; filer reads [200, 200, 200]; 1 MB read {'status': 200, 'seconds': 0.0, 'right_size': True}; leader 127.0.0.1:9334.19334
+winners per 24-writer race with 1 master down: [1, 1, 1]
+   [control] stop master1
+2 masters down, 5s later: creates [0, 0, 0] ([25.04, 25.01, 25.01] s); gateway reads [200, 200, 200]; filer reads [200, 200, 200]; 1 MB read {'status': 200, 'seconds': 0.0, 'right_size': True}
+2 masters down, 30s later: creates [0, 0, 0] ([25.02, 25.02, 25.02] s); gateway reads [200, 200, 200]; filer reads [200, 200, 200]; 1 MB read {'status': 200, 'seconds': 0.02, 'right_size': True}
+2 masters down, 90s later: creates [0, 0, 0] ([25.02, 25.01, 25.01] s); gateway reads [200, 200, 200]; filer reads [200, 200, 200]; 1 MB read {'status': 200, 'seconds': 0.02, 'right_size': True}
+   [control] start master0
+   [control] start master1
+both masters restarted; creates and reads fully work again after 34.7 s
+winners per race after recovery: [1, 1, 1]
+
+######## experiment 3 extra: never-read objects with master0+master1 down (ad-hoc, not in a script)
+6 objects (3 x 20 B, 3 x 600 KB) created, then master0 and master1 stopped, 15 s wait, first-ever read through all 3 gateways: all 18 reads returned 200 with the right bytes in 0.00-0.03 s. After restarting both masters, creates through all 3 gateways worked again after 16.8 s.

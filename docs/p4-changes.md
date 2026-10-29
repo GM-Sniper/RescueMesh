@@ -240,3 +240,77 @@ Foreseeable mixed-OS problems (all UNVERIFIED):
 | 10 | Is the failure tied to a filer restart, or to any ring change? | Not tested: a fresh filer joining, a filer being killed (not restarted), a master change. Check d was meant to cover masters |
 | 11 | `commit` timeout value | Contended creates can take about 15 s for the last of 24 writers; for the real case of 1-3 writers about 1 s. Suggest a `commit` timeout of 5 s, UNVERIFIED as a good value; whatever is chosen, a timeout is `StateUnavailable`, never "failed" (check g) |
 | 12 | Anonymous gateway access | Works with no configuration (check h) but means anyone who can reach the port can write. Whether the real machines can be firewalled to the nodes is a deployment question; credentials were not tested |
+
+
+---
+
+## Oct 29: SeaweedFS spike 3, how often do two writers win after a node returns? (measurement only)
+
+**Headline: the two-winner round from spike 2 did not happen again. 0 two-winner rounds in 360 post-restart or post-mute races (30 runs), so its rate is unknown. The spike-2 observation stands; it is just rare or needs a condition these runs did not create.** No design decision was changed and nothing was built on SeaweedFS.
+
+### What was run
+
+Same cluster as spike 2 (SeaweedFS 4.48, Windows 11, localhost; 3 masters, 3 volume servers on 3 racks with replication `010`, 3 filers, 3 S3 gateways), started fresh. Script: `spike/seaweedfs/run_restart_experiments.py` (modes `restart`, `mute`, `masters`, `summary`). Raw output: `results-windows11-seaweedfs-4.48-spike3.txt`; every round as one JSON line (including the final value read from each filer and gateway): `results-windows11-seaweedfs-4.48-spike3-rounds.jsonl`; experiment 3: `...-spike3-masters.json`. Unlike `run_s3_checks.py` this script never stops on a two-winner round; it counts them.
+
+Each round: 24 writers start together, writer *i* through gateway *i* mod 3, each writing a unique token (`node<gateway>-w<i>-<random>`) with `If-None-Match: *`. After the round the script waits up to 15 s for all 3 gateways and all 3 filers to return one value and records whether the 3 filers agree. Per run, 12 rounds are scheduled at fixed offsets after the node is back: 2 rounds each at 0, 2, 5, 10, 30 and 60 s, **started concurrently on different keys** (a 24-writer race can take 15-20 s, so back-to-back rounds could not give exact offsets). "Offset 0" means the moment the restarted gateway first answered an HTTP request (after its start command: 1-4 s in the kill runs; in the mute runs the processes were already running, so about 0 s).
+
+### Experiment 1 (with 4): kill filer 1 and gateway 1, restart, race
+
+| Variant | Runs / rounds | Rounds with 2+ winners | Runs with any | Filers disagreeing at the end |
+|---|---|---|---|---|
+| Down 5 s, then restart | 10 / 120 | **0** | 0 | 0 |
+| Down 90 s with 20 creates through the other gateways meanwhile, then restart | 10 / 120 | **0** | 0 | 0 |
+
+Time since restart (offsets 0, 2, 5, 10, 30, 60 s): 20 rounds per offset in each variant, **0 two-winner rounds at every offset**. The curve is flat at zero, so these runs give no basis for a hold time: there was no risk to see decline. Every round had exactly one `200` and 23 × `412`; the slowest answer (a queued loser) was at most about 20 s.
+
+What I did not reproduce from spike 2 (UNVERIFIED as the missing ingredient): there, the filer and gateway were killed **in the middle of a running 24-writer race** and stayed down for about 3 minutes while further races ran. Here they were stopped between races. A killed filer that was holding or queueing locks for in-flight requests is the obvious difference; I did not test it. Suggested next measurement: kill mid-race, restart after 60-180 s, and repeat 10 times.
+
+### Experiment 2: mute instead of kill
+
+| Variant | Runs / rounds | Rounds with 2+ winners | Filers disagreeing |
+|---|---|---|---|
+| Filer 1 and gateway 1 suspended for 10 s (odd runs) or 20 s (even runs), then resumed, processes never stopped | 10 / 120 | **0** | 0 |
+
+Method difference (deliberate): I **suspended the processes** (`NtSuspendProcess`; `SIGSTOP` on Linux) instead of using a firewall rule or a dropping proxy. The filers reach each other through addresses registered with the masters, so a proxy would not sit on their path, and a Windows firewall rule does not filter loopback traffic (UNVERIFIED, not tried). A suspended process keeps its memory and sockets and answers nothing, which is the closest local match to "muted". Whether the masters dropped the suspended filer from the cluster during a 10-20 s mute was not checked. **Result: mute-only did not show the problem, but neither did the kill-and-restart runs, so these runs cannot say mute is safer.**
+
+### Experiment 3: masters
+
+(Initial leader was master0. Client timeout for creates 25 s; "no answer" means the PUT hung until that timeout.)
+
+| State | Creates | Reads of existing data | Notes |
+|---|---|---|---|
+| 3 of 3 masters | 200 from all 3 gateways in under 0.03 s | 200 | baseline |
+| Master0 (leader) killed, +5 s | Gateways 0 and 1: **no answer for 25 s**; gateway 2: 200 after 8.2 s | 200 everywhere, including a 1 MB object | Master1 became leader |
+| 1 master down, +15 s and +30 s | **200 from all gateways, under 0.03 s** | 200 | 3 races of 24 writers: exactly one winner each |
+| Second master (master1) killed, +5 s, +30 s, +90 s | **No answer on any gateway, for the whole 90 s** (25 s timeouts) | **200 everywhere, in under 0.03 s**, including the 1 MB object | Reads and writes of **existing** data are unaffected; **new creates hang** |
+| Same, never-read objects (ad-hoc test, 6 objects of 20 B and 600 KB, first ever read with 2 masters down) | n/a | 18 of 18 reads returned the right bytes in 0.00-0.03 s | So the reads were not served from a cache of earlier reads (UNVERIFIED for objects on a volume server that was itself restarted) |
+| Both masters restarted | Creates and reads fully working after **34.7 s** (16.8 s in the ad-hoc run) | 200 | 3 races after recovery: exactly one winner each. Old data intact |
+
+What this means: with 2 of 3 masters the cluster recovers from losing the leader in 5-15 s (creates hang for up to about 8-25 s meanwhile). With only 1 of 3 masters, existing data stays readable but **no new object can be created** (a `commit` would hit the client timeout every time, so it is `StateUnavailable`). No double win and no lost data were seen. Recovery after restarting the masters took 17-35 s.
+
+### Experiment 4: writer-token read-back
+
+Right after its own `200`, each writer read the key back through the two other gateways and compared the body with its own token.
+
+| Measure | Result |
+|---|---|
+| Two-winner rounds this read-back would have caught | **0 of 0**: there were none to catch |
+| Two-winner rounds it would have missed because the filers still disagreed | **0 of 0** |
+| False alarms (single-winner rounds where a read-back mismatched) | **0 of 360** (360 rounds, one winner each) |
+
+What the read-back can and cannot do, reasoning from the spike-2 evidence (UNVERIFIED: nothing here observed a double win with the read-back running): in the spike-2 round the three gateways all returned `writer-8` afterwards while two filers held `writer-23`. If that was also the state at read-back time, `writer-23`'s read-back through another gateway would have returned `writer-8` and flagged a mismatch, while `writer-8`'s would have passed. A read-back runs after the `200` has been sent, so it can only **detect** a double win, not prevent it; both writers would already hold a success. It could miss a double win if the read lands on a gateway whose filer still holds the writer's own value, which the disagreeing filers in spike 2 make possible. It adds one extra read (about 3-30 ms here).
+
+### Answers to the questions asked
+
+- **Rate of two-winner rounds:** 0 of 360 rounds (0 of 30 runs) here, versus 1 round in the 1 restart of spike 2. With zero events, the usual "rule of three" approximation (UNVERIFIED as applied here) bounds the per-round rate at about 0.8% and the per-run rate at about 10%, at 95% confidence, **for the conditions tested**. The spike-2 conditions (kill during a race) were not tested.
+- **Safe hold time:** cannot be derived; the curve is flat at zero from 0 to 60 s.
+- **Mute-only avoids it?** No two-winner rounds, but the kill variants had none either, so no conclusion.
+- **1 master down:** creates hang for roughly 8-25 s until the new leader is elected, then work normally; reads unaffected. **2 masters down:** reads of existing and never-read data work; every new create hangs. **Recovery** after restarting both: 17-35 s.
+- **Read-back:** no false alarms; it can detect but not prevent a double win, and may miss one while the filers disagree.
+
+### Open questions from spike 3
+
+| # | Question | Notes |
+|---|---|---|
+| 13 | What condition produced the spike-2 double win? | Not reproduced in 360 rounds. Untested candidates: kill mid-race; a longer outage with many races running; Windows scheduling of the restarted processes. Needs the mid-race kill experiment above before open questions 8-10 can be answered. The hold-time (open question 9, option A) is neither supported nor ruled out |
+| 14 | `commit` behavior when 1 or 2 masters are down | Creates can hang for 8-25 s (leader election) or indefinitely (no quorum). A `commit` timeout of 5 s (open question 11) turns both into `StateUnavailable`, which is the intended handling. Reads (`snapshot`, `lookup_request`) keep working with 2 masters down |
