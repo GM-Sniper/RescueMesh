@@ -269,3 +269,33 @@ A request that passed the entry gate and is then muted has its reply dropped at 
 | Node 2 with `--planner-iterations 30000` | 290 (48%) | 23 (4%) | 287 (48%) | 600/600 ok |
 
 Node 2's plans took 19.6 ms on average when it won (vs 0.8 ms in the baseline), confirming the 20 ms estimate. Its load score rose (service time and CPU), so it lost most elections and the other two took its share. It still wins now and then: losers count each request's short election time as service time, which pulls its average back down between wins. The baseline is uneven because idle nodes often tie, and ties go to the lowest node ID.
+
+## 13. Final timeout and retry values (Step C)
+
+**What.** The values every Step C and Step D run uses. Section 8.5 lists the Step A timeouts; this table replaces it for the client and adds the election.
+
+| Value | Final | Set in | What it does |
+|---|---|---|---|
+| Heartbeat interval | 500 ms | `[timing] heartbeat_interval_ms` | One heartbeat per peer |
+| Suspect after | 1500 ms | `[timing] suspect_after_ms` | 3 missed heartbeats, then the peer is down and the election skips it |
+| Detector tick | 100 ms | code (`heartbeat.rs`) | So a peer is marked down 1.5 to 1.6 s after its last heartbeat |
+| Peer connect timeout | 500 ms | `[timing] connect_timeout_ms` | Opening a connection to a peer |
+| Peer call deadline | 1000 ms | `[timing] rpc_deadline_ms` | Each heartbeat, each fault-injector call |
+| Bid timeout T | 300 ms | code (`election.rs`, P3) | Wait for the peers' bids, and for the winner's announcement; at most one retry inside it (section 8.4) |
+| Client attempt deadline | 2000 ms | `RetryPolicy::attempt_timeout` | How long one multicast waits for a plan; also the client's connect timeout |
+| Client attempts | 3 | `RetryPolicy::attempts` | The first try plus 2 retries, all with the same `request_id` |
+| Pause before a retry | 0 to 50 ms, random | code (`client/src/lib.rs`) | Spreads out clients that fail at the same moment |
+| Longest mute | 20 000 ms | code (`service.rs`) | Course limit on an injected fault |
+
+**Retry rule.** An attempt that brings no plan always waits out its full 2 s deadline before the retry, even when every node already answered with an error or "no plan". Then a random 0 to 50 ms pause, then the same request goes to every node again. A request that gets no plan in 3 attempts is `failed` after about 6.1 s.
+
+**Why 2 s per attempt.** If the winner dies after taking a request, the other nodes still call it alive until they suspect it, at most 1.6 s later (1.5 s plus one tick). A retry before that would only hear "the winner is node X" again. 2 s puts the retry after the suspicion, with 0.4 s to spare for the bid timeout and scheduling, so the retry's election runs without the dead node. A longer deadline would only add to every failover.
+
+**Why 3 attempts.** One retry covers the three failure cases (a cut network, a winner that died, a slow request). The third attempt covers a second failure during the retry, such as the retry's winner being muted too. More would only make a lost request take longer to report.
+
+**Alternatives for the pause.**
+- **A fixed 0.5 s backoff, as in the Step C plan.** It isn't needed: the full 2 s wait already plays that role, and it is tied to the failure detector, not picked by hand.
+- **Exponential backoff with jitter** (0.5 s, then 1 s), the usual pattern for clients of a shared service (gRPC and AWS use it). On top of the 2 s wait it would make every failed request slower (retries at about 2.5 and 5.5 s instead of 2 and 4 s) without fixing anything. Decided: keep the 0 to 50 ms pause.
+
+**Worked example (failover, replaces the plan's 2.6 s).** The winner is muted just after taking a request at 0 s. The other two suspect it by 1.6 s. The client's deadline ends at 2.0 s, it pauses about 25 ms and multicasts again. The two live nodes elect each other in a few ms (no bid is missing, so no 300 ms wait) and plan in about 50 ms. Plan at about 2.1 s.
+**Not a failure case.** A node muted *before* a request arrives costs only the bid timeout: the other two wait 300 ms for its bid, treat it as out and decide without it. No client retry is needed.
