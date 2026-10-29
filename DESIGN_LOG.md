@@ -24,6 +24,35 @@ Planner v1 assigns at most one resource to each incident.
 
 Generators use a seed to produce repeatable outputs, and planner tie-breaking is deterministic.
 
+### 6. Configurable Matching Workload
+
+The planner performs deterministic incident-resource scoring for a configurable workload. The workload dimensions are controlled by `workload_incidents`, `workload_resources`, and `iterations`. The workload is generated using a fixed seed, so the same configuration produces the same workload inputs across nodes.
+
+The extra workload is separate from the live snapshot. It adds CPU work but does not change the assignment returned for the incoming incident.
+
+### 7. Planner Cost Benchmark
+
+Measurements were collected using the release build with `cargo run --release -p common --example planner_benchmark`. Times are average milliseconds per planner call on the machine used for testing.
+
+| Incidents | Resources | Iterations | Work units (N × M × I) | Average time (ms) |
+|---:|---:|---:|---:|---:|
+| 10 | 20 | 1 | 200 | 0.002942 |
+| 50 | 50 | 1 | 2,500 | 0.025871 |
+| 100 | 100 | 1 | 10,000 | 0.075175 |
+| 200 | 200 | 1 | 40,000 | 0.197777 |
+| 100 | 100 | 10 | 100,000 | 0.372429 |
+| 300 | 300 | 1 | 90,000 | 0.533878 |
+| 500 | 500 | 1 | 250,000 | 1.955595 |
+| 500 | 500 | 10 | 2,500,000 | 17.585792 |
+
+The measurements show increasing planning time with larger workloads. The configuration of 500 incidents, 500 resources, and 10 iterations measured approximately 17.59 ms per call, near the example target of about 20 ms. Actual timings depend on the machine and build environment.
+
+**Benchmark limitation:** these timings include deterministic workload generation and scoring. The generated workload is used to add CPU cost; it is not a batch assignment of all generated incidents. The returned plan still concerns the original incoming incident.
+
+### 8. Determinism and Validation
+
+The common crate tests passed: 28 passed, 0 failed. The tests include deterministic planning and confirmation that adding the workload does not change the returned plan.
+
 ## P1: Protocol, Node, Transport, Fault Injection, Failure Detection
 
 P1's entries are kept in their own file: [`docs/p1-design-log.md`](docs/p1-design-log.md).
