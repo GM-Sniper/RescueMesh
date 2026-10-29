@@ -29,6 +29,9 @@ pub struct ClusterConfig {
     /// Load score inputs and weights (P3). Optional; missing values use the defaults.
     #[serde(default)]
     pub load: LoadConfig,
+    /// Planner workload settings (P2). Optional; missing values use defaults.
+    #[serde(default)]
+    pub planner: PlannerConfig,
     /// Automatic fault injection (P5). Optional; off unless `enabled = true`.
     #[serde(default)]
     pub faults: Faults,
@@ -160,10 +163,19 @@ impl ClusterConfig {
                 .parse::<SocketAddr>()
                 .with_context(|| format!("node {}: addr {:?} is not ip:port", n.id, n.addr))?;
         }
+
         if self.timing.suspect_after_ms <= self.timing.heartbeat_interval_ms {
             bail!("timing.suspect_after_ms must be longer than heartbeat_interval_ms");
         }
         self.load.check()?;
+
+        if self.planner.workload_incidents == 0
+            || self.planner.workload_resources == 0
+            || self.planner.iterations == 0
+        {
+            bail!("planner workload settings must all be greater than zero");
+        }
+
         self.faults.check()?;
         Ok(())
     }
@@ -176,6 +188,30 @@ impl ClusterConfig {
     /// Every node except `me`.
     pub fn peers(&self, me: NodeId) -> impl Iterator<Item = &NodeEntry> {
         self.nodes.iter().filter(move |n| n.id != me)
+    }
+}
+
+/// Controls the extra deterministic work performed by the planner.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default)]
+pub struct PlannerConfig {
+    /// Number of incidents represented in the workload model.
+    pub workload_incidents: usize,
+
+    /// Number of resources represented in the workload model.
+    pub workload_resources: usize,
+
+    /// Number of times to process the incident-resource pairs.
+    pub iterations: usize,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            workload_incidents: 10,
+            workload_resources: 20,
+            iterations: 1,
+        }
     }
 }
 
@@ -227,7 +263,8 @@ mod tests {
 
     #[test]
     fn partial_tables_keep_other_defaults() {
-        let text = format!("{THREE_NODES}\n[timing]\nrpc_deadline_ms = 300\n[weights]\nage = 0.9\n");
+        let text =
+            format!("{THREE_NODES}\n[timing]\nrpc_deadline_ms = 300\n[weights]\nage = 0.9\n");
         let cfg = ClusterConfig::parse(&text).unwrap();
         assert_eq!(cfg.timing.rpc_deadline_ms, 300);
         assert_eq!(cfg.timing.heartbeat_interval_ms, 500);

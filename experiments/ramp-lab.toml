@@ -1,0 +1,13 @@
+# Ramp experiment on the 3 lab machines. The nodes run on their own machines, so the runner
+# prints how to start each one with this run's --run-id, waits for Enter, then runs the load.
+# Fill in the IPs in config/nodes.lab.toml first.
+#   cargo build --release
+#   cargo run --release -p loadgen --bin experiment -- experiments/ramp-lab.toml
+
+name = "ramp-lab"
+cluster = "config/nodes.lab.toml"  # the 3 machines' real addresses
+start_nodes = false                # the nodes are started by hand on each machine
+target = 1
+seed = 1
+stages = [1, 2, 4, 8, 16]          # clients per stage
+stage_secs = 30                    # 2.5 minutes in total
