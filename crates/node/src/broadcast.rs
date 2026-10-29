@@ -2,7 +2,7 @@
 //! waits at most `deadline`, and returns what each peer answered.
 //!
 //! - Generic over the call: the caller passes "given a client, make this RPC",
-//!   so the same helper serves Step B's Bid, Replicate and FaultCommand.
+//!   so the same helper serves the election's bid exchange and winner announcement.
 //! - Every configured peer gets the call, not only the ones the detector thinks
 //!   are alive: the calls run in parallel, so a dead peer costs no extra time,
 //!   and a peer that just came back is not left out. The caller decides what a
