@@ -115,7 +115,7 @@ Rerun: `WEED_BIN=<path to weed> RUN_DIR=<empty dir> spike/seaweedfs/start_local_
 ### What this means (for Yasmina to decide)
 
 - **Using the filer's own HTTP API for create-if-absent does not work in 4.48.** We would silently get last-writer-wins, and different filers can disagree about the winner. This breaks the "exactly one committer wins per `request_id`" rule.
-- **The S3 gateway's conditional create did give the guarantee in every round we ran.** It is the same SeaweedFS and needs no central database, but it is a different front door (S3 API, an extra `weed s3` process per machine, bucket and object-key naming) from the one the plan assumed. This is a design decision, so I did not build on it.
+- **UPDATE Oct 29 (spike 2, below): the guarantee broke once, in the first race after a filer was restarted.** On Oct 23: **The S3 gateway's conditional create did give the guarantee in every round we ran.** It is the same SeaweedFS and needs no central database, but it is a different front door (S3 API, an extra `weed s3` process per machine, bucket and object-key naming) from the one the plan assumed. This is a design decision, so I did not build on it.
 - UNVERIFIED: why the S3 path is atomic across filers. The logs show a "LockRing" (a lock manager shared by the filers, kept in sync by the masters), and my guess is that the gateway takes a lock on the object path, but I did not read the source or confirm it. Whether the guarantee survives a filer crashing in the middle of a write, a network partition, or two filers disagreeing about the ring is untested.
 - UNVERIFIED: the filer's gRPC `CreateEntry` has an exclusive-create option (`o_excl`) that I believe gives create-if-absent without the S3 layer. Not tested; a Rust client would need the SeaweedFS `.proto` files, which would be a new dependency.
 - UNVERIFIED: other SeaweedFS-supported shared filer stores (Redis, MySQL, PostgreSQL, Cassandra, and others) exist, but would centralize the metadata, which the task rules out. Not tested.
@@ -158,3 +158,85 @@ Foreseeable problems on other machines (all UNVERIFIED, except where noted):
 | 5 | Is the S3 gateway an acceptable way to use SeaweedFS? | The only path that passed create-if-absent. Alternatives: gRPC `o_excl` (untested), or give up on SeaweedFS for the atomic step (for example, one designated filer for all `commit` calls, which gives up the "no single point" goal). This needs Yasmina |
 | 6 | `StateUnavailable`: when should it be returned? | With S3, a gateway or filer that cannot be reached returns a connection error or 5xx. The simplest rule: any transport error or 5xx on `commit` is `StateUnavailable`, and the caller retries with the same `request_id` (safe, because create-if-absent) |
 | 7 | How to store `snapshot()`? | Not spiked. The simplest option is one object per incident, resource and assignment, and `snapshot()` lists and reads them. A read after a write on another filer can be stale by the delay in check 3 (a few ms to tens of ms locally), which is why `commit` must re-check resources |
+
+
+---
+
+## Oct 29: SeaweedFS spike 2, the S3 gateway under failures (report only, nothing is built on it)
+
+**Headline: the S3 gateway gave exactly one winner in every round until a filer was restarted. In the first race after that restart, two writers both got `200`, and the filers ended up holding different values. The test run was stopped there, as instructed. Locked decision 1 (create-if-absent through the S3 gateway) therefore does not yet hold as written. See "What this means" and open questions 9 and 10.**
+
+### What was run
+
+| Item | Value |
+|---|---|
+| SeaweedFS | 4.48 (commit `530be3e3`), `windows_amd64.zip`, md5 re-checked. Same version as spike 1 |
+| OS | Windows 11 Pro 10.0.26200, Git Bash, one machine, everything on `127.0.0.1` |
+| Cluster | 3 masters (9333-9335); 3 volume servers (8080-8082) on racks `rack1`-`rack3` of data center `dc1`; 3 filers (8888-8890), each with its own `-defaultStoreDir`; 3 S3 gateways (8333-8335), gateway *i* in front of filer *i*. No credentials configured anywhere |
+| Replication | `-defaultReplication=010` ("one extra copy on a different rack"). Confirmed by the master: every volume reports `ReplicaPlacement {rack: 1}` and exists on 2 of the 3 volume servers. The meaning of the digits `xyz` (other data centers, other racks, other servers on the same rack) is from my memory of the SeaweedFS documentation: UNVERIFIED. `020` (a copy on every rack) was not tested; my expectation, UNVERIFIED, is that new writes would need all 3 volume servers alive |
+| Scripts | `spike/seaweedfs/start_local_cluster.sh`, `proc_ctl.sh` (stop/start/pause/resume one process), `run_s3_checks.py` with `s3_cluster.local.toml`. Raw output: `spike/seaweedfs/results-windows11-seaweedfs-4.48-s3.txt` |
+| Test client | Python 3.11.8, standard library only. 24 writers started together with a barrier, spread round-robin over the 3 gateways. Client timeout 60 s |
+
+### Results
+
+| Check | Result | Numbers |
+|---|---|---|
+| **a)** 24 concurrent `PUT`s of one key with `If-None-Match: *`, over all 3 gateways, 12 rounds | **PASS** | 12 of 12 rounds: exactly one `200`, 23 × `412`. All 3 gateways and all 3 filers returned the same winner within 30-85 ms of the race ending (polled). Also 10 of 10 rounds with only 3 contenders (the realistic case) |
+| **b)** same race while one volume server is killed during the test | **PASS** | Volume server 1 killed in round 0. 12 of 12 rounds exactly one winner, all readers agree. While it stayed down, 20 of 20 further creates succeeded |
+| **c)** same race while one filer plus its gateway are killed | **PASS while down, then FAIL after restart** | Filer 1 and gateway 1 killed in round 0. 12 of 12 rounds had exactly one `200` (the 8 writers aimed at the dead gateway got connection refused; the others won or got `412`). 20 of 20 creates through the live gateways succeeded. After restart, the race below had **two winners** |
+| **d)** kill one master, then a second | **NOT RUN** | Stopped by the two-winner rule before reaching it |
+| **e)** `If-Match` with one shared etag, 24 writers | **PASS** | 12 of 12 rounds: exactly one `200`, 23 × `412`; readers agree after 14-78 ms |
+| **f)** read-after-commit staleness | **PASS (nothing stale seen)** | 150 first reads of a new key right after the `200` (through the other 2 gateways and 3 filers): 0 × `404`. 150 first reads of an updated key: 0 returned the old version. Localhost only: the real network will add delay (UNVERIFIED) |
+| **g)** a `PUT` that times out on the client | **A timed-out write can land** | Client gave up after 1 s with the reply held back by a proxy: 10 of 10 timed out, 10 of 10 writes **landed anyway**, and the retry (same key, `If-None-Match: *`) got `412` 10 of 10. With the gateway process suspended during the `PUT`: 5 of 5 client timeouts, key absent while suspended (5 of 5), key **present after the gateway resumed** (5 of 5) |
+| **h)** gateway without credentials | **Works** | Every gateway ran with no `-config` and no keys, and every request above was anonymous. That is the minimal setup: `weed s3 -port=<p> -port.grpc=<g> -filer=<filer>`. Gateways on the same host need distinct `-port.grpc` and `-port.iceberg=0 -port.lance=0` (the Iceberg and Lance listeners default to fixed ports and the second gateway crashes). Behavior with credentials configured: not tested (anonymous access on a real deployment is a security question for Yasmina) |
+| **i)** restart what was killed | **Rejoin works; the first race after the filer rejoined did not** | Volume server 1 restarted: everything written during its absence was readable after 1.1 s, and the next race was fine. Filer 1 + gateway 1 restarted: everything written during their absence was readable through them after 2.4 s (0 of 20 objects unreadable). Then the two-winner race. Masters: not run |
+
+### Latency (localhost; informational)
+
+| Case | Numbers |
+|---|---|
+| Uncontended create, 30 fresh keys | median 8.5 ms, p95 29.7 ms |
+| Contended create, 24 writers on one key | The winner answers in 10-20 ms. **Losers wait**: median 3-8.5 s, slowest 13-18 s per round. They answer `412` one after another, about 1 s apart, so the 24th waits about 15 s. Seen in all 12 rounds |
+| Contended create, 3 writers on one key | Slowest answer 0.02-0.03 s in 4 of 10 rounds, 1.01-1.02 s in the other 6 |
+| Cause of the waiting | UNVERIFIED: the losers appear to queue on a lock inside SeaweedFS and be released about once per second. Not confirmed in the source |
+
+### The two-winner round (the evidence)
+
+- Key `c-after-8f0d29f4`, race started a few seconds after filer 1 and gateway 1 were restarted. The script's result for that round: `200` × 2, `412` × 22, no failures.
+- Both `200`s were writers 8 and 23, and both were sent to gateway index 2 (`writer % 3 == 2`), so this was **not** a cross-gateway artifact: two writes through the same gateway both succeeded.
+- Afterwards, read-only: gateways 8333, 8334 and 8335 all returned `writer-8`; filer 8888 and filer 8890 returned `writer-23`; filer 8889 (the restarted one) returned `writer-8`. The three filers disagree, and the gateways do not agree with the filer they sit in front of.
+- Timeline from the filer logs (UNVERIFIED as the cause): the masters push a "lock ring" (the list of filers that share lock ownership) every 30 s. At 05:23:29 all three filers applied a new ring that included filer 1 again; the race ran a few seconds later. My hypothesis, not tested: while the ring has just changed, two filers can both believe they own the lock for the same key. Whether this window also appears when a filer is killed (not restarted), when a new filer joins, or after a master change was not tested.
+- Not reproduced: the run stopped at the first occurrence, as instructed, so I do not know how often it happens. One occurrence in one restart.
+- Also seen: in the first round of c, "readers agree after NEVER" and the verdict "1 disagreeing" come from the script waiting for the filer it had just killed to answer. I believe that is a measurement artifact, not a second finding (UNVERIFIED: the round's winner was unique).
+
+### What this means (for Yasmina to decide)
+
+- Create-if-absent through the S3 gateway held in 12 + 12 + 12 + 12 rounds (a, b, c before the restart, and e for `If-Match`) plus 10 rounds with 3 contenders. It broke once, right after a filer rejoined. A guarantee that can fail during recovery is exactly when we need it, because a returning node and a retrying client are the normal case in this project.
+- Decision 1 is recorded as locked, but its safety claim is now in question. I did not change it. Options, with open question 9: wait for the lock ring to settle before allowing commits after any membership change; add a read-back check after every commit; fall back to the filer's gRPC exclusive-create (still untested, and it may use the same lock, UNVERIFIED); or accept it and document the window.
+- **Timeout ambiguity (g) is real and fits the interface:** a commit that times out may have landed. The caller must treat a timeout as `StateUnavailable`, retry with the same `request_id`, and treat a `412` on retry as `AlreadyCommitted`, then read the stored plan with `lookup_request`. Never give up on a timed-out commit and answer the client with a different plan. This is already how `StateUnavailable` is documented.
+- Contended creates are slow for the losers (about 1 s each in the queue). In our flow only the elected executor commits, so contention should be 1-3 writers, where the slowest answer was about 1 s. A `commit` call needs a timeout of several seconds, not milliseconds.
+- Read-after-commit was never stale on localhost, but spike 1 measured 3-28 ms for filer-to-filer propagation, and reads here were slower than that. Do not rely on it across a real network: keep `commit` re-checking resources and use `lookup_request` after a `412` rather than a cached value.
+
+### Running it on the real machines (updates the spike 1 list)
+
+1. Same `start_local_cluster.sh` flags with real `-ip` and `-peers`; each volume server with its own `-rack`; each filer with its own `-defaultStoreDir`; one `weed s3` per filer.
+2. Copy `s3_cluster.local.toml` to `s3_cluster.real.toml`, change the URLs, and replace `[control].command_template` with a command that can stop/start/pause that machine's processes (for example over ssh). Without `[control]`, checks a, e, f and the proxy part of g still run; b, c, d and the paused-gateway part of g are skipped.
+3. `python run_s3_checks.py s3_cluster.real.toml --json results.json`. It exits with code 2 and stops at the first round with two winners.
+
+Foreseeable mixed-OS problems (all UNVERIFIED):
+- `proc_ctl.sh pause` uses `NtSuspendProcess` through PowerShell on Windows and `kill -STOP` elsewhere. The Windows path reads the Windows process id from Git Bash's `ps` output (column 4); it worked here. The Linux path was never run.
+- On Windows, stopping `weed.exe` with `kill` from Git Bash worked; `taskkill` with the pid file's number does not (it is the Git Bash pid).
+- Mixed Linux and Windows nodes in one SeaweedFS cluster: not tested. File path separators and case sensitivity could matter for object keys that differ only in case (we use lowercase hex keys).
+- Clock differences between machines could affect lock expiry (UNVERIFIED), and `Last-Modified`/etag order is not used by us.
+- Firewalls: SeaweedFS opens a gRPC port at HTTP port + 10000 for each component, and gateways use `-port.grpc`; all must be reachable between machines.
+- The lock ring is re-sent by the masters every 30 s; cross-machine latency or one slow machine could widen the window found above (UNVERIFIED).
+
+### Open questions from spike 2
+
+| # | Question | Notes |
+|---|---|---|
+| 8 | **Rejoin readiness** (locked decision 4, placeholder): a returning node is ready when its S3 gateway is reachable, it has read the resource listing once, and it has passed one heartbeat round | Not implemented. Spike 2 suggests these three conditions are not enough for safety: filer 1 and gateway 1 answered reads correctly 2.4 s after the restart and the next race still produced two winners. Simplest addition, UNVERIFIED that it is enough: also wait until the lock ring has settled, for example not committing for about 60 s (two ring updates) after the node's filer joins. Alternative: no waiting, rely on a read-back check. Needs a decision |
+| 9 | What to do about the two-winner window? | Options: (A) after any filer or gateway (re)start, hold commits from that node for about 60 s; (B) after every `200` read the object back from a second gateway and compare to what we wrote, treating a mismatch as `StateUnavailable` (cannot catch a double win in time: both writers see their own value for a moment); (C) switch to the filer's gRPC exclusive-create (untested); (D) accept and document. I took none of them. Next step if Yasmina agrees: rerun c 10 times to learn how often it happens, and test (A) |
+| 10 | Is the failure tied to a filer restart, or to any ring change? | Not tested: a fresh filer joining, a filer being killed (not restarted), a master change. Check d was meant to cover masters |
+| 11 | `commit` timeout value | Contended creates can take about 15 s for the last of 24 writers; for the real case of 1-3 writers about 1 s. Suggest a `commit` timeout of 5 s, UNVERIFIED as a good value; whatever is chosen, a timeout is `StateUnavailable`, never "failed" (check g) |
+| 12 | Anonymous gateway access | Works with no configuration (check h) but means anyone who can reach the port can write. Whether the real machines can be firewalled to the nodes is a deployment question; credentials were not tested |

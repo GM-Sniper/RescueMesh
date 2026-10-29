@@ -1,0 +1,151 @@
+######## run: s3_aef
+gateways: ['http://127.0.0.1:8333', 'http://127.0.0.1:8334', 'http://127.0.0.1:8335']
+filers:   ['http://127.0.0.1:8888', 'http://127.0.0.1:8889', 'http://127.0.0.1:8890']
+bucket:   spikebucket
+bucket create status: 409
+
+== a) S3 race: concurrent PUTs of one key, spread over all gateways ==
+round  0: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/3.03/14.05 s  readers agree after 40 ms
+round  1: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/6.02/17.05 s  readers agree after 67 ms
+round  2: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/8.54/18.05 s  readers agree after 78 ms
+round  3: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/4.53/16.05 s  readers agree after 75 ms
+round  4: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/5.53/13.04 s  readers agree after 39 ms
+round  5: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/7.54/17.05 s  readers agree after 67 ms
+round  6: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/6.53/17.05 s  readers agree after 47 ms
+round  7: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/8.53/17.05 s  readers agree after 36 ms
+round  8: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/3.53/13.04 s  readers agree after 55 ms
+round  9: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/6.53/18.05 s  readers agree after 30 ms
+round 10: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/4.52/16.05 s  readers agree after 63 ms
+round 11: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/3.53/14.04 s  readers agree after 85 ms
+-- the realistic case: 3 contenders (one request multicast to 3 nodes) --
+round  0: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.01/1.02 s  readers agree after 62 ms  [3 contenders]
+round  1: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.01/1.01 s  readers agree after 48 ms  [3 contenders]
+round  2: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.02/0.02 s  readers agree after 58 ms  [3 contenders]
+round  3: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.01/1.01 s  readers agree after 81 ms  [3 contenders]
+round  4: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.01/1.01 s  readers agree after 39 ms  [3 contenders]
+round  5: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.01/1.01 s  readers agree after 56 ms  [3 contenders]
+round  6: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.01/0.03 s  readers agree after 79 ms  [3 contenders]
+round  7: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.01/1.01 s  readers agree after 80 ms  [3 contenders]
+round  8: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.01/0.02 s  readers agree after 42 ms  [3 contenders]
+round  9: 200=1 412=2 no-answer=0 other=[]  time winner/median/slowest 0.01/0.02/0.02 s  readers agree after 67 ms  [3 contenders]
+-- uncontended create latency (one writer, 30 fresh keys) --
+    {'median': 8.5, 'p95': 29.7, 'max': 29.8}
+RESULT: PASS {'rounds': 12, 'exactly_one_winner_and_all_agree': 12, 'zero_winners': 0, 'two_or_more_winners': 0, 'disagreeing_after_15s': 0, 'slowest_loser_seconds_max': 18.05, 'slowest_loser_seconds_median': 16.55, 'three_contenders': {'rounds': 10, 'exactly_one_winner_and_all_agree': 10, 'zero_winners': 0, 'two_or_more_winners': 0, 'disagreeing_after_15s': 0, 'slowest_seconds_max': 1.02}, 'uncontended_create_ms': {'median': 8.5, 'p95': 29.7, 'max': 29.8}, 'passed': True}
+
+== e) If-Match: two writers update one object with the same etag ==
+round  0: 200=1 412=23 other=[] readers agree after 14 ms
+round  1: 200=1 412=23 other=[] readers agree after 38 ms
+round  2: 200=1 412=23 other=[] readers agree after 68 ms
+round  3: 200=1 412=23 other=[] readers agree after 32 ms
+round  4: 200=1 412=23 other=[] readers agree after 52 ms
+round  5: 200=1 412=23 other=[] readers agree after 18 ms
+round  6: 200=1 412=23 other=[] readers agree after 78 ms
+round  7: 200=1 412=23 other=[] readers agree after 18 ms
+round  8: 200=1 412=23 other=[] readers agree after 63 ms
+round  9: 200=1 412=23 other=[] readers agree after 40 ms
+round 10: 200=1 412=23 other=[] readers agree after 65 ms
+round 11: 200=1 412=23 other=[] readers agree after 20 ms
+RESULT: PASS
+
+== f) read-after-commit: commit via one gateway, read at once via the others ==
+new key, first read right after the 200: {'total': 150, 'not_found_404': 0, 'other': 0, 'delay_until_correct': {'count': 0, 'median_ms': None, 'max_ms': None}}
+updated key, first read right after the 200: {'total': 150, 'stale_old_version': 0, 'other': 0, 'delay_until_correct': {'count': 0, 'median_ms': None, 'max_ms': None}}
+
+== Summary ==
+a: PASS
+e: PASS
+f: INFO/SKIPPED
+
+######## run: s3_g
+gateways: ['http://127.0.0.1:8333', 'http://127.0.0.1:8334', 'http://127.0.0.1:8335']
+filers:   ['http://127.0.0.1:8888', 'http://127.0.0.1:8889', 'http://127.0.0.1:8890']
+bucket:   spikebucket
+bucket create status: 409
+
+== g) a PUT that times out on the client: did the write land anyway? ==
+   reply held back: 10/10 client timeouts; the write landed anyway in 10; the retry (create-if-absent) got 412 in 10
+   [control] pause s3gateway0
+   [control] resume s3gateway0
+   [control] pause s3gateway0
+   [control] resume s3gateway0
+   [control] pause s3gateway0
+   [control] resume s3gateway0
+   [control] pause s3gateway0
+   [control] resume s3gateway0
+   [control] pause s3gateway0
+   [control] resume s3gateway0
+   gateway paused during the PUT: client timed out 5/5, object absent while paused 5/5, landed after resume 5/5
+
+== Summary ==
+g: INFO/SKIPPED
+
+######## run: s3_b
+gateways: ['http://127.0.0.1:8333', 'http://127.0.0.1:8334', 'http://127.0.0.1:8335']
+filers:   ['http://127.0.0.1:8888', 'http://127.0.0.1:8889', 'http://127.0.0.1:8890']
+bucket:   spikebucket
+bucket create status: 409
+
+== b) race while volume server 1 is killed, then i) bring it back ==
+   [control] stop volume1
+round  0: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/3.04/10.05 s  readers agree after 99 ms
+round  1: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.22/9.54/21.06 s  readers agree after 80 ms  [after kill]
+round  2: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/4.03/12.04 s  readers agree after 69 ms  [after kill]
+round  3: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/4.03/14.05 s  readers agree after 74 ms  [after kill]
+round  4: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/7.54/18.05 s  readers agree after 75 ms  [after kill]
+round  5: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/3.03/12.04 s  readers agree after 111 ms  [after kill]
+round  6: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/3.53/15.05 s  readers agree after 29 ms  [after kill]
+round  7: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/6.53/18.05 s  readers agree after 86 ms  [after kill]
+round  8: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/6.53/18.05 s  readers agree after 71 ms  [after kill]
+round  9: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/6.53/17.05 s  readers agree after 77 ms  [after kill]
+round 10: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/3.52/9.03 s  readers agree after 48 ms  [after kill]
+round 11: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.01/9.54/21.06 s  readers agree after 117 ms  [after kill]
+verdict: {'rounds': 12, 'exactly_one_winner_and_all_agree': 12, 'zero_winners': 0, 'two_or_more_winners': 0, 'disagreeing_after_15s': 0, 'killed_during_round': 0}
+-- writing while the volume server is still down --
+   20 of 20 creates succeeded, 0 failed while volume1 was down
+   [control] start volume1
+-- i) volume1 restarted; waiting for objects written in its absence to be readable --
+   all readable after 1.1 s (unreadable: 0)
+round  0: 200=1 412=23 no-answer=0 other=[]  time winner/median/slowest 0.02/7.53/19.05 s  readers agree after 122 ms  [after restart]
+
+== Summary ==
+b: PASS
+
+######## run: s3_c
+gateways: ['http://127.0.0.1:8333', 'http://127.0.0.1:8334', 'http://127.0.0.1:8335']
+filers:   ['http://127.0.0.1:8888', 'http://127.0.0.1:8889', 'http://127.0.0.1:8890']
+bucket:   spikebucket
+bucket create status: 409
+
+== c) race while filer 1 and its gateway are killed, then i) bring them back ==
+   [control] stop s3gateway1
+   [control] stop filer1
+round  0: 200=1 412=17 no-answer=6 other=[]  time winner/median/slowest 0.01/3.52/8.03 s  readers agree after NEVER
+round  1: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.01/2.06/13.04 s  readers agree after 43 ms  [after kill]
+round  2: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.01/2.07/12.04 s  readers agree after 60 ms  [after kill]
+round  3: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.02/2.06/13.05 s  readers agree after 20 ms  [after kill]
+round  4: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.02/2.54/14.04 s  readers agree after 86 ms  [after kill]
+round  5: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.01/2.54/11.04 s  readers agree after 62 ms  [after kill]
+round  6: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.02/2.06/13.04 s  readers agree after 30 ms  [after kill]
+round  7: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.01/2.03/13.03 s  readers agree after 93 ms  [after kill]
+round  8: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.02/2.05/13.05 s  readers agree after 19 ms  [after kill]
+round  9: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.01/2.06/13.04 s  readers agree after 48 ms  [after kill]
+round 10: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.01/2.04/12.04 s  readers agree after 15 ms  [after kill]
+round 11: 200=1 412=15 no-answer=8 other=[]  time winner/median/slowest 0.01/2.07/13.04 s  readers agree after 67 ms  [after kill]
+verdict: {'rounds': 12, 'exactly_one_winner_and_all_agree': 11, 'zero_winners': 0, 'two_or_more_winners': 0, 'disagreeing_after_15s': 1, 'killed_during_round': 0}
+-- writing through the two live gateways while filer1 is down --
+   20 of 20 creates succeeded, 0 failed
+   [control] start filer1
+   [control] start s3gateway1
+-- i) filer1 and gateway1 restarted; waiting until THEY can read what was written meanwhile --
+   readable after 2.4 s (unreadable: 0)
+!!! TWO OR MORE WINNERS on c-after-8f0d29f4: {'winners': 2, 'winner_writer': None, 'rejected_412': 22, 'no_answer_0': 0, 'other': [], 'winner_seconds': None, 'slowest_seconds': 13.05, 'median_seconds': 3.04}
+
+STOPPED: two winners on c-after-8f0d29f4. Results so far are saved; do not continue.
+
+######## read-only evidence after the two-winner round (key c-after-8f0d29f4)
+gateway 8333: writer-8
+gateway 8334: writer-8
+gateway 8335: writer-8
+filer 8888: writer-23
+filer 8889: writer-8
+filer 8890: writer-23
