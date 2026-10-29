@@ -55,10 +55,17 @@ pub enum CommitOutcome {
     AlreadyCommitted(Plan),
 
     /// A resource in the plan was not free when the write happened (taken by another request
-    /// after the snapshot was copied; or not a known resource; or named twice in one plan).
-    /// Nothing was written. The caller should take a fresh snapshot, plan again and retry.
-    /// Carries the first offending resource so the log can say which one collided.
+    /// after the snapshot was copied, or named twice in one plan). Nothing was written.
+    /// The caller should take a fresh snapshot, plan again and retry: this is an ordinary
+    /// race, not a fault. Carries the first offending resource so the log can say which one
+    /// collided.
     ResourceTaken { resource_id: ResourceId },
+
+    /// A resource in the plan does not exist in the shared state at all. Nothing was written.
+    /// Why separate from `ResourceTaken`: retrying on a fresh snapshot cannot fix this, so
+    /// the caller must NOT loop. Today it means a bug (the planner was given a resource the
+    /// store does not hold, or two nodes disagree about the resource list).
+    UnknownResource { resource_id: ResourceId },
 
     /// Not enough of the shared state could be reached to decide. Nothing is known to have
     /// been written. Why not simply "Committed" or an error: the write may or may not have

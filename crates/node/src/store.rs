@@ -98,13 +98,15 @@ impl SharedState for InMemoryStore {
         }
 
         // Every planned resource must exist, be unassigned, and appear only once in the plan.
-        // An unknown resource is reported as "taken" too: from the caller's side the cure is
-        // the same (snapshot again and re-plan). Nothing is written before all checks pass.
+        // "Unknown" is reported apart from "taken": re-planning fixes a race but not a
+        // resource that does not exist. Nothing is written before all checks pass.
         let mut seen_in_this_plan = HashSet::new();
         for assignment in &plan.assignments {
             let resource_id = assignment.resource_id;
-            let is_free = contents.resources.contains_key(&resource_id)
-                && !contents.assignments.contains_key(&resource_id);
+            if !contents.resources.contains_key(&resource_id) {
+                return CommitOutcome::UnknownResource { resource_id };
+            }
+            let is_free = !contents.assignments.contains_key(&resource_id);
             if !is_free || !seen_in_this_plan.insert(resource_id) {
                 return CommitOutcome::ResourceTaken { resource_id };
             }
@@ -293,12 +295,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_resource_or_one_named_twice_is_reported_as_taken_and_writes_nothing() {
+    async fn an_unknown_resource_is_reported_as_unknown_and_a_repeated_one_as_taken_and_nothing_is_written() {
         let store = store_with_resources(3);
         let empty = store.snapshot().await.unwrap();
         assert_eq!(
             commit(&store, "r1", 10, &[1, 77]).await,
-            CommitOutcome::ResourceTaken { resource_id: 77 }
+            CommitOutcome::UnknownResource { resource_id: 77 }
         );
         assert_eq!(
             commit(&store, "r2", 11, &[2, 2]).await,

@@ -14,13 +14,14 @@ The state interface is ready to code against. No PR yet; P3 reviews it first.
 - `lookup_request(request_id).await?`: the stored plan for a retry, or `None`.
 - `commit(request_id, incident, plan).await`: store the plan if this `request_id` has none yet. Exactly one committer wins per `request_id`.
 
-**What `commit` returns.**
+**What `commit` returns.** (Oct 29: a fifth case, `UnknownResource`, was added. If you `match` on `CommitOutcome`, add an arm for it.)
 
 | Outcome | What it means | What you do |
 |---|---|---|
 | `Committed` | You stored the plan | Reply with your plan |
 | `AlreadyCommitted(plan)` | Someone already stored a plan for this `request_id` | Reply with **that** plan, not yours |
 | `ResourceTaken { resource_id }` | A resource in your plan was no longer free; nothing was written | Take a new `snapshot()`, plan again, commit again |
+| `UnknownResource { resource_id }` | A resource in your plan does not exist at all; nothing was written | Do not retry. It is a bug: return an internal error |
 | `StateUnavailable(why)` | The shared state could not be reached; the write may or may not have landed | Retry with the **same** `request_id` (safe) |
 
 `snapshot()` and `lookup_request()` return `Err(StateUnavailable)` in the same situation.

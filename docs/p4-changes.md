@@ -43,6 +43,7 @@ match state.store.commit(&request_id, incident, plan.clone()).await {
     CommitOutcome::Committed => { /* we did the work: reply with plan, duplicate = false */ }
     CommitOutcome::AlreadyCommitted(stored) => { /* reply with `stored`, throw ours away, duplicate = true */ }
     CommitOutcome::ResourceTaken { .. } => { /* go back to snapshot and plan again, a few times at most */ }
+    CommitOutcome::UnknownResource { .. } => { /* a bug: do NOT re-plan; return an internal error */ }
     CommitOutcome::StateUnavailable(why) => { /* tell the client to retry with the SAME request_id */ }
 }
 ```
@@ -56,6 +57,7 @@ match state.store.commit(&request_id, incident, plan.clone()).await {
 | `Committed` | This call stored the plan | Reply with your plan |
 | `AlreadyCommitted(plan)` | That `request_id` already had a plan (earlier call, retry, or another node) | Reply with **that** plan, not yours. Otherwise a client could get two different plans for one request |
 | `ResourceTaken { resource_id }` | A planned resource was not free at write time. Nothing was written | Take a new snapshot, plan again, commit again |
+| `UnknownResource { resource_id }` | A planned resource does not exist in the shared state. Nothing was written | Do not retry: a fresh snapshot cannot fix it. Treat it as a bug and return an internal error (`handle_submit` does this) |
 | `StateUnavailable(reason)` | Could not reach enough of the shared state to decide. The write may or may not have landed | Retry with the same `request_id`. This is safe: commit is create-if-absent, so the retry comes back `AlreadyCommitted` if the first attempt landed |
 
 Other rules:
@@ -79,7 +81,7 @@ Other rules:
 | # | Question | What I did | Alternatives |
 |---|---|---|---|
 | 1 | The request said `commit(request_id, plan)`, but a `Plan` only holds an incident id and the stored state needs the incident itself (it must be recorded as `Open` when the plan is empty) | `commit(request_id, incident, plan)` | Keep `commit(request_id, plan)` and store incidents with a second call. That makes two writes that can half-fail on a DFS |
-| 2 | The old store returned a separate `UnknownResource` error (a bug at the time). The new enum has four variants only | An unknown resource is reported as `ResourceTaken`: the caller's cure is the same (snapshot and plan again) | Add a fifth variant if the team wants to tell "bug" from "race" |
+| 2 | RESOLVED Oct 29 (locked decision): a separate `UnknownResource` variant, so "retry on a fresh snapshot" (`ResourceTaken`) is not confused with "something is wrong" | `CommitOutcome` now has five variants | None |
 | 3 | `StateUnavailable` carries a `reason` string | Yes, for logs only | A bare variant with no data |
 | 4 | The earlier doc listed handling for two nodes planning the same free resource and "same request from two origins". With one shared create-if-absent record these should no longer happen, but that depends on the DFS giving the guarantee | Left to the spike (check 1 and 2) | None until the spike results are confirmed on the real machines |
 

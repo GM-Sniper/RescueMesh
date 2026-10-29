@@ -174,6 +174,13 @@ async fn handle_submit(
             CommitOutcome::ResourceTaken { resource_id } => {
                 tracing::debug!(%request_id, attempt, resource_id, "resource taken meanwhile; planning again");
             }
+            // Re-planning cannot fix a resource the store does not have, so no retry:
+            // it is a bug (planner and store disagree), as it was before this variant existed.
+            CommitOutcome::UnknownResource { resource_id } => {
+                return Err(Status::internal(format!(
+                    "plan names resource {resource_id}, which the store does not have"
+                )));
+            }
             CommitOutcome::StateUnavailable(why) => return Err(unavailable(why)),
         }
     }
