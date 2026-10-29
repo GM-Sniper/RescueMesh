@@ -10,9 +10,11 @@
 //!   experiment.toml                  copy of the config that was used
 //!   <run_id>.csv, <run_id>.meta.txt  the load generator's output
 //!   summary.txt                      the stats script's output
+//!   elections-summary.txt            election metrics and win share (from the nodes' election logs)
 //!   node<N>.log                      each node's console output
 //!   logs/faults-node<N>.csv          each node's fault log (P5)
 //!   logs/node_metrics-node<N>.csv    each node's load, once per second (P6)
+//!   logs/elections-node<N>.csv       each node's view of every election (P3)
 //!
 //! Lab mode (`start_nodes = false`): the nodes already run on the 3 machines. The runner tells you how
 //! to start them with the right --run-id, waits for Enter, runs the load, and lists the node files to
@@ -99,7 +101,7 @@ fn main() -> anyhow::Result<()> {
     // The other programs are built next to this one (target/release or target/debug).
     let bin_dir = std::env::current_exe()?.parent().context("no folder for this program")?.to_path_buf();
     let bin = |name: &str| bin_dir.join(format!("{name}{EXE_SUFFIX}"));
-    for name in ["node", "loadgen", "stats"] {
+    for name in ["node", "loadgen", "stats", "elections"] {
         if !bin(name).exists() {
             bail!("{} not found: run `cargo build --release` first (it builds every program)", bin(name).display());
         }
@@ -144,13 +146,27 @@ fn main() -> anyhow::Result<()> {
     fs::write(out.join("summary.txt"), &stats.stdout)?;
     print!("{}", String::from_utf8_lossy(&stats.stdout));
 
+    // 4b. Election metrics (P3's logs), when the nodes wrote them here (local mode).
+    let election_logs: Vec<PathBuf> = cluster.nodes.iter()
+        .map(|n| out.join("logs").join(format!("elections-node{}.csv", n.id)))
+        .filter(|p| p.exists())
+        .collect();
+    if !election_logs.is_empty() {
+        let report = Command::new(bin("elections")).args(&election_logs).output().context("could not start elections")?;
+        if !report.status.success() {
+            bail!("elections failed: {}", String::from_utf8_lossy(&report.stderr));
+        }
+        fs::write(out.join("elections-summary.txt"), &report.stdout)?;
+        print!("{}", String::from_utf8_lossy(&report.stdout));
+    }
+
     // 5. Tell the user where everything is.
     if exp.start_nodes {
         println!("all files are in {}", out.display());
     } else {
         println!("load results are in {}. Copy these from each node machine into it:", out.display());
         for node in &cluster.nodes {
-            println!("  node {}: logs/faults-node{}.csv and logs/node_metrics-node{}.csv -> {}", node.id, node.id, node.id, out.join(format!("node{}", node.id)).display());
+            println!("  node {}: logs/faults-node{}.csv, logs/node_metrics-node{}.csv, logs/elections-node{}.csv -> {}", node.id, node.id, node.id, node.id, out.join(format!("node{}", node.id)).display());
         }
     }
     Ok(())

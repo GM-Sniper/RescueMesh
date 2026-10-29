@@ -467,6 +467,50 @@ Tested on one laptop: 3 nodes started, 4-stage ramp, 13 files gathered, no node 
 
 ---
 
+## 13. Step B, Tue Oct 27: election metrics and win share (branch `StepB/p6`)
+
+Plan tasks: "elections.csv from P3's events" and "load distribution: wins per node per time window, share per node". P3's `logs/elections-node<N>.csv` landed on `main` (PR #19) in the format agreed in the PR #12 review, so both can be built now. **Nothing calls the election yet** (P1 still has to wire it into the Submit handler), so real runs give header-only files until then.
+
+New program `crates/loadgen/src/bin/elections.rs`:
+
+```bash
+cargo run --release -p loadgen --bin elections -- results/<run_id>/logs/elections-node1.csv results/<run_id>/logs/elections-node2.csv results/<run_id>/logs/elections-node3.csv
+cargo run --release -p loadgen --bin elections -- --window-secs 5 <files...>   # narrower time windows
+```
+
+Every node logs its own view of every election, so one election is 3 rows. The program groups rows by **(request_id, round)** to count each election once:
+
+```rust
+by_key.entry((r.request_id.clone(), r.round)).or_default().push(r);   // group the nodes' rows per election
+let winner = /* the winner most nodes reported; ties to the lowest node ID */;
+disagreed: votes.len() > 1,                                           // nodes named different winners = split
+bid_calls_sent: views.iter().map(|v| v.bid_calls_sent).sum(),         // all nodes' messages for this election
+```
+
+What it prints (sample from made-up rows):
+
+```text
+elections:   60 (0 re-elections after a winner went down), seen by nodes {1, 2, 3}          # count, re-elections
+disagreement: 0 elections where nodes named different winners, 0 split announcements, ...    # split-decision rate
+duration (per node view, 180 views):                                                          # each node times its own election
+  mean 3.51 ms  p50 3.48 ms  p95 4.80 ms  p99 4.95 ms  max 5.00 ms
+  waited the full bid timeout: 0 of 180 (0.0%)                                                # a silent peer not yet marked down
+messages: 6.00 bid calls per election on average (min 6, max 6)                               # message overhead
+win share (60 decided elections, even split = 33.3%):                                         # the plan's worked example format
+  node 1: 27 wins = 45.0% (+11.7 points vs even)
+win share per 10 s window:                                                                    # load distribution over time
+         window  elections    node 1    node 2    node 3
+         0-10 s         20    100.0%      0.0%      0.0%
+```
+
+The experiment runner now also runs it on the nodes' election logs and saves `elections-summary.txt`; in lab mode it lists `logs/elections-node<N>.csv` among the files to copy.
+
+5 tests (`cargo test -p loadgen`): P3's example row parses correctly; one election seen by 3 nodes counts once with 6 messages; a split is flagged and the majority winner kept; re-elections (round 1) count separately; the plan's worked example (40 / 35 / 25 wins out of 100).
+
+**Note for P3:** `cargo test -p node csv_row_counts_retries` fails every time on this laptop: `waited_full_t` is `true` where the test expects `false` (election.rs line 1180). Looks timing-sensitive.
+
+---
+
 ## How to run everything
 
 ```bash
