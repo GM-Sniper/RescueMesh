@@ -660,6 +660,7 @@ mod tests {
 
     use common::pb::node_client::NodeClient;
     use common::pb::node_server::NodeServer;
+    use common::NodeId;
     use common::shared_state::SharedState;
     use tonic::transport::Channel;
 
@@ -673,6 +674,15 @@ mod tests {
 
     /// Starts 3 real nodes that all use `store`; returns each one's state and a client to it.
     async fn three_nodes(store: Arc<dyn SharedState>) -> Vec<(Arc<NodeState>, NodeClient<Channel>)> {
+        three_nodes_with_slow_node(store, None).await
+    }
+
+    /// Like `three_nodes`, but `slow = Some((id, iterations))` gives that one node a heavier
+    /// planner, as `--planner-iterations` does: the "artificially loaded node" (P3).
+    async fn three_nodes_with_slow_node(
+        store: Arc<dyn SharedState>,
+        slow: Option<(NodeId, usize)>,
+    ) -> Vec<(Arc<NodeState>, NodeClient<Channel>)> {
         let cfg = ClusterConfig::parse(&format!(
             "[[nodes]]\nid = 1\naddr = \"127.0.0.1:{}\"\n\
              [[nodes]]\nid = 2\naddr = \"127.0.0.1:{}\"\n\
@@ -685,7 +695,13 @@ mod tests {
         let mut nodes = Vec::new();
         for id in 1..=3 {
             let peers = Peers::new(&cfg, id).unwrap();
-            let state = Arc::new(NodeState::new(id, cfg.clone(), peers).with_store(store.clone()));
+            let mut node_cfg = cfg.clone();
+            if let Some((slow_id, iterations)) = slow
+                && slow_id == id
+            {
+                node_cfg.planner.iterations = iterations;
+            }
+            let state = Arc::new(NodeState::new(id, node_cfg, peers).with_store(store.clone()));
             let addr: std::net::SocketAddr = cfg.node(id).unwrap().addr.parse().unwrap();
             tokio::spawn(
                 tonic::transport::Server::builder()
@@ -779,6 +795,39 @@ mod tests {
         assert!(again.duplicate);
         assert_eq!(again.plan, Some(plan_to_pb(&stored)));
     }
+
+    // P3's load-imbalance test: node 1 plans much slower, so its service time (part of
+    // the load score) goes up each time it wins, and the other two take most requests.
+    // Node 1 is the hardest one to make lose: it wins every tie (lowest ID), and with
+    // nobody slow it takes about 13 of 30. Loose check, not exact shares: timing differs
+    // between machines. The measured shares come from live runs (docs/p1-design-log.md,
+    // section 12).
+    #[tokio::test]
+    async fn slow_node_wins_fewer_elections() {
+        let nodes = three_nodes_with_slow_node(shared_store(), Some((1, SLOW_ITERATIONS))).await;
+        let mut wins = [0usize; 3];
+        for i in 0..30 {
+            let id = format!("li{i}");
+            let [mut c1, mut c2, mut c3] = [0, 1, 2].map(|n| nodes[n].1.clone());
+            let (r1, r2, r3) = tokio::join!(
+                c1.submit(submit_req(&id, i)),
+                c2.submit(submit_req(&id, i)),
+                c3.submit(submit_req(&id, i)),
+            );
+            let winner = [r1, r2, r3]
+                .into_iter()
+                .map(|r| r.unwrap().into_inner())
+                .find(|r| r.plan.is_some())
+                .expect("one node plans")
+                .executor_node;
+            wins[winner as usize - 1] += 1;
+        }
+        // At most half a fair share (10 of 30). Runs so far gave node 1 one or two wins.
+        assert!(wins[0] <= 5, "wins per node: {wins:?}");
+    }
+
+    /// Enough planner work that node 1's plans clearly take longer than the others'.
+    const SLOW_ITERATIONS: usize = 30_000;
 
     #[tokio::test]
     async fn invalid_request_starts_no_election() {
