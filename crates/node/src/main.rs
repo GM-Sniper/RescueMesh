@@ -57,6 +57,21 @@ struct Args {
     /// Default: run-<unix seconds>, like loadgen.
     #[arg(long)]
     run_id: Option<String>,
+    /// Extra planner work on this node only: replaces `[planner] iterations` from the
+    /// shared config, to make it a slower machine in load-balancing tests. At the default
+    /// sizes one iteration is about 0.7 us of CPU, so 30000 is about 20 ms per plan.
+    #[arg(long)]
+    planner_iterations: Option<usize>,
+}
+
+/// `--planner-iterations`: replaces the config's `[planner] iterations` for this node.
+/// Refuses 0, like the config check does.
+fn apply_planner_iterations(config: &mut ClusterConfig, iterations: Option<usize>) -> anyhow::Result<()> {
+    if let Some(n) = iterations {
+        anyhow::ensure!(n > 0, "--planner-iterations must be at least 1");
+        config.planner.iterations = n;
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -71,8 +86,9 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // 3. Load and check the config, then find ourselves in it.
-    let config = ClusterConfig::load(&args.config)?;
+    // 3. Load and check the config (plus this node's own planner load), then find ourselves in it.
+    let mut config = ClusterConfig::load(&args.config)?;
+    apply_planner_iterations(&mut config, args.planner_iterations)?;
     let me = config
         .node(args.id)
         .with_context(|| format!("node {} is not listed in {}", args.id, args.config))?;
@@ -118,11 +134,32 @@ async fn main() -> anyhow::Result<()> {
         .context("cannot open the node_metrics log")?;
 
     // 7. Open the doors: serve the Node service until Ctrl+C.
-    tracing::info!(id = args.id, %listen, peers = ?peer_ids, %run_id, fault_log = %log_path, "node listening");
+    let planner_iterations = state.config.planner.iterations; // in the log, so every run says which node was loaded
+    tracing::info!(id = args.id, %listen, peers = ?peer_ids, %run_id, fault_log = %log_path, planner_iterations, "node listening");
     tonic::transport::Server::builder()
         .add_service(NodeServer::new(NodeService::new(state)))
         .serve(listen)
         .await
         .with_context(|| format!("server on {listen} stopped"))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn planner_iterations_flag_replaces_the_config_value() {
+        let mut cfg = ClusterConfig::parse(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:50052\"\n",
+        )
+        .unwrap();
+        let shared = cfg.planner.iterations;
+        apply_planner_iterations(&mut cfg, None).unwrap();
+        assert_eq!(cfg.planner.iterations, shared, "no flag: the config's value stays");
+        apply_planner_iterations(&mut cfg, Some(30_000)).unwrap();
+        assert_eq!(cfg.planner.iterations, 30_000);
+        assert!(apply_planner_iterations(&mut cfg, Some(0)).is_err(), "0 is refused");
+    }
 }
