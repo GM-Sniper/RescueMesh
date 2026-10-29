@@ -90,6 +90,7 @@ struct Row {
     status: SubmitStatus,       // ok / timeout / error
     assigned: Option<bool>,     // true = a resource was assigned, false = empty plan (nothing free), None = no plan
     stage: u32,                 // which stage sent it (1, 2, ...); always 1 without --stages
+    outcome: &'static str,      // committed / duplicate / failed (P1, Step C: for the reliability %)
 }
 
 /// Everything one client task needs. One per client per stage.
@@ -126,6 +127,7 @@ impl ClientJob {
             let timestamp_ms = unix_ms(); // when this request was sent
             let outcome = self.client.submit(incident).await; // send, wait, time it (never panics)
             let assigned = outcome.assigned(); // read before outcome's fields are moved into the row
+            let result = outcome.outcome(); // same: committed / duplicate / failed
             let row = Row {
                 timestamp_ms,
                 client_id: self.client_id,
@@ -135,6 +137,7 @@ impl ClientJob {
                 status: outcome.status,
                 assigned,
                 stage: self.stage,
+                outcome: result,
             };
             if self.tx.send(row).is_err() {
                 break; // the writer stopped (disk error): no point sending more
@@ -267,7 +270,7 @@ async fn main() -> anyhow::Result<()> {
 /// The CSV writer: takes rows off the channel and writes them until every sender is gone.
 fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Result<Counts> {
     let mut w = BufWriter::new(File::create(path)?); // buffered, so we don't hit the disk on every row
-    writeln!(w, "run_id,timestamp,client_id,request_id,latency_us,executor_node,status,assigned,stage")?; // header row
+    writeln!(w, "run_id,timestamp,client_id,request_id,latency_us,executor_node,status,assigned,stage,outcome")?; // header row
     let mut counts = Counts::default();
     for row in rx {
         // This loop ends by itself once all tasks are done and the channel is closed.
@@ -283,8 +286,8 @@ fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Res
         let assigned = row.assigned.map_or(String::new(), |a| a.to_string()); // "true", "false", or empty if no plan
         writeln!(
             w,
-            "{run_id},{},{},{},{},{node},{},{assigned},{}",
-            row.timestamp_ms, row.client_id, row.request_id, row.latency_us, row.status.as_str(), row.stage
+            "{run_id},{},{},{},{},{node},{},{assigned},{},{}",
+            row.timestamp_ms, row.client_id, row.request_id, row.latency_us, row.status.as_str(), row.stage, row.outcome
         )?;
     }
     w.flush()?; // save whatever is still in the buffer
