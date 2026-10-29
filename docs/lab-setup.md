@@ -108,6 +108,45 @@ Use one run ID for everything, so P6 can join the files, e.g. `lab-nov1-smoke`.
 
 Stop a node with Ctrl+C. Never kill programs on a lab PC that are not ours.
 
+## 6. Real failures: network cable out, PC switched off
+
+The supervisor may test these by hand, so we test them first. Both run under load
+(loadgen at about 10 requests/s from the client machine), each on a different node.
+For each one, write down the times (fault, suspected, back) and the loadgen result.
+
+**A. Network cable out for about 10 s, then back in.** The PC keeps running but nobody can
+reach it. This is what our mute imitates.
+- [ ] The other two log `peer suspected down` within about 1.5 s and keep serving.
+- [ ] No request `failed`; requests the cut-off node was handling come back after one retry (about 2 to 2.5 s).
+- [ ] After the cable is back, the others log `peer alive again` within a few seconds.
+  **If it takes much longer** (tens of seconds or minutes), a dead connection is lingering:
+  tell P1 (fix: a keep-alive setting on the connections).
+- [ ] The node does not win elections until P3's rejoin rule passes.
+
+**B. PC switched off (power cable out, or `sudo poweroff -f`), then booted again.** The node
+loses everything in memory.
+- [ ] The other two log `peer suspected down` within about 1.5 s and keep serving.
+- [ ] No request `failed` (same as A).
+- [ ] After the boot, start the node with the same command and run ID; the others log
+  `peer alive again`.
+- [ ] The node reloads the shared state before taking work (P3's rejoin rule with P5's
+  reload call): it must not assign a resource that is already assigned.
+- [ ] P6: failover time comes from the other nodes' `PEER_DOWN` rows and the client CSV,
+  because the switched-off node cannot log its own failure.
+
+**C. Shared state survives one PC switched off (P5, before Nov 1 if possible).** A DFS only
+survives a machine failure if it is set up for it:
+- [ ] Replication keeps **2 copies** of every file on different machines (SeaweedFS keeps one
+  by default, to be confirmed; e.g. replication `001` or `010`).
+- [ ] The masters run on all 3 PCs (they need 2 of 3 up).
+- [ ] The S3 gateway (the only create-if-absent path that passed P4's spike) is reachable
+  with any one PC off, not only from one machine.
+- [ ] With one PC off: every saved plan can still be read, and P4's create-if-absent check
+  (`spike/seaweedfs/run_checks.py`) still gives exactly one winner.
+
+Until the DFS is in, each node has its own in-memory store: test B then **loses that node's
+data**, and the report must say so.
+
 ## If something fails
 
 | Symptom | Likely cause | Fix |
