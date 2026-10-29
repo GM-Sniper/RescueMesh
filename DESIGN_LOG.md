@@ -170,3 +170,39 @@ SeaweedFS is a service we use. The consistency rules are ours: how create-if-abs
 | Not run | Check d (kill masters), rejoin of masters, gateway with credentials, replication `020` | Needs a rerun once the two-winner window is understood |
 | Spike 3 (Oct 29): the double win did not recur | 0 two-winner rounds in 360 post-restart or post-mute races (30 runs; 5 s and 90 s outages, kill and suspend, offsets 0-60 s); writer-token read-back: 0 false alarms | Rate unknown; the spike-2 condition (kill during a running race) was not re-created. No hold time can be derived. Decisions unchanged. Details and open questions 13 and 14 in `docs/p4-changes.md` |
 | Spike 3: masters | 1 of 3 down: creates hang 8-25 s during election, then work. 2 of 3 down: reads of existing and never-read data work, every create hangs. Recovery 17-35 s after restart | `commit` needs a timeout; a timeout is `StateUnavailable` |
+
+### Assigned versus completed (Oct 29, from Yasmina's discussion with teammates)
+
+Code: `crates/common/src/shared_state.rs` (trait, types), `crates/node/src/store.rs` (in-memory implementation and tests). Usage: `docs/p4-changes.md` and `docs/p4-team-note.md`. Status: implemented for the in-memory store only; nothing is wired into the failure detector or the election.
+
+**The model.** Each request record has an owner node id and a status: `Assigned` (resources reserved, not yet confirmed done), `Completed`, or `Released` (the owner was declared failed, its resources were freed, the request waits for a new owner). `commit` stores the plan as `Assigned` with the executing node as owner. A commit over a `Released` record atomically moves it to `Assigned` with the new owner, and exactly one concurrent committer wins; `AlreadyCommitted` applies only to `Assigned` or `Completed`. A returning node forgets all in-flight work and re-reads state from shared state; it never resumes anything.
+
+| # | Decision | Alternatives | Why |
+|---|---|---|---|
+| 1 | **No special "late owner" handling.** A node that returns and tries `mark_completed` is checked against the record: if the record is `Released` or owned by another node, the call is rejected (`NotCurrentOwner`) and nothing changes | Let the returned node finish and overwrite the record | Overwriting could clobber the new owner's work. One conditional check handles every case |
+| 2 | **The node elected to handle a failed peer's cleanup releases that peer's requests**, using `release_unfinished_requests_of_failed_node`. The release stays conditional anyway | Every survivor releases independently | One cleaner avoids duplicate work. Independent release would need conflict handling for no benefit. The condition is a safety net: the election can briefly give two winners after a restart (spike 2 findings), and then a second release finds `AlreadyReleased` and does nothing |
+| 3 | **A new election picks the new executor of a released request.** The cleaning node does not run it itself | Wait only for the client's retry; survivors re-run it directly | See open question A below |
+| 4 | **This reverses the Oct 23 decision that cut server-side takeover.** P3 and P1 must review it. The professor's note that fault tolerance is client-side may conflict with it (UNVERIFIED: I did not see the note) | Keep takeover out and rely on client retries | Yasmina's decision after discussion with teammates; recorded here so the reversal is visible |
+| 5 | **Leases as a backstop for late failure detection: undecided** | Not adding leases; adding a lease expiry to each `Assigned` record | See open question B below |
+| 6 | `commit` takes the owner: `commit(request_id, owner_node_id, incident, plan)`. This changes the signature locked on Oct 29 (`commit(request_id, incident, plan)`) by one parameter | The store is built with its node id; the record's owner is looked up later | The owner must be stored with the record, and an explicit argument is clearer than hidden state in a store that, with a DFS backend, is shared by all nodes. Only `handle_submit` in `service.rs` needed the extra argument (`state.id`) |
+| 7 | `lookup_request` returns `None` for a `Released` record | Return the old plan | A released request needs a fresh plan from its next owner; handing the old plan to a retry would reply with resources that were freed |
+| 8 | `mark_completed` sets the incident `Resolved` and **keeps the resources reserved**; `release` sets the incident back to `Open` and frees the resources | Free the resources on completion | The task only defined freeing on release. Open question C |
+| 9 | Every new outcome enum has its own variants (`NotCurrentOwner`, `AlreadyCompleted`, `NotFound`, `AlreadyReleased`, `StateUnavailable`) | Booleans or errors | Same reason as `CommitOutcome`: each case needs different caller behavior |
+
+**Open questions.**
+- **A. What triggers the new election for a released request** (the cleaning node after releasing, or the client's retry)? For P3 and P1 to settle. Until then a released request is picked up only when a client retries it with the same `request_id`, because `lookup_request` returns `None` and the retry is planned afresh.
+- **B. Leases.** Detection takes at least the failure detector's 1.5 s (UNVERIFIED: figure taken from the task text, not re-checked in `failure_detector.rs`), so for that long a failed node's reservations look alive. A lease would let any node treat an `Assigned` record as expired after a fixed time. Not built.
+- **C. Should completion free the reserved resources?** Today they stay assigned forever after `mark_completed` (as the old store did). If resources are reusable, `mark_completed` must free them. Needs P2/Yasmina.
+- **D. Release is atomic here but not on S3** (see the mapping below): resources are separate objects from the record.
+
+**How each transition maps to a conditional S3 write (documented, NOT built; all UNVERIFIED as a whole design).** Spike 1-3 showed `If-None-Match: *` and `If-Match: <etag>` on `PUT` through the S3 gateway giving exactly one winner (12 of 12 rounds each in spike 2), with the one unexplained double win after a filer restart (spike 2).
+
+| Transition | S3 operations |
+|---|---|
+| commit (new request) | `PUT record` with `If-None-Match: *`. `412` means the record exists: read it, and if `Assigned` or `Completed` return `AlreadyCommitted(plan)` |
+| commit over `Released` | `GET record` (note its etag), check `Released`, then `PUT record` with `If-Match: <etag>` and the new owner and `Assigned`. `412` means someone else won the move: `AlreadyCommitted` |
+| `mark_completed` | `GET record`, check `Assigned` and owner, `PUT record` with `If-Match: <etag>` and `Completed`. `412` means the record changed: read again to produce `NotCurrentOwner` or `AlreadyCompleted` |
+| `release_unfinished_request` | `GET record`, check `Assigned` and the expected owner, `PUT record` with `If-Match: <etag>` and `Released`; then delete or overwrite the reservation objects for the plan's resources. A second call finds `Released` and stops |
+| `list_unfinished_requests_owned_by` | List the record objects and read each (or keep a per-owner index object). Cost not measured |
+
+The weak point is the release: the record and the reservations are different objects, and S3 has no multi-object transaction. If the cleaner dies after writing `Released` and before freeing the resources, the resources stay reserved while the record says `Released`. A rerun of the cleaner would then need to free resources for an `AlreadyReleased` record too (the in-memory store does not need that). Open question D.

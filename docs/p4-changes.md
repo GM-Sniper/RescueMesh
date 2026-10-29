@@ -39,7 +39,7 @@ if let Some(plan) = state.store.lookup_request(&request_id).await? { /* reply wi
 let snapshot = state.store.snapshot().await?;
 
 // 3. Store the plan. Exactly one committer wins per request_id.
-match state.store.commit(&request_id, incident, plan.clone()).await {
+match state.store.commit(&request_id, state.id, incident, plan.clone()).await {
     CommitOutcome::Committed => { /* we did the work: reply with plan, duplicate = false */ }
     CommitOutcome::AlreadyCommitted(stored) => { /* reply with `stored`, throw ours away, duplicate = true */ }
     CommitOutcome::ResourceTaken { .. } => { /* go back to snapshot and plan again, a few times at most */ }
@@ -314,3 +314,43 @@ What the read-back can and cannot do, reasoning from the spike-2 evidence (UNVER
 |---|---|---|
 | 13 | What condition produced the spike-2 double win? | Not reproduced in 360 rounds. Untested candidates: kill mid-race; a longer outage with many races running; Windows scheduling of the restarted processes. Needs the mid-race kill experiment above before open questions 8-10 can be answered. The hold-time (open question 9, option A) is neither supported nor ruled out |
 | 14 | `commit` behavior when 1 or 2 masters are down | Creates can hang for 8-25 s (leader election) or indefinitely (no quorum). A `commit` timeout of 5 s (open question 11) turns both into `StateUnavailable`, which is the intended handling. Reads (`snapshot`, `lookup_request`) keep working with 2 masters down |
+
+
+---
+
+## Oct 29: assigned, completed, released (branch `p4/state-interface`)
+
+Decisions and alternatives: `DESIGN_LOG.md`, section "Assigned versus completed". This section says what the code does.
+
+### What changed
+
+| File | Change |
+|---|---|
+| `crates/common/src/shared_state.rs` | New types `RequestStatus` (`Assigned`, `Completed`, `Released`), `RequestRecord`, `MarkCompletedOutcome`, `ReleaseOutcome`. New trait methods `mark_completed`, `list_unfinished_requests_owned_by`, `release_unfinished_request`. New free function `release_unfinished_requests_of_failed_node`. `commit` gained an `owner_node_id` argument |
+| `crates/node/src/store.rs` | `InMemoryStore` implements all of it. The request record now holds owner, status and plan. 9 new tests (22 store tests in total) |
+| `crates/node/src/service.rs` (P1's) | One edit, only to compile: `commit(&request_id, state.id, ...)` |
+
+### Who calls what
+
+| Method | Caller | When |
+|---|---|---|
+| `commit(request_id, owner_node_id, incident, plan)` | The executing node (`handle_submit`) | After planning. Also the way a released request gets a new owner |
+| `mark_completed(request_id, node_id)` | The owner | When it has finished the work. **Not wired into `handle_submit` yet**: today a request stays `Assigned` forever. Whoever adds the execution step calls it |
+| `list_unfinished_requests_owned_by(node_id)` | The elected cleaner (usually through the convenience function) | After `node_id` is declared failed |
+| `release_unfinished_request(request_id, expected_owner)` | The elected cleaner | Once per unfinished request |
+| `release_unfinished_requests_of_failed_node(&store, node_id)` | **The node elected to handle the failed peer.** Not called by the failure detector (P5) or the election (P3): they decide when it runs | After failure detection and election |
+
+### Rules for callers
+
+- Every outcome other than the success one means **nothing changed**.
+- A returning node forgets all in-flight work and re-reads the state; it never resumes. If it later calls `mark_completed` for a request it had, `NotCurrentOwner` is the answer, and it must drop that work.
+- After `release_unfinished_requests_of_failed_node`, the released requests are not re-run by this code. See open question A in the design log.
+- `lookup_request` returns `None` for a `Released` request (it needs a new plan).
+
+### Tests
+
+`cargo test -p node store`: 22 pass. New: complete twice; wrong node completes; a failed node's requests released and their resources free (another node's request untouched); released request committed by a new node and the old owner's `mark_completed` rejected; releasing twice is a no-op; wrong expected owner changes nothing; two (six) concurrent commits on a released request give exactly one winner; a completed request is never released; a returned node's stale `mark_completed` after a release is rejected. `cargo test -p node` overall: 130 pass, 1 fails (P3's `election::tests::csv_row_counts_retries_late_bids_and_splits`, also failing on `origin/main`).
+
+### Not built
+
+Wiring into the failure detector, the election or `handle_submit`'s completion step; leases; anything on S3 (the mapping is in the design log, UNVERIFIED); resource freeing on completion (design log, open question C).
