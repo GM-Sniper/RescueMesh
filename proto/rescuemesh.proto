@@ -2,6 +2,7 @@
 // v0 (Fri Oct 16): Heartbeat only, to prove the build and gRPC work.
 // v1 (Mon Oct 19): adds Submit, domain types, Bid, Replicate, FetchLog, FaultCommand.
 // v2 (Mon Oct 26): election calls ExchangeBid and AnnounceWinner; Bid gets round and ready (P3, agreed with P1 in Q1).
+// v3 (Tue Oct 27): removes LogEntry, ApplyPlan, Replicate* and FetchLog*: shared state moved to a DFS, nodes no longer replicate.
 // Rule: every state-changing message carries request_id.
 // Rule: never change or reuse a field number once it is merged.
 syntax = "proto3";
@@ -162,48 +163,4 @@ message Coordinator {
 
 message CoordinatorAck {
   uint32 node_id = 1;     // replier's ID, like HeartbeatReply
-}
-
-// ---- Change log and replication (owner: P4) ----
-// Field numbers are wire identities: rename freely, never renumber or reuse once merged.
-
-message LogEntry {
-  uint32 source_node = 1;   // node that executed the request and created this entry
-  uint64 seq = 2;           // entry number, counted per source node: 1, 2, 3...
-                            // assigned by the source node inside the store's write lock
-  string request_id = 3;    // client Uuid, used to spot client retries
-  uint64 timestamp_ms = 4;  // source node's wall clock; informational only, never for ordering
-  oneof op {
-    ApplyPlan apply_plan = 5;
-    // Future change types (Steps B/C). Add with NEW numbers, never reuse:
-    //   ClaimLease     claim_lease     = 6;
-    //   UpdatePresence update_presence = 7;
-  }
-}
-
-// Step A's only op: "this incident arrived, this plan was decided".
-message ApplyPlan {
-  Incident incident = 1;
-  Plan plan = 2;
-}
-
-// Step B: source node pushes a new entry to a peer.
-message ReplicateRequest {
-  LogEntry entry = 1;
-}
-
-message ReplicateReply {
-  uint32 replying_node = 1;  // who is answering
-  uint32 source_node = 2;    // whose log this ack is about
-  uint64 acked_seq = 3;      // highest seq from that source the replier has applied
-}
-
-// Step C: a returning node pulls what it missed.
-message FetchLogRequest {
-  uint32 requesting_node = 1;
-  map<uint32, uint64> last_seq_by_source = 2;  // source node -> last seq I already have (= my `applied` map)
-}
-
-message FetchLogReply {
-  repeated LogEntry entries = 1;
 }

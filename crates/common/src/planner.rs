@@ -1,7 +1,26 @@
+use crate::config::PlannerConfig;
 use crate::domain::*;
 
 /// Pure planner v1: no clock, no RNG. Ties broken by lowest resource id.
+///
+/// Preserves the original API and uses the default workload configuration.
 pub fn plan(incident: &Incident, snapshot: &Snapshot, w: &Weights, now: u64) -> Plan {
+    plan_with_workload(incident, snapshot, w, now, &PlannerConfig::default())
+}
+
+/// Plans an assignment after performing configurable deterministic workload.
+///
+/// The extra work models an incident-resource matching workload. It does not
+/// change the assignment algorithm or the returned plan.
+pub fn plan_with_workload(
+    incident: &Incident,
+    snapshot: &Snapshot,
+    w: &Weights,
+    now: u64,
+    config: &PlannerConfig,
+) -> Plan {
+    simulate_workload(config);
+
     let age_min = now.saturating_sub(incident.timestamp) as f64 / 60_000.0;
     let priority = w.severity * incident.severity as f64 + w.age * age_min;
 
@@ -34,6 +53,29 @@ pub fn plan(incident: &Incident, snapshot: &Snapshot, w: &Weights, now: u64) -> 
     }
 }
 
+/// Performs deterministic CPU work proportional to:
+/// workload_incidents * workload_resources * iterations.
+fn simulate_workload(config: &PlannerConfig) {
+    let mut accumulator = 0.0_f64;
+
+    for incident_index in 0..config.workload_incidents {
+        for resource_index in 0..config.workload_resources {
+            for iteration in 0..config.iterations {
+                // Deterministic arithmetic prevents this from being just an
+                // empty loop, while keeping the result independent of randomness.
+                let value = (incident_index + 1) as f64 * (resource_index + 1) as f64
+                    / (iteration + 1) as f64;
+
+                accumulator += value.sqrt();
+            }
+        }
+    }
+
+    // Keep the computed value observable to the optimizer without affecting
+    // the plan's output.
+    std::hint::black_box(accumulator);
+}
+
 fn is_free(r: &Resource, s: &Snapshot, now: u64) -> bool {
     r.available
         && r.quantity > 0
@@ -58,6 +100,7 @@ mod tests {
             ttl_secs: 600,
         }
     }
+
     fn res(id: u64, t: ResourceType, x: u8, y: u8) -> Resource {
         Resource {
             id,
@@ -147,5 +190,41 @@ mod tests {
         };
         let p = plan(&inc(), &s, &Weights::default(), 5_000);
         assert_eq!(p.assignments[0].resource_id, 3);
+    }
+
+    #[test]
+    fn workload_planner_preserves_assignment_result() {
+        let snapshot = generate_snapshot(42, 10, 20);
+        let incident = generate_incident(7);
+        let weights = Weights::default();
+
+        let config = PlannerConfig {
+            workload_incidents: 20,
+            workload_resources: 30,
+            iterations: 2,
+        };
+
+        let original = plan(&incident, &snapshot, &weights, 1_000);
+        let with_workload = plan_with_workload(&incident, &snapshot, &weights, 1_000, &config);
+
+        assert_eq!(original, with_workload);
+    }
+
+    #[test]
+    fn workload_planner_is_deterministic() {
+        let snapshot = generate_snapshot(42, 10, 20);
+        let incident = generate_incident(7);
+        let weights = Weights::default();
+
+        let config = PlannerConfig {
+            workload_incidents: 20,
+            workload_resources: 30,
+            iterations: 2,
+        };
+
+        let first = plan_with_workload(&incident, &snapshot, &weights, 1_000, &config);
+        let second = plan_with_workload(&incident, &snapshot, &weights, 1_000, &config);
+
+        assert_eq!(first, second);
     }
 }

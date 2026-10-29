@@ -38,6 +38,11 @@ service_weight = 0.2
 queue_max = 10             # this many requests in progress = fully loaded
 service_cap_ms = 100.0     # this average time per request = fully loaded
 service_ewma_alpha = 0.2   # newest request's share of the service-time average
+# Planner workload settings (P2). Optional; defaults shown.
+[planner]
+workload_incidents = 10
+workload_resources = 20
+iterations = 1
 
 
 # Automatic fault injection (P5, Step B). Optional; off unless enabled = true.

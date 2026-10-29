@@ -84,6 +84,14 @@ impl NodeState {
         self
     }
 
+    /// Replaces this node's own store. Tests give several nodes the same one, so they
+    /// share state the way they will through the DFS.
+    #[cfg(test)]
+    pub fn with_store(mut self, store: Arc<dyn SharedState>) -> Self {
+        self.store = store;
+        self
+    }
+
     /// P3's hook: how many requests this node is working on right now.
     pub fn in_flight(&self) -> usize {
         // Relaxed: the counter is a statistic; no other data depends on its ordering.
