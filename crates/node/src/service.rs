@@ -15,10 +15,11 @@ use common::pb::{
 };
 use common::planner;
 use common::shared_state::{CommitOutcome, StateUnavailable};
+use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 
 use crate::election;
-use crate::state::NodeState;
+use crate::state::{NodeState, SubmitResult};
 
 pub struct NodeService {
     /// Shared with the background tasks (heartbeat loop, detector ticker).
@@ -65,18 +66,15 @@ impl Node for NodeService {
     }
 
     async fn submit(&self, req: Request<SubmitRequest>) -> Result<Response<SubmitReply>, Status> {
-        self.gate().await?; // before counting: held requests are not work
-        let guard = self.state.start_request(); // P3's queue counter and service time
-        let result = handle_submit(&self.state, req.into_inner()).await;
-        // Stop counting and timing before the reply gate: time held by a mute is not
-        // service time, and counting it would make the node look overloaded (and lose
-        // elections) right after it unmutes.
-        drop(guard);
-        let reply = result?;
+        self.gate().await?; // held while muted; not counted as work
+        // The work runs in its own task (it counts itself in P3's queue and service time).
+        // If the client stops waiting, only this wait ends: the work still finishes and
+        // commits, and the client's retry gets the stored plan.
+        let reply = wait_for(start_or_join(&self.state, req.into_inner())).await?;
         // Muted mid-request: drop the reply. The client retries with the same
         // request_id and gets the stored plan (duplicate = true).
         self.gate().await?;
-        Ok(reply)
+        Ok(Response::new(reply))
     }
 
     async fn inject_fault(&self, req: Request<FaultCommand>) -> Result<Response<FaultAck>, Status> {
@@ -96,18 +94,12 @@ impl Node for NodeService {
         // First we hear of this request (the client's copy is late or lost), or the peer
         // moved us to a newer round: run Submit for it too. Otherwise, with the lowest
         // bid, we would be everyone's winner but never plan. The reply has no client
-        // to go to; a client retry finds the committed plan.
+        // to go to; a client retry finds the committed plan. If the client's copy is already
+        // being worked on here, this joins that work instead of planning a second time.
         if let Some(request) = request
             && (before.is_none() || round_of(&request.request_id) > before)
         {
-            let state = self.state.clone();
-            tokio::spawn(async move {
-                let _guard = state.start_request(); // real work: it counts in our load
-                let id = request.request_id.clone();
-                if let Err(status) = handle_submit(&state, request).await {
-                    tracing::debug!(request_id = %id, %status, "submit started by a bid failed");
-                }
-            });
+            start_or_join(&self.state, request); // nobody waits for this result
         }
         self.gate().await?; // muted meanwhile: the reply never leaves
         Ok(Response::new(reply))
@@ -122,6 +114,59 @@ impl Node for NodeService {
         let ack = election::handle_announce_winner(&self.state, req.into_inner())?;
         self.gate().await?; // muted meanwhile: the reply never leaves
         Ok(Response::new(ack))
+    }
+}
+
+/// Starts the Submit work for `req` in its own task, or joins the work already running
+/// for the same request_id. Returns where the result will arrive.
+///
+/// Own task (Step C, found in the slow-request case): work run inside the client's call
+/// is dropped when the client stops waiting, so a plan slower than the client's deadline
+/// was never committed, and every retry started it again. The table makes a retry, or a
+/// peer's bid, wait for the work already running instead of planning twice.
+fn start_or_join(state: &Arc<NodeState>, req: SubmitRequest) -> watch::Receiver<Option<SubmitResult>> {
+    let mut running = state.in_progress.lock().unwrap();
+    if let Some(result) = running.get(&req.request_id) {
+        return result.clone(); // already being worked on: wait for that
+    }
+    let (send, result) = watch::channel(None);
+    running.insert(req.request_id.clone(), result.clone());
+    drop(running); // unlock before starting the task
+    let state = state.clone();
+    tokio::spawn(async move {
+        // Leaves the table however the task ends (result, error or panic), so no
+        // request_id can be stuck "in progress" with nobody working on it.
+        let _entry = InProgressEntry { state: &state, request_id: req.request_id.clone() };
+        let request_id = req.request_id.clone();
+        let counted = state.start_request(); // real work: counts in our load (P3)
+        let outcome = handle_submit(&state, req).await.map(Response::into_inner);
+        drop(counted); // stop counting before anyone sees the result
+        if let Err(status) = &outcome {
+            tracing::debug!(%request_id, %status, "submit failed");
+        }
+        let _ = send.send(Some(outcome)); // an error here only means nobody is waiting any more
+    });
+    result
+}
+
+/// Waits for the result `start_or_join` promised.
+async fn wait_for(mut result: watch::Receiver<Option<SubmitResult>>) -> SubmitResult {
+    match result.wait_for(Option::is_some).await {
+        Ok(done) => done.clone().expect("wait_for only returns once there is a result"),
+        // The task ended without sending: it panicked.
+        Err(_) => Err(Status::internal("submit stopped without a result")),
+    }
+}
+
+/// Removes a request from `in_progress` when dropped.
+struct InProgressEntry<'a> {
+    state: &'a NodeState,
+    request_id: String,
+}
+
+impl Drop for InProgressEntry<'_> {
+    fn drop(&mut self) {
+        self.state.in_progress.lock().unwrap().remove(&self.request_id);
     }
 }
 
@@ -473,6 +518,75 @@ mod tests {
             from_node: 2,
             seq: 1,
         })
+    }
+
+    // ---- Step C: Submit runs in its own task (found in the slow-request case).
+
+    /// One node whose plans take a while (P2's workload knob), so a caller can give up mid-plan.
+    fn slow_service() -> NodeService {
+        let cfg = ClusterConfig::parse(
+            "[[nodes]]
+id = 1
+addr = \"127.0.0.1:50051\"
+[planner]
+iterations = 20000
+",
+        )
+        .unwrap();
+        let peers = Peers::new(&cfg, 1).unwrap();
+        NodeService::new(Arc::new(NodeState::new(1, cfg, peers)))
+    }
+
+    /// Waits (up to 10 s) until no Submit is in progress on this node.
+    async fn wait_until_idle(svc: &NodeService) {
+        for _ in 0..1000 {
+            if svc.state.in_progress.lock().unwrap().is_empty() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("a request stayed in progress");
+    }
+
+    #[tokio::test]
+    async fn slow_plan_is_saved_even_if_the_caller_stops_waiting() {
+        let svc = slow_service();
+        // The caller gives up mid-plan, like a client whose attempt deadline passed.
+        let gave_up = tokio::time::timeout(Duration::from_millis(20), svc.submit(submit_req("s1", 1))).await;
+        assert!(gave_up.is_err(), "the plan should take longer than 20 ms");
+        // Before the fix, the plan was dropped here and never committed.
+        wait_until_idle(&svc).await;
+        let stored = svc.state.store.lookup_request("s1").await.unwrap().expect("plan was committed");
+        // The retry gets that plan at once.
+        let retry = svc.submit(submit_req("s1", 1)).await.unwrap().into_inner();
+        assert!(retry.duplicate);
+        assert_eq!(retry.plan, Some(plan_to_pb(&stored)));
+        assert_eq!(svc.state.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn same_request_arriving_twice_at_once_is_planned_once() {
+        let svc = slow_service();
+        // E.g. the client's copy and a peer's bid, or a retry while the first plan runs.
+        let (a, b) = tokio::join!(svc.submit(submit_req("s2", 2)), svc.submit(submit_req("s2", 2)));
+        let (a, b) = (a.unwrap().into_inner(), b.unwrap().into_inner());
+        // One piece of work, one result for both. Planning twice would make the
+        // second commit fail and come back as a duplicate.
+        assert_eq!(a, b);
+        assert!(!a.duplicate, "planned only once");
+    }
+
+    #[tokio::test]
+    async fn finished_requests_leave_the_in_progress_table() {
+        let svc = service();
+        svc.submit(submit_req("s3", 3)).await.unwrap();
+        let mut bad = submit_req("s4", 4).into_inner();
+        if let Some(submit_request::Kind::Incident(incident)) = bad.kind.as_mut() {
+            incident.severity = 99; // rejected by P2's checks
+        }
+        assert!(svc.submit(Request::new(bad)).await.is_err());
+        wait_until_idle(&svc).await; // an error must not leave the request stuck "in progress"
+        assert_eq!(svc.state.in_flight(), 0);
     }
 
     #[tokio::test(start_paused = true)]
