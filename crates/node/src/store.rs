@@ -7,7 +7,7 @@
 //!
 //! The old change log, `applied` map, `entries_since` and replication path were removed when
 //! the design moved to a DFS. Three ideas were kept:
-//! - `request_id` is the dedup key (`plans_by_request`).
+//! - `request_id` is the dedup key (`records_by_request`).
 //! - No clocks decide anything.
 //! - `commit` re-checks inside the write lock that every planned resource is still free,
 //!   because `snapshot()` returns a copy that may be stale.
@@ -21,7 +21,11 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use async_trait::async_trait;
 use common::domain::*;
 use common::generators::generate_snapshot;
-use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
+use common::NodeId;
+use common::shared_state::{
+    CommitOutcome, MarkCompletedOutcome, ReleaseOutcome, RequestRecord, RequestStatus, SharedState,
+    StateUnavailable,
+};
 
 // TODO(P4): remove once clients can offer resources; make configurable only if experiments
 // need a different resource count.
@@ -35,14 +39,16 @@ struct Contents {
     resources: BTreeMap<ResourceId, Resource>,
     /// Keyed by resource id: a resource has at most one assignment.
     assignments: BTreeMap<ResourceId, Assignment>,
-    /// The one stored plan per client request. This is the create-if-absent record.
-    plans_by_request: HashMap<String, Plan>,
+    /// The one stored record per client request: the create-if-absent record, with its owner
+    /// and status (`Assigned`, `Completed`, `Released`).
+    records_by_request: HashMap<String, RequestRecord>,
 }
 
 /// Shared state kept in this process's memory. Implements [`SharedState`].
 ///
-/// Why one `RwLock` around everything: `commit` must check and write several maps as one
-/// atomic step, and a single lock is the simplest way to guarantee that.
+/// Why one `RwLock` around everything: `commit`, `mark_completed` and `release_unfinished_request`
+/// must check and write several maps as one atomic step, and a single lock is the simplest way
+/// to guarantee that.
 pub struct InMemoryStore {
     contents: RwLock<Contents>,
 }
@@ -88,13 +94,24 @@ impl SharedState for InMemoryStore {
         })
     }
 
-    async fn commit(&self, request_id: &str, mut incident: Incident, plan: Plan) -> CommitOutcome {
+    async fn commit(
+        &self,
+        request_id: &str,
+        owner_node_id: NodeId,
+        mut incident: Incident,
+        plan: Plan,
+    ) -> CommitOutcome {
         let mut contents = self.write();
 
         // Create-if-absent: two retries of one request can both get past `lookup_request`,
-        // so the check must be repeated here, inside the lock.
-        if let Some(existing) = contents.plans_by_request.get(request_id) {
-            return CommitOutcome::AlreadyCommitted(existing.clone());
+        // so the check must be repeated here, inside the lock. A `Released` record does not
+        // block the commit: it is waiting for a new owner, and this call becomes that owner.
+        // Because the check and the write share one lock, exactly one concurrent committer
+        // sees `Released`; the others then see `Assigned` and get `AlreadyCommitted`.
+        if let Some(existing) = contents.records_by_request.get(request_id) {
+            if existing.status != RequestStatus::Released {
+                return CommitOutcome::AlreadyCommitted(existing.plan.clone());
+            }
         }
 
         // Every planned resource must exist, be unassigned, and appear only once in the plan.
@@ -126,12 +143,114 @@ impl SharedState for InMemoryStore {
                 .insert(assignment.resource_id, assignment.clone());
         }
         contents.incidents.insert(incident.id, incident);
-        contents.plans_by_request.insert(request_id.to_string(), plan);
+        contents.records_by_request.insert(
+            request_id.to_string(),
+            RequestRecord {
+                request_id: request_id.to_string(),
+                owner_node_id,
+                status: RequestStatus::Assigned,
+                plan,
+            },
+        );
         CommitOutcome::Committed
     }
 
+    async fn mark_completed(&self, request_id: &str, node_id: NodeId) -> MarkCompletedOutcome {
+        let mut contents = self.write();
+        let Some(record) = contents.records_by_request.get(request_id) else {
+            return MarkCompletedOutcome::NotFound;
+        };
+        match (record.status, record.owner_node_id == node_id) {
+            (RequestStatus::Completed, _) => return MarkCompletedOutcome::AlreadyCompleted,
+            (RequestStatus::Assigned, true) => {}
+            (status, _) => {
+                return MarkCompletedOutcome::NotCurrentOwner {
+                    current_status: status,
+                    current_owner_node_id: record.owner_node_id,
+                };
+            }
+        }
+        let incident_id = record.plan.incident_id;
+        contents
+            .records_by_request
+            .get_mut(request_id)
+            .expect("record was found above under the same lock")
+            .status = RequestStatus::Completed;
+        // The reserved resources stay assigned after completion (see open question in
+        // docs/p4-changes.md); only the incident moves on.
+        if let Some(incident) = contents.incidents.get_mut(&incident_id) {
+            incident.status = IncidentStatus::Resolved;
+        }
+        MarkCompletedOutcome::Completed
+    }
+
+    async fn list_unfinished_requests_owned_by(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<RequestRecord>, StateUnavailable> {
+        let contents = self.read();
+        let mut unfinished: Vec<RequestRecord> = contents
+            .records_by_request
+            .values()
+            .filter(|r| r.owner_node_id == node_id && r.status == RequestStatus::Assigned)
+            .cloned()
+            .collect();
+        unfinished.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        Ok(unfinished)
+    }
+
+    async fn release_unfinished_request(
+        &self,
+        request_id: &str,
+        expected_owner_node_id: NodeId,
+    ) -> ReleaseOutcome {
+        let mut contents = self.write();
+        let Some(record) = contents.records_by_request.get(request_id) else {
+            return ReleaseOutcome::NotFound;
+        };
+        let owner_matches = record.owner_node_id == expected_owner_node_id;
+        match (record.status, owner_matches) {
+            (RequestStatus::Completed, _) => return ReleaseOutcome::AlreadyCompleted,
+            (RequestStatus::Released, true) => return ReleaseOutcome::AlreadyReleased,
+            (RequestStatus::Assigned, true) => {}
+            (status, _) => {
+                return ReleaseOutcome::NotCurrentOwner {
+                    current_status: status,
+                    current_owner_node_id: record.owner_node_id,
+                };
+            }
+        }
+        let incident_id = record.plan.incident_id;
+        let reserved: Vec<ResourceId> = record.plan.assignments.iter().map(|a| a.resource_id).collect();
+        // Only remove an assignment that still belongs to this request's incident, so a
+        // resource that somehow belongs to another incident is never freed by mistake.
+        for resource_id in reserved {
+            if contents
+                .assignments
+                .get(&resource_id)
+                .is_some_and(|a| a.incident_id == incident_id)
+            {
+                contents.assignments.remove(&resource_id);
+            }
+        }
+        if let Some(incident) = contents.incidents.get_mut(&incident_id) {
+            incident.status = IncidentStatus::Open;
+        }
+        contents
+            .records_by_request
+            .get_mut(request_id)
+            .expect("record was found above under the same lock")
+            .status = RequestStatus::Released;
+        ReleaseOutcome::Released
+    }
+
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable> {
-        Ok(self.read().plans_by_request.get(request_id).cloned())
+        Ok(self
+            .read()
+            .records_by_request
+            .get(request_id)
+            .filter(|r| r.status != RequestStatus::Released)
+            .map(|r| r.plan.clone()))
     }
 }
 
@@ -194,6 +313,7 @@ mod tests {
         store
             .commit(
                 request_id,
+                1,
                 incident(incident_id),
                 plan_assigning(incident_id, resource_ids),
             )

@@ -155,7 +155,7 @@ async fn handle_submit(
         .await
         .map_err(|e| Status::internal(format!("planner failed: {e}")))?;
 
-        match state.store.commit(&request_id, incident.clone(), plan.clone()).await {
+        match state.store.commit(&request_id, state.id, incident.clone(), plan.clone()).await {
             CommitOutcome::Committed => {
                 tracing::debug!(
                     %request_id,
