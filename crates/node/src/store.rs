@@ -484,4 +484,184 @@ mod tests {
         assert_eq!(resource_ids, [1, 2, 3, 4]);
         assert_eq!(assigned_ids, [1, 3, 4]);
     }
+
+    // ---- assigned / completed / released lifecycle ----
+
+    use common::shared_state::release_unfinished_requests_of_failed_node;
+
+    async fn commit_as(
+        store: &InMemoryStore,
+        owner: NodeId,
+        request_id: &str,
+        incident_id: u64,
+        resource_ids: &[u64],
+    ) -> CommitOutcome {
+        store
+            .commit(
+                request_id,
+                owner,
+                incident(incident_id),
+                plan_assigning(incident_id, resource_ids),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn completing_a_request_twice_returns_already_completed_the_second_time() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        assert_eq!(store.mark_completed("r1", 1).await, MarkCompletedOutcome::Completed);
+        assert_eq!(store.mark_completed("r1", 1).await, MarkCompletedOutcome::AlreadyCompleted);
+        assert_eq!(
+            store.snapshot().await.unwrap().incidents[0].status,
+            IncidentStatus::Resolved
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_completed_by_the_wrong_node_is_rejected_and_changes_nothing() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        assert_eq!(
+            store.mark_completed("r1", 2).await,
+            MarkCompletedOutcome::NotCurrentOwner {
+                current_status: RequestStatus::Assigned,
+                current_owner_node_id: 1
+            }
+        );
+        assert_eq!(store.mark_completed("missing", 1).await, MarkCompletedOutcome::NotFound);
+        // Still Assigned to node 1, so node 1 can complete it.
+        assert_eq!(store.mark_completed("r1", 1).await, MarkCompletedOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_failed_nodes_requests_are_released_and_their_resources_become_free() {
+        let store = store_with_resources(4);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        commit_as(&store, 1, "r2", 11, &[2]).await;
+        commit_as(&store, 2, "r3", 12, &[3]).await; // another node's request: must be untouched
+
+        let unfinished = store.list_unfinished_requests_owned_by(1).await.unwrap();
+        let ids: Vec<_> = unfinished.iter().map(|r| r.request_id.as_str()).collect();
+        assert_eq!(ids, ["r1", "r2"]);
+
+        let outcomes = release_unfinished_requests_of_failed_node(&store, 1).await.unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("r1".to_string(), ReleaseOutcome::Released),
+                ("r2".to_string(), ReleaseOutcome::Released)
+            ]
+        );
+        let snapshot = store.snapshot().await.unwrap();
+        let assigned: Vec<_> = snapshot.assignments.iter().map(|a| a.resource_id).collect();
+        assert_eq!(assigned, [3], "only node 2's resource is still reserved");
+        assert!(store.list_unfinished_requests_owned_by(1).await.unwrap().is_empty());
+        assert_eq!(store.lookup_request("r1").await.unwrap(), None, "released: a retry plans afresh");
+        // The freed resource can be taken by someone else at once.
+        assert_eq!(commit_as(&store, 2, "r4", 13, &[1]).await, CommitOutcome::Committed);
+    }
+
+    #[tokio::test]
+    async fn a_released_request_committed_by_a_new_node_rejects_the_old_owners_mark_completed() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        store.release_unfinished_request("r1", 1).await;
+
+        assert_eq!(commit_as(&store, 2, "r1", 10, &[2]).await, CommitOutcome::Committed);
+        assert_eq!(
+            store.mark_completed("r1", 1).await,
+            MarkCompletedOutcome::NotCurrentOwner {
+                current_status: RequestStatus::Assigned,
+                current_owner_node_id: 2
+            }
+        );
+        assert_eq!(store.mark_completed("r1", 2).await, MarkCompletedOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn releasing_the_same_request_twice_is_a_no_op() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        assert_eq!(store.release_unfinished_request("r1", 1).await, ReleaseOutcome::Released);
+        let after_first = store.snapshot().await.unwrap();
+        assert_eq!(store.release_unfinished_request("r1", 1).await, ReleaseOutcome::AlreadyReleased);
+        assert_eq!(store.snapshot().await.unwrap(), after_first);
+        assert_eq!(store.release_unfinished_request("missing", 1).await, ReleaseOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_release_naming_the_wrong_owner_changes_nothing() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        let before = store.snapshot().await.unwrap();
+        assert_eq!(
+            store.release_unfinished_request("r1", 2).await,
+            ReleaseOutcome::NotCurrentOwner {
+                current_status: RequestStatus::Assigned,
+                current_owner_node_id: 1
+            }
+        );
+        assert_eq!(store.snapshot().await.unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_commits_on_a_released_request_give_exactly_one_winner() {
+        let store = Arc::new(store_with_resources(8));
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        store.release_unfinished_request("r1", 1).await;
+
+        let tasks: Vec<_> = (2..=7u64)
+            .map(|new_owner| {
+                let store = store.clone();
+                // Each contender plans a different free resource, as separate nodes would.
+                tokio::spawn(async move { commit_as(&store, new_owner as NodeId, "r1", 10, &[new_owner]).await })
+            })
+            .collect();
+        let mut committed = 0;
+        let mut already_committed = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                CommitOutcome::Committed => committed += 1,
+                CommitOutcome::AlreadyCommitted(_) => already_committed += 1,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!((committed, already_committed), (1, 5));
+        assert_eq!(store.snapshot().await.unwrap().assignments.len(), 1, "one reservation only");
+    }
+
+    #[tokio::test]
+    async fn a_completed_request_is_never_released() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        store.mark_completed("r1", 1).await;
+        assert_eq!(store.release_unfinished_request("r1", 1).await, ReleaseOutcome::AlreadyCompleted);
+        assert!(store.list_unfinished_requests_owned_by(1).await.unwrap().is_empty());
+        assert_eq!(store.snapshot().await.unwrap().assignments.len(), 1);
+        // And committing over a Completed record is AlreadyCommitted, not a re-assignment.
+        assert!(matches!(
+            commit_as(&store, 2, "r1", 10, &[2]).await,
+            CommitOutcome::AlreadyCommitted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_returned_nodes_stale_mark_completed_after_a_release_is_rejected() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        // Node 1 is declared failed and its request released; it then comes back and still
+        // believes it owns the request.
+        store.release_unfinished_request("r1", 1).await;
+        assert_eq!(
+            store.mark_completed("r1", 1).await,
+            MarkCompletedOutcome::NotCurrentOwner {
+                current_status: RequestStatus::Released,
+                current_owner_node_id: 1
+            }
+        );
+        // Nothing changed: the request is still waiting for a new owner.
+        assert_eq!(store.lookup_request("r1").await.unwrap(), None);
+        assert!(store.snapshot().await.unwrap().assignments.is_empty());
+    }
 }
