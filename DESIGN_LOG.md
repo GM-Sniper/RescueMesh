@@ -94,7 +94,7 @@ P3's Q4: keep the plan from the lower origin `node_id`. Step A: **first applied 
 
 ## P4: Shared state in a distributed file system (DRAFT, for Yasmina to edit)
 
-Code and usage: `crates/common/src/shared_state.rs`, `docs/p4-changes.md`. Replaces the section "P4: Store and Change Log" above. Status as of Oct 23: **SeaweedFS is the chosen candidate, pending the spike. The spike has run; its result changes how SeaweedFS can be used (see the last table).**
+Code and usage: `crates/common/src/shared_state.rs`, `docs/p4-changes.md`. Replaces the section "P4: Store and Change Log" above. Status as of Oct 29: **SeaweedFS is chosen, and the four decisions in "Locked decisions" below were recorded on Oct 29 from Yasmina's written instructions. The Oct 23 spike result (last table) is what led to decision 1.** This section is still a DRAFT for Yasmina to edit.
 
 ### What changed and what stayed
 
@@ -114,9 +114,18 @@ On Oct 21 the design changed: shared state lives in an existing distributed file
 | The interface is an `async` trait whose methods can fail | A synchronous, infallible trait (simplest for the in-memory store) | A DFS write is a network call and can fail. A synchronous trait now would make P1, P3 and P6 rewrite every call site later |
 | `#[async_trait]` (boxed futures) | Native `async fn` in traits | Nodes hold `Arc<dyn SharedState>` so the backend is chosen at start-up. Native async fn in traits cannot be used behind `dyn` |
 | `commit` returns an enum with four cases: `Committed`, `AlreadyCommitted(plan)`, `ResourceTaken`, `StateUnavailable` | `Result<Plan, Error>`; separate calls for "create" and "check" | Each case needs different caller behavior, and an enum makes the compiler force every caller to handle all four. A separate check-then-create has a gap in which two nodes both pass the check |
-| `commit(request_id, incident, plan)`: the incident is a parameter | `commit(request_id, plan)` as first specified | A `Plan` holds only an incident id, and the stored state needs the incident (as `Open` when the plan is empty). Open question 1 in `docs/p4-changes.md` |
-| An unknown resource is reported as `ResourceTaken` | A fifth variant for "unknown resource" | The spec had four variants and the caller's cure is the same (snapshot, plan again). Open question 2 |
+| `commit(request_id, incident, plan)`: the incident is a parameter | `commit(request_id, plan)` as first specified | Locked decision 2 below |
+| An unknown resource is its own outcome, `UnknownResource` | Folding it into `ResourceTaken` (what the first version did) | Locked decision 3 below |
 | In-memory store stays behind the trait for now | Wait for the DFS backend before landing the interface | The interface unblocks P1, P2, P3 and P6 today. Each node's in-memory copy is NOT shared, so no cross-node guarantee exists until the DFS backend does |
+
+### Locked decisions (Oct 29)
+
+| # | Decision | Alternatives | Why |
+|---|---|---|---|
+| 1 | Create-if-absent goes through the SeaweedFS **S3 gateway** with `If-None-Match: *` | The filer's gRPC exclusive-create (`o_excl`): untested, needs the SeaweedFS `.proto` files wired into Rust, **kept as the fallback**. Plain filer HTTP PUT: failed (the header is ignored, last writer wins). Other DFSs: see the table below | It is the only route that passed our race tests (Oct 23 spike, see the table at the end) |
+| 2 | `commit(request_id, incident, plan)` | Embed the incident in `Plan` | The stored state needs the incident, and passing it explicitly is clearer than a hidden lookup. Embedding it would change P2's `Plan` type and hide data inside it |
+| 3 | `CommitOutcome` has a separate `UnknownResource { resource_id }` variant | Fold it into `ResourceTaken` (the first version did) | `ResourceTaken` means "take a fresh snapshot and retry", an ordinary race. An unknown resource cannot be fixed by retrying, so it must not look the same, or a caller would loop on a bug. Landed as its own commit (`Add UnknownResource to CommitOutcome`); `handle_submit` in `service.rs` was the only `match` that needed a new arm |
+| 4 | **Rejoin readiness (placeholder, P4 may refine):** a returning node is ready when (a) its S3 gateway is reachable, (b) it has read the resource listing once, and (c) it has passed one heartbeat round | Replaying a log or copying a snapshot (the old design) | State lives in the DFS, so there is nothing to replay. The three conditions check that the node can reach the state, can read it, and is seen by its peers. Not implemented yet; see open question 8 in `docs/p4-changes.md` |
 
 ### Report note (ready to paste)
 
@@ -129,7 +138,8 @@ SeaweedFS is a service we use. The consistency rules are ours: how create-if-abs
 | **Our own thin replication layer** with a file API | It is the replication we already had (a log and sync between nodes), plus the work of defining a file protocol. It moves the same problem rather than removing it |
 | **GlusterFS, Ceph, Lustre, BeeGFS** | Linux-only or too heavy to install and run on the team's mixed lab machines. Platform support: UNVERIFIED for each, not checked in detail |
 | **Windows DFS Replication** | Windows Server only, multi-master, and no atomic create-if-absent |
-| **JuiceFS** | Keeps its metadata in a separate database (Redis, MySQL and similar), which centralizes the state |
+| **JuiceFS** | Mainly setup cost: it needs three pieces (the file system client, a metadata database, and an object store) to install and run on every lab machine. Corrected Oct 29: the earlier reason, "metadata is centralized", is too strong, because the metadata database can itself be replicated (UNVERIFIED: JuiceFS's supported metadata engines and their replication were not checked) |
+| **HDFS** | Central NameNode; high availability needs a standby NameNode plus JournalNodes plus ZooKeeper; files are write-once (no in-place update); a Linux and Java stack with poor Windows support; small records (ours are under 1 KB) are a poor fit. All of these points are UNVERIFIED: none was checked against HDFS documentation or tried |
 | **XtreemFS** | Server runs only on Linux and Solaris. Maintenance status: UNVERIFIED |
 | **etcd, ZooKeeper** | Strong atomic operations, but they are coordination stores, not file systems |
 | **NFS** | One central server |
