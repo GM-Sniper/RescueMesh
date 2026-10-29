@@ -10,14 +10,15 @@ use common::conversions::{incident_from_pb, plan_to_pb};
 use common::domain::Plan;
 use common::pb::node_server::Node;
 use common::pb::{
-    FaultAck, FaultCommand, HeartbeatReply, HeartbeatRequest, SubmitReply, SubmitRequest,
-    submit_request,
+    Bid, BidRequest, Coordinator, CoordinatorAck, FaultAck, FaultCommand, HeartbeatReply,
+    HeartbeatRequest, SubmitReply, SubmitRequest, submit_request,
 };
 use common::planner;
+use common::shared_state::{CommitOutcome, StateUnavailable};
 use tonic::{Request, Response, Status};
 
+use crate::election;
 use crate::state::NodeState;
-use crate::store::ApplyError;
 
 pub struct NodeService {
     /// Shared with the background tasks (heartbeat loop, detector ticker).
@@ -83,6 +84,45 @@ impl Node for NodeService {
         // No gate before replying: this handler mutes the node itself and must still ack.
         handle_inject_fault(&self.state, req.into_inner()).await
     }
+
+    // P3: a peer's bid for one request; the reply carries ours (see election.rs).
+    async fn exchange_bid(&self, req: Request<BidRequest>) -> Result<Response<Bid>, Status> {
+        self.gate().await?;
+        let call = req.into_inner();
+        let request = call.request.clone();
+        let round_of = |id: &str| self.state.election.lock().unwrap().round(id);
+        let before = request.as_ref().and_then(|r| round_of(&r.request_id));
+        let reply = election::handle_exchange_bid(&self.state, call)?;
+        // First we hear of this request (the client's copy is late or lost), or the peer
+        // moved us to a newer round: run Submit for it too. Otherwise, with the lowest
+        // bid, we would be everyone's winner but never plan. The reply has no client
+        // to go to; a client retry finds the committed plan.
+        if let Some(request) = request
+            && (before.is_none() || round_of(&request.request_id) > before)
+        {
+            let state = self.state.clone();
+            tokio::spawn(async move {
+                let _guard = state.start_request(); // real work: it counts in our load
+                let id = request.request_id.clone();
+                if let Err(status) = handle_submit(&state, request).await {
+                    tracing::debug!(request_id = %id, %status, "submit started by a bid failed");
+                }
+            });
+        }
+        self.gate().await?; // muted meanwhile: the reply never leaves
+        Ok(Response::new(reply))
+    }
+
+    // P3: a peer announces it won an election; we check it against ours (see election.rs).
+    async fn announce_winner(
+        &self,
+        req: Request<Coordinator>,
+    ) -> Result<Response<CoordinatorAck>, Status> {
+        self.gate().await?;
+        let ack = election::handle_announce_winner(&self.state, req.into_inner())?;
+        self.gate().await?; // muted meanwhile: the reply never leaves
+        Ok(Response::new(ack))
+    }
 }
 
 /// How many times to plan again when another request takes a planned resource
@@ -90,17 +130,18 @@ impl Node for NodeService {
 const MAX_PLAN_ATTEMPTS: usize = 3;
 
 /// Task 7: one client request, in the order from P4's notes (docs/p4-changes.md):
-/// lookup_request -> incident_from_pb -> snapshot -> plan -> try_apply -> reply.
+/// lookup_request -> incident_from_pb -> election -> snapshot -> plan -> commit -> reply.
 async fn handle_submit(
-    state: &NodeState,
+    state: &Arc<NodeState>, // Arc: the election and the win announcement keep their own handle
     req: SubmitRequest,
 ) -> Result<Response<SubmitReply>, Status> {
     // 1. Every request needs its ID (idempotency) and an incident (the only kind in Step A).
-    let request_id = req.request_id;
+    let request_id = req.request_id.clone();
     if request_id.is_empty() {
         return Err(Status::invalid_argument("request_id is empty"));
     }
-    let Some(submit_request::Kind::Incident(incident)) = req.kind else {
+    // Cloned, not moved: the election sends the whole request along with our bid.
+    let Some(submit_request::Kind::Incident(incident)) = req.kind.clone() else {
         return Err(Status::invalid_argument("expected an incident"));
     };
     let reply = |plan: &Plan, duplicate: bool| {
@@ -113,7 +154,7 @@ async fn handle_submit(
     };
 
     // 2. Already handled: the same answer again, never a second plan.
-    if let Some(stored) = state.store.lookup_request(&request_id) {
+    if let Some(stored) = state.store.lookup_request(&request_id).await.map_err(unavailable)? {
         return Ok(reply(&stored, true));
     }
 
@@ -121,11 +162,35 @@ async fn handle_submit(
     let incident = incident_from_pb(incident).map_err(Status::invalid_argument)?;
     let weights = state.config.weights;
     let planner_config = state.config.planner;
-    // 4. Snapshot -> plan -> try_apply. try_apply re-checks under the store's lock, so a
-    //    resource taken by another request in between is caught, and we plan again.
+
+    // 4. Election (P3): every node that got this request bids, and only the winner plans.
+    match election::elect(state, &req).await {
+        Some(winner) if winner == state.id => {}
+        // Lost: name the winner and send no plan (Q2). "No plan" is not an empty plan;
+        // the client keeps the reply that has one.
+        Some(winner) => {
+            return Ok(Response::new(SubmitReply {
+                request_id,
+                executor_node: winner,
+                plan: None,
+                duplicate: false,
+            }));
+        }
+        // No bid was ready: no node can reach the shared state now. The client retries.
+        None => return Err(Status::unavailable("no node can take this request now; retry")),
+    }
+    // Won: tell the peers before planning, so a rival that also thinks it won can step
+    // aside early (design doc step 6). In the background: the acks carry nothing we need,
+    // so the client's reply never waits for them.
+    let round = state.election.lock().unwrap().round(&request_id).unwrap_or(0);
+    let (announcer, id) = (state.clone(), request_id.clone());
+    tokio::spawn(async move { election::announce_winner(&announcer, &id, round).await });
+
+    // 5. Snapshot -> plan -> commit. commit re-checks that every planned resource is still
+    //    free, so a resource taken by another request in between is caught, and we plan again.
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
         let now = now_unix_ms();
-        let snapshot = state.store.snapshot();
+        let snapshot = state.store.snapshot().await.map_err(unavailable)?;
         let to_plan = incident.clone();
         // The planner is CPU work: run it off the async threads so it can never
         // delay heartbeats (which would cause false PeerDowns).
@@ -135,28 +200,26 @@ async fn handle_submit(
         .await
         .map_err(|e| Status::internal(format!("planner failed: {e}")))?;
 
-        match state
-            .store
-            .try_apply(&request_id, incident.clone(), plan, now)
-        {
-            Ok(applied) => {
+        match state.store.commit(&request_id, incident.clone(), plan.clone()).await {
+            CommitOutcome::Committed => {
                 tracing::debug!(
                     %request_id,
-                    assigned = applied.plan.assignments.len(),
-                    duplicate = applied.duplicate,
+                    assigned = plan.assignments.len(),
                     attempt,
-                    "submit applied"
+                    "submit committed"
                 );
-                return Ok(reply(&applied.plan, applied.duplicate));
+                return Ok(reply(&plan, false));
             }
-            Err(ApplyError::ResourceTaken { resource_id }) => {
+            // Another request (maybe on another node) committed this request_id first:
+            // its plan is the answer, ours is discarded.
+            CommitOutcome::AlreadyCommitted(stored) => {
+                tracing::debug!(%request_id, attempt, "submit already committed; returning stored plan");
+                return Ok(reply(&stored, true));
+            }
+            CommitOutcome::ResourceTaken { resource_id } => {
                 tracing::debug!(%request_id, attempt, resource_id, "resource taken meanwhile; planning again");
             }
-            Err(ApplyError::UnknownResource { resource_id }) => {
-                return Err(Status::internal(format!(
-                    "plan names resource {resource_id}, which the store does not have"
-                )));
-            }
+            CommitOutcome::StateUnavailable(why) => return Err(unavailable(why)),
         }
     }
     // Conflicts every time: the client may retry with the same request_id.
@@ -165,6 +228,13 @@ async fn handle_submit(
     Err(Status::aborted(format!(
         "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
     )))
+}
+
+/// A shared-state failure as a gRPC error. `Unavailable` tells the client the same
+/// request_id can be retried: commit is create-if-absent, so a retry cannot double-book.
+fn unavailable(why: StateUnavailable) -> Status {
+    tracing::warn!(%why, "shared state unavailable");
+    Status::unavailable(why.to_string())
 }
 
 /// The node's wall clock in Unix milliseconds (the planner's `now`, the log entry's timestamp).
@@ -181,7 +251,7 @@ const MAX_MUTE_MS: u64 = 20_000;
 /// Task 4: check the fault order, go silent for duration_ms, and ack.
 /// Refusals are FaultAcks (accepted = false + reason), not gRPC errors, so the
 /// injector only has to read one kind of answer.
-async fn handle_inject_fault(
+pub(crate) async fn handle_inject_fault(
     state: &Arc<NodeState>, // Arc: the "mute ended" task keeps its own handle
     cmd: FaultCommand,
 ) -> Result<Response<FaultAck>, Status> {
@@ -301,12 +371,8 @@ mod tests {
         assert!(!reply.duplicate);
         let plan = reply.plan.expect("a plan");
         assert_eq!(plan.incident_id, generate_incident(7).id);
-        assert_eq!(
-            plan.assignments.len(),
-            1,
-            "a free resource exists, so one is assigned"
-        );
-        assert_eq!(svc.state.store.applied().get(&1), Some(&1)); // one log entry
+        assert_eq!(plan.assignments.len(), 1, "a free resource exists, so one is assigned");
+        assert_eq!(svc.state.store.snapshot().await.unwrap().incidents.len(), 1);
     }
 
     #[tokio::test]
@@ -316,8 +382,9 @@ mod tests {
         let again = svc.submit(submit_req("r1", 7)).await.unwrap().into_inner();
         assert!(again.duplicate);
         assert_eq!(again.plan, first.plan);
-        assert_eq!(svc.state.store.applied().get(&1), Some(&1)); // still one log entry
-        assert_eq!(svc.state.store.snapshot().assignments.len(), 1);
+        let snapshot = svc.state.store.snapshot().await.unwrap();
+        assert_eq!(snapshot.incidents.len(), 1); // still one record
+        assert_eq!(snapshot.assignments.len(), 1);
     }
 
     #[tokio::test]
@@ -345,7 +412,7 @@ mod tests {
                 err.message()
             );
         }
-        assert!(svc.state.store.applied().is_empty());
+        assert!(svc.state.store.snapshot().await.unwrap().incidents.is_empty());
         assert_eq!(svc.state.in_flight(), 0);
     }
 
@@ -372,7 +439,7 @@ mod tests {
             svc.submit(submit_req(&format!("r{i}"), i)).await.unwrap();
         }
 
-        let snap = svc.state.store.snapshot();
+        let snap = svc.state.store.snapshot().await.unwrap();
         let mut resources: Vec<u64> = snap.assignments.iter().map(|a| a.resource_id).collect();
         let total = resources.len();
         resources.sort();
@@ -383,7 +450,7 @@ mod tests {
             "a resource was given to two incidents"
         );
         assert_eq!(total, 10, "all 10 resources end up assigned, once each");
-        assert_eq!(svc.state.store.applied().get(&1), Some(&20)); // every request logged once
+        assert_eq!(snap.incidents.len(), 20, "every request is stored once");
     }
 
     // ---- Task 4: mute hook. `start_paused` = fake clock that jumps ahead whenever
@@ -586,5 +653,144 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
         let reply = client.heartbeat(ping()).await.unwrap().into_inner();
         assert_eq!(reply.node_id, 1);
+    }
+
+    // ---- Step B task 4: the election in Submit. 3 real nodes on localhost share one
+    // store, standing in for the DFS: with a store each, a second plan would go unnoticed.
+
+    use common::pb::node_client::NodeClient;
+    use common::pb::node_server::NodeServer;
+    use common::shared_state::SharedState;
+    use tonic::transport::Channel;
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn shared_store() -> Arc<dyn SharedState> {
+        Arc::new(crate::store::InMemoryStore::with_default_resources())
+    }
+
+    /// Starts 3 real nodes that all use `store`; returns each one's state and a client to it.
+    async fn three_nodes(store: Arc<dyn SharedState>) -> Vec<(Arc<NodeState>, NodeClient<Channel>)> {
+        let cfg = ClusterConfig::parse(&format!(
+            "[[nodes]]\nid = 1\naddr = \"127.0.0.1:{}\"\n\
+             [[nodes]]\nid = 2\naddr = \"127.0.0.1:{}\"\n\
+             [[nodes]]\nid = 3\naddr = \"127.0.0.1:{}\"\n",
+            free_port(),
+            free_port(),
+            free_port()
+        ))
+        .unwrap();
+        let mut nodes = Vec::new();
+        for id in 1..=3 {
+            let peers = Peers::new(&cfg, id).unwrap();
+            let state = Arc::new(NodeState::new(id, cfg.clone(), peers).with_store(store.clone()));
+            let addr: std::net::SocketAddr = cfg.node(id).unwrap().addr.parse().unwrap();
+            tokio::spawn(
+                tonic::transport::Server::builder()
+                    .add_service(NodeServer::new(NodeService::new(state.clone())))
+                    .serve(addr),
+            );
+            let client = loop {
+                match NodeClient::connect(format!("http://{addr}")).await {
+                    Ok(c) => break c,
+                    Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+                }
+            };
+            nodes.push((state, client));
+        }
+        nodes
+    }
+
+    #[tokio::test]
+    async fn request_sent_to_all_three_gets_exactly_one_plan() {
+        let store = shared_store();
+        let nodes = three_nodes(store.clone()).await;
+        // The client multicasts: the same request_id to every node at once.
+        let [mut c1, mut c2, mut c3] = [0, 1, 2].map(|i| nodes[i].1.clone());
+        let (r1, r2, r3) = tokio::join!(
+            c1.submit(submit_req("e1", 7)),
+            c2.submit(submit_req("e1", 7)),
+            c3.submit(submit_req("e1", 7)),
+        );
+        let replies = [r1, r2, r3].map(|r| r.unwrap().into_inner());
+
+        let planned: Vec<&SubmitReply> = replies.iter().filter(|r| r.plan.is_some()).collect();
+        assert_eq!(planned.len(), 1, "exactly one node plans: {replies:?}");
+        let winner = planned[0].executor_node;
+        assert!(replies.iter().all(|r| r.executor_node == winner), "same winner everywhere: {replies:?}");
+        assert!(replies.iter().all(|r| !r.duplicate));
+        assert_eq!(store.snapshot().await.unwrap().incidents.len(), 1, "stored once");
+    }
+
+    #[tokio::test]
+    async fn retry_to_a_node_that_lost_returns_the_same_plan() {
+        let nodes = three_nodes(shared_store()).await;
+        let [mut c1, mut c2, mut c3] = [0, 1, 2].map(|i| nodes[i].1.clone());
+        let (r1, r2, r3) = tokio::join!(
+            c1.submit(submit_req("e2", 7)),
+            c2.submit(submit_req("e2", 7)),
+            c3.submit(submit_req("e2", 7)),
+        );
+        let replies = [r1, r2, r3].map(|r| r.unwrap().into_inner());
+        let first = replies.iter().find(|r| r.plan.is_some()).expect("one plan");
+
+        let loser = if first.executor_node == 1 { 2 } else { 1 };
+        let mut client = nodes[loser - 1].1.clone();
+        let again = client.submit(submit_req("e2", 7)).await.unwrap().into_inner();
+        assert!(again.duplicate, "answered from the store, not planned again");
+        assert_eq!(again.plan, first.plan);
+    }
+
+    #[tokio::test]
+    async fn with_one_node_muted_the_other_two_still_give_one_plan() {
+        let nodes = three_nodes(shared_store()).await;
+        nodes[2].0.mute_for(Duration::from_secs(5)); // node 3 goes silent
+        // Node 3's copy from the client would be held by its mute: only 1 and 2 answer.
+        let [mut c1, mut c2] = [0, 1].map(|i| nodes[i].1.clone());
+        let (r1, r2) = tokio::join!(c1.submit(submit_req("e3", 7)), c2.submit(submit_req("e3", 7)));
+        let replies = [r1, r2].map(|r| r.unwrap().into_inner());
+        assert_eq!(replies.iter().filter(|r| r.plan.is_some()).count(), 1, "{replies:?}");
+        assert!(replies.iter().all(|r| r.executor_node != 3), "a muted node cannot win");
+    }
+
+    #[tokio::test]
+    async fn winner_that_only_got_a_peers_bid_still_plans() {
+        let store = shared_store();
+        let nodes = three_nodes(store.clone()).await;
+        // Only node 1 gets the client's copy. It is busy with it (queue 1), so nodes 2 and
+        // 3 bid a lower load, and node 2 wins (tie with 3) from the bid call alone.
+        let mut c1 = nodes[0].1.clone();
+        let first = c1.submit(submit_req("e4", 7)).await.unwrap().into_inner();
+        assert_eq!(first.executor_node, 2, "{first:?}");
+        assert!(first.plan.is_none());
+
+        // Node 2 plans in the background; the client's retry gets that plan.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let stored = loop {
+            if let Some(plan) = store.lookup_request("e4").await.unwrap() {
+                break plan;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "node 2 never planned");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let again = c1.submit(submit_req("e4", 7)).await.unwrap().into_inner();
+        assert!(again.duplicate);
+        assert_eq!(again.plan, Some(plan_to_pb(&stored)));
+    }
+
+    #[tokio::test]
+    async fn invalid_request_starts_no_election() {
+        let svc = service();
+        let mut bad = incident_to_pb(&generate_incident(7));
+        bad.severity = 0;
+        let req = Request::new(SubmitRequest {
+            request_id: "bad".into(),
+            kind: Some(submit_request::Kind::Incident(bad)),
+        });
+        let err = svc.submit(req).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(svc.state.election.lock().unwrap().round("bad").is_none(), "no election for it");
     }
 }

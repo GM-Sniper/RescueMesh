@@ -8,7 +8,13 @@ mod failure_detector;
 // Task 6. No caller in Step A: the election and replication use it in Step B.
 #[allow(dead_code)]
 mod broadcast;
+// P3: election rule. No caller yet: the bid exchange is the next step.
+#[allow(dead_code)]
+mod election;
+mod election_log;
 mod fault_log;
+// P5: automatic fault injector (Step B). Does nothing unless [faults] enabled = true.
+mod fault_round;
 mod heartbeat;
 mod load;
 // P6: NODE_METRICS LOG (ONE CSV ROW PER SECOND: QUEUE, CPU, SERVICE TIME, LOAD SCORE).
@@ -18,9 +24,7 @@ mod node_metrics;
 mod peers;
 mod service;
 mod state;
-// P4: store and change log. Used by the Submit handler; the replication functions
-// (apply_remote, entries_since, applied) are not called until Step B.
-#[allow(dead_code)]
+// P4: in-memory implementation of the shared-state interface (common::shared_state).
 mod store;
 
 use std::net::SocketAddr;
@@ -34,6 +38,7 @@ use common::config::ClusterConfig;
 use common::pb::node_server::NodeServer;
 use tracing_subscriber::EnvFilter;
 
+use crate::election_log::ElectionLog;
 use crate::fault_log::FaultLog;
 use crate::peers::Peers;
 use crate::service::NodeService;
@@ -92,13 +97,22 @@ async fn main() -> anyhow::Result<()> {
     let log_path = format!("logs/faults-node{}.csv", args.id);
     let fault_log = FaultLog::open(&log_path, args.id, &run_id)
         .with_context(|| format!("cannot open fault log {log_path}"))?;
-    let state = Arc::new(NodeState::new(args.id, config, peers).with_fault_log(fault_log));
+    // P3: election CSV, same run_id so P6 can join it with the other logs.
+    let election_log_path = format!("logs/elections-node{}.csv", args.id);
+    let election_log = ElectionLog::open(&election_log_path, args.id, &run_id)
+        .with_context(|| format!("cannot open election log {election_log_path}"))?;
+    let state = Arc::new(
+        NodeState::new(args.id, config, peers)
+            .with_fault_log(fault_log)
+            .with_election_log(election_log),
+    );
 
     // 6. Background tasks: CPU sampling for the load score (P3), heartbeats to
     //    each peer, and the detector ticker.
     load::spawn_sampler(state.clone());
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
+    fault_round::spawn(state.clone());
     // P6 (SEE NOTE AT THE TOP, P1): ONE ROW PER SECOND TO logs/node_metrics-node<ID>.CSV
     node_metrics::spawn(state.clone(), format!("logs/node_metrics-node{}.csv", args.id))
         .context("cannot open the node_metrics log")?;
