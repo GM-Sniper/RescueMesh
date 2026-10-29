@@ -253,3 +253,19 @@ A request that passed the entry gate and is then muted has its reply dropped at 
 **Alternatives.** Keep them unused in case Step C needs them; mark them deprecated with a comment.
 **Why.** Shared state moved to a DFS (team decision Q8, P3 election design), and P4's PR #18 removed the log, `applied`, `apply_remote` and the replication code. No `rpc` ever used these messages and no code refers to them, so nothing on the wire changes. Unused messages in the proto would suggest that nodes still replicate to each other, which is no longer the design. The "never reuse a field number" rule is about fields of messages still in use; it does not apply to whole messages removed before any rpc carried them. If Step C needs a message for a returning node, it gets a new one designed for the DFS, not the old log format.
 **Evidence.** A search of `crates/` and `proto/` finds no use of the six messages besides one stale comment in `broadcast.rs` (fixed). The workspace builds with no warnings and all tests pass as before.
+
+---
+
+## 12. Load knob for one node (Step B, P2's load knob)
+
+**What.** `node --planner-iterations N` replaces `[planner] iterations` (P2's workload knob, PR #22) for that node only. The config file stays the same on all nodes; the flag makes one node a slower machine, so load-balancing tests have something to show. The value is printed in the "node listening" log line, so every run's log says which node was loaded. At the default sizes (10 x 20 work units per iteration, about 3.4 ns per unit) one iteration is about 0.7 us, so 30000 is about 20 ms per plan.
+**Alternatives.** An admin RPC (reusing the `FaultCommand` path, as the Step B plan suggested), which can change the load while the node runs; a per-node value in the config file.
+**Why.** The experiments compare whole runs ("baseline" vs "node 2 loaded"), so setting the load at startup is enough, and the flag is a few lines in `main.rs` with no proto change. The real load (queue, CPU, service time) still changes live during every run; only the artificial extra work is fixed. A per-node config value would make the shared config differ between machines. If the demo needs to overload a node mid-run, the RPC can be added on top of the same `PlannerConfig` (decided: not needed for now).
+**Evidence.** Unit test: the flag replaces the config value, and 0 is refused. Live runs, 3 nodes on one laptop (release build), the client multicasting 600 requests at 40/s from 3 clients:
+
+| Run | Node 1 wins | Node 2 wins | Node 3 wins | Result |
+|---|---|---|---|---|
+| Baseline (no flag) | 327 (54%) | 161 (27%) | 112 (19%) | 600/600 ok |
+| Node 2 with `--planner-iterations 30000` | 290 (48%) | 23 (4%) | 287 (48%) | 600/600 ok |
+
+Node 2's plans took 19.6 ms on average when it won (vs 0.8 ms in the baseline), confirming the 20 ms estimate. Its load score rose (service time and CPU), so it lost most elections and the other two took its share. It still wins now and then: losers count each request's short election time as service time, which pulls its average back down between wins. The baseline is uneven because idle nodes often tie, and ties go to the lowest node ID.
