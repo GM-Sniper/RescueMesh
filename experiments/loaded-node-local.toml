@@ -1,0 +1,15 @@
+# Step B done-check, on one laptop: "the artificially loaded node stops winning".
+# Node 2 gets extra planner work (P2's --planner-iterations knob), so its load score rises
+# and the election should move its wins to nodes 1 and 3. Compare elections-summary.txt
+# with a run of ramp-local.toml.
+#   cargo run --release -p loadgen --bin experiment -- experiments/loaded-node-local.toml
+
+name = "loaded-node-local"
+cluster = "config/nodes.toml"
+start_nodes = true
+seed = 1
+stages = [2, 4, 8]
+stage_secs = 10
+
+[planner_iterations]   # node ID = iterations; about 0.7 us each, so 30000 is about 20 ms per plan
+"2" = 30000

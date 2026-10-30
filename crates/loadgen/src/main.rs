@@ -1,9 +1,15 @@
-//! Load generator (owner: P6): many fake clients send requests to one node at the same time,
+//! Load generator (owner: P6): many fake clients send requests at the same time,
 //! and every result is saved as one CSV row for the stats script.
 //!
-//! Run (with the node already running). The address comes from the same config file the nodes use:
-//!   cargo run -p loadgen -- --clients 10 --requests 1000 --seed 1 --rate 100                     (node 1 in config/nodes.toml)
-//!   cargo run --release -p loadgen -- --config config/nodes.lab.toml --target 1 --requests 1000  (real machines)
+//! Step B (default): multicast. Every request goes to every node in the config file (the same file
+//! the nodes use); the nodes elect who plans, the first reply with a plan wins, and a request with no
+//! plan before the attempt deadline is retried with the same request_id (P1's ClientMiddleware).
+//!   cargo run -p loadgen -- --clients 10 --requests 1000 --seed 1 --rate 100                     (3 nodes in config/nodes.toml)
+//!   cargo run --release -p loadgen -- --config config/nodes.lab.toml --requests 1000            (the 3 real machines)
+//!   cargo run -p loadgen -- --attempts 5 --attempt-timeout-ms 3000                               (retry settings)
+//!
+//! Step A style: one node only, one try per request, if --target or --node is given.
+//!   cargo run -p loadgen -- --target 1 --requests 100                                            (node 1 in the config)
 //!   cargo run -p loadgen -- --node 127.0.0.1:6000 --requests 100                                  (any address, e.g. the mock)
 //!
 //! Ramp mode (Step B): the load grows in stages, e.g. 1, 2, 4 then 8 clients for 30 s each.
@@ -23,7 +29,7 @@ use std::sync::mpsc; // a channel: tasks drop rows in one end, the CSV writer ta
 use std::time::{Duration, SystemTime, UNIX_EPOCH}; // durations and the wall clock (for CSV timestamps)
 
 use clap::Parser; // turns the `Args` struct below into command-line flags
-use client::{ClientMiddleware, DEFAULT_TIMEOUT, SubmitStatus}; // our client from crates/client
+use client::{ClientMiddleware, DEFAULT_TIMEOUT, RetryPolicy, SubmitStatus}; // our client from crates/client
 use common::conversions::incident_to_pb; // P2: domain Incident -> proto Incident
 use common::generators::generate_incident; // P2: same seed always gives the same incident
 use tokio::time::Instant; // stopwatch that works with tokio's sleep_until
@@ -32,18 +38,27 @@ use tokio::time::Instant; // stopwatch that works with tokio's sleep_until
 #[derive(Parser, Debug)]
 #[command(about = "RescueMesh load generator: many clients, one CSV row per request")]
 struct Args {
-    /// Cluster config to read the node address from (the same file the nodes use).
+    /// Cluster config with the nodes' addresses (the same file the nodes use).
     /// On the 3 real machines: config/nodes.lab.toml
     #[arg(long, default_value = "config/nodes.toml")]
     config: String,
 
-    /// Which node in the config to send to (Step A: one fixed node).
-    #[arg(long, default_value_t = 1)]
-    target: u32,
+    /// Step A style: send to this one node of the config only, one try per request.
+    /// Without --target or --node, every request goes to every node (multicast).
+    #[arg(long, conflicts_with = "node")]
+    target: Option<u32>,
 
-    /// Send to this address instead of the config's (e.g. the mock server: 127.0.0.1:6000).
+    /// Step A style: send to this one address only (e.g. the mock server: 127.0.0.1:6000).
     #[arg(long)]
     node: Option<String>,
+
+    /// Multicast: tries per request, the first one included (1 = never retry).
+    #[arg(long, default_value_t = RetryPolicy::default().attempts, value_parser = clap::value_parser!(u32).range(1..))]
+    attempts: u32,
+
+    /// Multicast: how long one attempt waits for a plan before retrying, in milliseconds.
+    #[arg(long, default_value_t = RetryPolicy::default().attempt_timeout.as_millis() as u64)]
+    attempt_timeout_ms: u64,
 
     /// How many fake clients send at the same time.
     #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
@@ -90,6 +105,8 @@ struct Row {
     status: SubmitStatus,       // ok / timeout / error
     assigned: Option<bool>,     // true = a resource was assigned, false = empty plan (nothing free), None = no plan
     stage: u32,                 // which stage sent it (1, 2, ...); always 1 without --stages
+    attempts: u32,              // tries this request used (1 = no retry); multicast retries with the same request_id
+    no_plan_replies: u32,       // replies with no plan: nodes that lost the election, naming the winner
 }
 
 /// Everything one client task needs. One per client per stage.
@@ -131,10 +148,12 @@ impl ClientJob {
                 client_id: self.client_id,
                 request_id: outcome.request_id,
                 latency_us: outcome.latency_us,
-                executor_node: outcome.executor_node,
+                executor_node: outcome.executor_node, // multicast: the election winner
                 status: outcome.status,
                 assigned,
                 stage: self.stage,
+                attempts: outcome.attempts,
+                no_plan_replies: outcome.no_plan_replies,
             };
             if self.tx.send(row).is_err() {
                 break; // the writer stopped (disk error): no point sending more
@@ -150,6 +169,7 @@ struct Counts {
     timeout: u64,
     error: u64,
     unassigned: u64, // ok requests whose plan was empty (nothing was free)
+    retried: u64,    // requests that needed more than one attempt
 }
 
 #[tokio::main] // starts the async runtime, then runs `main` inside it
@@ -159,9 +179,14 @@ async fn main() -> anyhow::Result<()> {
     fs::create_dir_all(&args.out)?; // make results/ if it doesn't exist yet
     let csv_path = args.out.join(format!("{run_id}.csv"));
     let meta_path = args.out.join(format!("{run_id}.meta.txt"));
-    // The node's address: from --node if given, otherwise node --target in --config.
-    let node_addr = client::target_addr(&args.config, args.target, args.node.as_deref())
-        .map_err(|e| anyhow::anyhow!(e))?;
+    // Where requests go: one node if --target or --node is given (Step A style), else every node in --config.
+    let single = args.target.is_some() || args.node.is_some();
+    let policy = RetryPolicy { attempts: args.attempts, attempt_timeout: Duration::from_millis(args.attempt_timeout_ms) };
+    let destination = if single {
+        client::target_addr(&args.config, args.target.unwrap_or(1), args.node.as_deref()).map_err(|e| anyhow::anyhow!(e))?
+    } else {
+        format!("all nodes in {}", args.config)
+    };
 
     // The stages to run. Ramp mode: one per --stages value. Fixed mode: a single stage of --clients clients.
     let ramp = !args.stages.is_empty();
@@ -175,16 +200,27 @@ async fn main() -> anyhow::Result<()> {
     let stage_len = Duration::from_secs_f64(args.stage_secs);
     let max_clients = *stages.iter().max().expect("at least one stage"); // the biggest stage sets how many connections we need
 
-    // Connect every client BEFORE the clock starts, so connection setup isn't counted as request latency.
-    // Each client gets its own connection, like separate users would; a stage with k clients uses the first k.
+    // One ClientMiddleware per client, each with its own connections, like separate users;
+    // a stage with k clients uses the first k.
+    // - single node: connects now, so a wrong address fails here and setup isn't counted as latency;
+    // - multicast: P1's connect_all connects lazily, on each client's first request, so a node that is
+    //   down at startup costs one failed call instead of stopping the run. That first request per client
+    //   includes connection setup (about a millisecond on a LAN).
     let mut clients = Vec::new();
     for _ in 0..max_clients {
-        clients.push(ClientMiddleware::connect(&node_addr, DEFAULT_TIMEOUT).await?);
+        clients.push(if single {
+            ClientMiddleware::connect(&destination, DEFAULT_TIMEOUT).await?
+        } else {
+            ClientMiddleware::connect_all(&args.config, policy).map_err(|e| anyhow::anyhow!(e))?
+        });
     }
+    let how = if single { format!("to {destination}, one try per request") } else {
+        format!("multicast to {destination}, {} attempts of {} ms", policy.attempts, args.attempt_timeout_ms)
+    };
     if ramp {
-        println!("{max_clients} clients connected to {node_addr}; ramp {stages:?} clients, {} s per stage", args.stage_secs);
+        println!("{max_clients} clients, {how}; ramp {stages:?} clients, {} s per stage", args.stage_secs);
     } else {
-        println!("{max_clients} clients connected to {node_addr}, sending {} requests...", args.requests);
+        println!("{max_clients} clients, {how}; sending {} requests...", args.requests);
     }
 
     // The CSV writer runs on its own thread, so slow disk writes never delay a request.
@@ -230,12 +266,19 @@ async fn main() -> anyhow::Result<()> {
     let elapsed = start.elapsed(); // total run time
     let counts = writer.join().expect("CSV writer thread panicked")?; // wait for the last rows to be saved
 
-    // Summary. The stats script (Tue) computes the full numbers from the CSV; this is a quick check.
+    // Late plans: a second plan for a request that already had one (a split decision, or a slow winner).
+    // P1's client counts them in the background until each attempt's deadline, so wait that long first.
+    let late_plans = if single { 0 } else {
+        tokio::time::sleep(policy.attempt_timeout).await;
+        clients.iter().map(|c| c.late_plans()).sum::<u64>()
+    };
+
+    // Summary. The stats script computes the full numbers from the CSV; this is a quick check.
     let secs = elapsed.as_secs_f64();
     let throughput = counts.ok as f64 / secs; // successful requests per second
     println!(
-        "done in {secs:.2} s: {} ok ({} with nothing assigned), {} timeout, {} error, {throughput:.1} ok/s",
-        counts.ok, counts.unassigned, counts.timeout, counts.error
+        "done in {secs:.2} s: {} ok ({} with nothing assigned, {} retried), {} timeout, {} error, {late_plans} late plans, {throughput:.1} ok/s",
+        counts.ok, counts.unassigned, counts.retried, counts.timeout, counts.error
     );
 
     // The metadata file records how to repeat this exact run.
@@ -243,21 +286,25 @@ async fn main() -> anyhow::Result<()> {
         "run_id: {run_id}\n\
          started_at_ms: {started_at_ms}\n\
          command: {}\n\
-         mode: {}\nnode: {}\nstages: {}\nstage_secs: {}\nclients: {}\nrequests: {}\nseed: {}\nrate: {}\n\
+         mode: {}\nsend: {}\nnode: {}\nattempts: {}\nattempt_timeout_ms: {}\n\
+         stages: {}\nstage_secs: {}\nclients: {}\nrequests: {}\nseed: {}\nrate: {}\n\
          git_commit: {}\n\
          duration_s: {secs:.3}\n\
-         ok: {}\nunassigned: {}\ntimeout: {}\nerror: {}\n\
+         ok: {}\nunassigned: {}\nretried: {}\ntimeout: {}\nerror: {}\nlate_plans: {late_plans}\n\
          throughput_ok_per_s: {throughput:.1}\n",
         std::env::args().collect::<Vec<_>>().join(" "), // the exact command that was typed
         if ramp { "ramp" } else { "fixed" },
-        node_addr,
+        if single { "single" } else { "multicast" },
+        destination,
+        if single { "1".to_string() } else { policy.attempts.to_string() },
+        if single { DEFAULT_TIMEOUT.as_millis() as u64 } else { args.attempt_timeout_ms },
         stages.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(","), // clients per stage, e.g. "1,2,4,8"
         if ramp { args.stage_secs.to_string() } else { "-".to_string() },
         max_clients,
         if ramp { "-".to_string() } else { args.requests.to_string() }, // ramp mode runs by time, not by count
         args.seed, args.rate,
         git_commit(),
-        counts.ok, counts.unassigned, counts.timeout, counts.error,
+        counts.ok, counts.unassigned, counts.retried, counts.timeout, counts.error,
     );
     fs::write(&meta_path, meta)?;
     println!("wrote {} and {}", csv_path.display(), meta_path.display());
@@ -267,7 +314,7 @@ async fn main() -> anyhow::Result<()> {
 /// The CSV writer: takes rows off the channel and writes them until every sender is gone.
 fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Result<Counts> {
     let mut w = BufWriter::new(File::create(path)?); // buffered, so we don't hit the disk on every row
-    writeln!(w, "run_id,timestamp,client_id,request_id,latency_us,executor_node,status,assigned,stage")?; // header row
+    writeln!(w, "run_id,timestamp,client_id,request_id,latency_us,executor_node,status,assigned,stage,attempts,no_plan_replies")?; // header row
     let mut counts = Counts::default();
     for row in rx {
         // This loop ends by itself once all tasks are done and the channel is closed.
@@ -279,12 +326,16 @@ fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Res
         if row.assigned == Some(false) {
             counts.unassigned += 1; // the node planned but nothing was free
         }
+        if row.attempts > 1 {
+            counts.retried += 1; // needed a retry (the winner died, the network cut, or the plan was slow)
+        }
         let node = row.executor_node.map_or(String::new(), |n| n.to_string()); // empty cell if no node answered
         let assigned = row.assigned.map_or(String::new(), |a| a.to_string()); // "true", "false", or empty if no plan
         writeln!(
             w,
-            "{run_id},{},{},{},{},{node},{},{assigned},{}",
-            row.timestamp_ms, row.client_id, row.request_id, row.latency_us, row.status.as_str(), row.stage
+            "{run_id},{},{},{},{},{node},{},{assigned},{},{},{}",
+            row.timestamp_ms, row.client_id, row.request_id, row.latency_us, row.status.as_str(), row.stage,
+            row.attempts, row.no_plan_replies
         )?;
     }
     w.flush()?; // save whatever is still in the buffer
