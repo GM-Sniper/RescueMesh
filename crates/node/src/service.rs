@@ -799,9 +799,10 @@ mod tests {
     // P3's load-imbalance test: node 1 plans much slower, so its service time (part of
     // the load score) goes up each time it wins, and the other two take most requests.
     // Node 1 is the hardest one to make lose: it wins every tie (lowest ID), and with
-    // nobody slow it takes about 13 of 30. Loose check, not exact shares: timing differs
-    // between machines. The measured shares come from live runs (docs/p1-design-log.md,
-    // section 12).
+    // nobody slow it takes about 13 of 30. Only service time decides here: requests go
+    // one at a time, so no node has a queue, and CPU stays 0 (tests don't start the
+    // sampler). Loose check, not exact shares: timing differs between machines. The
+    // measured shares come from live runs (docs/p1-design-log.md, section 12).
     #[tokio::test]
     async fn slow_node_wins_fewer_elections() {
         let nodes = three_nodes_with_slow_node(shared_store(), Some((1, SLOW_ITERATIONS))).await;
@@ -814,12 +815,9 @@ mod tests {
                 c2.submit(submit_req(&id, i)),
                 c3.submit(submit_req(&id, i)),
             );
-            let winner = [r1, r2, r3]
-                .into_iter()
-                .map(|r| r.unwrap().into_inner())
-                .find(|r| r.plan.is_some())
-                .expect("one node plans")
-                .executor_node;
+            let replies = [r1, r2, r3].map(|r| r.unwrap().into_inner());
+            let winner = replies.iter().find(|r| r.plan.is_some()).expect("one node plans").executor_node;
+            assert!(replies.iter().all(|r| r.executor_node == winner), "same winner everywhere: {replies:?}");
             wins[winner as usize - 1] += 1;
         }
         // At most half a fair share (10 of 30). Runs so far gave node 1 one or two wins.
