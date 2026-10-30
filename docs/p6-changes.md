@@ -467,6 +467,121 @@ Tested on one laptop: 3 nodes started, 4-stage ramp, 13 files gathered, no node 
 
 ---
 
+## 13. Step B, Tue Oct 27: election metrics and win share (branch `StepB/p6`)
+
+Plan tasks: "elections.csv from P3's events" and "load distribution: wins per node per time window, share per node". P3's `logs/elections-node<N>.csv` landed on `main` (PR #19) in the format agreed in the PR #12 review, so both can be built now. **Nothing calls the election yet** (P1 still has to wire it into the Submit handler), so real runs give header-only files until then.
+
+New program `crates/loadgen/src/bin/elections.rs`:
+
+```bash
+cargo run --release -p loadgen --bin elections -- results/<run_id>/logs/elections-node1.csv results/<run_id>/logs/elections-node2.csv results/<run_id>/logs/elections-node3.csv
+cargo run --release -p loadgen --bin elections -- --window-secs 5 <files...>   # narrower time windows
+```
+
+Every node logs its own view of every election, so one election is 3 rows. The program groups rows by **(request_id, round)** to count each election once:
+
+```rust
+by_key.entry((r.request_id.clone(), r.round)).or_default().push(r);   // group the nodes' rows per election
+let winner = /* the winner most nodes reported; ties to the lowest node ID */;
+disagreed: votes.len() > 1,                                           // nodes named different winners = split
+bid_calls_sent: views.iter().map(|v| v.bid_calls_sent).sum(),         // all nodes' messages for this election
+```
+
+What it prints (sample from made-up rows):
+
+```text
+elections:   60 (0 re-elections after a winner went down), seen by nodes {1, 2, 3}          # count, re-elections
+disagreement: 0 elections where nodes named different winners, 0 split announcements, ...    # split-decision rate
+duration (per node view, 180 views):                                                          # each node times its own election
+  mean 3.51 ms  p50 3.48 ms  p95 4.80 ms  p99 4.95 ms  max 5.00 ms
+  waited the full bid timeout: 0 of 180 (0.0%)                                                # a silent peer not yet marked down
+messages: 6.00 bid calls per election on average (min 6, max 6)                               # message overhead
+win share (60 decided elections, even split = 33.3%):                                         # the plan's worked example format
+  node 1: 27 wins = 45.0% (+11.7 points vs even)
+win share per 10 s window:                                                                    # load distribution over time
+         window  elections    node 1    node 2    node 3
+         0-10 s         20    100.0%      0.0%      0.0%
+```
+
+The experiment runner now also runs it on the nodes' election logs and saves `elections-summary.txt`; in lab mode it lists `logs/elections-node<N>.csv` among the files to copy.
+
+5 tests (`cargo test -p loadgen`): P3's example row parses correctly; one election seen by 3 nodes counts once with 6 messages; a split is flagged and the majority winner kept; re-elections (round 1) count separately; the plan's worked example (40 / 35 / 25 wins out of 100).
+
+**Note for P3:** `cargo test -p node csv_row_counts_retries` fails every time on this laptop: `waited_full_t` is `true` where the test expects `false` (election.rs line 1180). Looks timing-sensitive.
+
+---
+
+## 14. Step B, Fri Oct 30: load generator switched to multicast (branch `StepB/p6`)
+
+P1's multicast (PR #23, `ClientMiddleware::connect_all`) is on `main`, and the nodes now run P3's election in Submit. A client that talks to one node no longer works: that node is usually not the least loaded, loses the election, and replies with no plan (tested: 60 of 60 requests failed). So the load generator, the demo and the experiment runner now **multicast by default**.
+
+| Flag (loadgen) | Default | Meaning |
+|---|---|---|
+| *(none)* | | Multicast: every request to every node in `--config`; first reply with a plan wins; retries keep the request_id |
+| `--attempts` | `3` | Tries per request (P1's default) |
+| `--attempt-timeout-ms` | `2000` | How long one attempt waits for a plan (P1's default) |
+| `--target N` / `--node ADDR` | none | Step A style: one node only, one try (e.g. the mock) |
+
+```rust
+clients.push(if single {
+    ClientMiddleware::connect(&destination, DEFAULT_TIMEOUT).await?          // Step A: one node, connects now
+} else {
+    ClientMiddleware::connect_all(&args.config, policy).map_err(|e| anyhow::anyhow!(e))?  // Step B: all nodes, lazy
+});
+```
+
+- CSV: two new last columns, `attempts` (1 = no retry) and `no_plan_replies` (losers naming the winner). `executor_node` is now the **election winner** (plan task "request CSV gets the winning node from the reply").
+- Summary line and `.meta.txt`: `send` (multicast/single), `attempts`, `attempt_timeout_ms`, `retried` (requests with attempts > 1) and `late_plans` (a second plan for a request that already had one; read after waiting one attempt timeout, since P1's client counts them in the background).
+- With `connect_all` each client connects on its first request, so that request includes connection setup (about a millisecond locally).
+- Demo (`cargo run -p client`): multicast by default, prints attempts and no-plan replies; `--target` / `--node` for one node.
+- Experiment files: `target` is now optional (missing = multicast); new optional `attempts`, `attempt_timeout_ms`, and a `[planner_iterations]` table that starts chosen nodes with P2's `--planner-iterations` knob (local mode only). The example files no longer set `target`. New `experiments/loaded-node-local.toml`.
+
+Results on one laptop (3 local nodes, release, 4-stage ramp of 5 s):
+
+```text
+969 requests, 969 ok, 0 retried, 0 errors                      # multicast works end to end
+elections: 969, 0 splits                                       # one election per request
+win share: node 1 32.8%, node 2 31.2%, node 3 36.0%            # equal nodes share the work
+```
+
+Loaded-node check (`experiments/loaded-node-local.toml`, node 2 with `--planner-iterations 30000`):
+
+```text
+node 1: 35.4%   node 2: 20.0%   node 3: 44.6%                  # node 2 drops from ~33% to 20%
+0-10 s: node 2 16.6%   10-20 s: 15.2%   20-30 s: 29.6%           # strongest early; rises again later
+```
+
+**Observations for the team:**
+- P1: node ports 50051-50053 are inside Windows' range for temporary outgoing ports (49152-65535). Once, node 1 could not bind 50051 because the port was briefly in use. Ports below 49152 would avoid this.
+- P1/P3: some nodes log more election rows than requests (e.g. 1056 rows for 969 requests on node 1), i.e. the same (request_id, round) twice on one node, probably once from the client's Submit and once from a peer's bid. The elections program counts each election once, but the per-node duration numbers include the extra rows.
+- P3/P2: the loaded node's share drops but does not reach zero, and rises again after ~20 s (possibly because plans become empty and cheap once the starting resources are taken).
+- Runs must not overlap: a first attempt picked up 1002 requests from another client sending to the same ports at the same time.
+
+---
+
+## 15. Step B, Fri Oct 30: safeguards in the experiment runner
+
+Two checks run at the end of every experiment. Each problem found is printed as `WARNING: ...` and saved in `WARNINGS.txt` in the run folder, so a later reader of the folder sees it too. No file = no problem found.
+
+| Check | Catches | How |
+|---|---|---|
+| **A. Foreign traffic** | Another client sending to the same nodes during the run (results mixed) | Every request_id in the nodes' election logs must be in this run's CSV |
+| **B. Nothing assigned** | Requests got plans but not one assigned a resource, although fresh nodes start with free ones | Count `assigned = true` among `ok` rows; warn if 0 |
+
+```rust
+for id in column_values(log, "request_id") {   // every request a node elected for
+    if !sent.contains(&id) {                    // not sent by this run
+        foreign.insert(id);                     // counted once, even if all 3 nodes logged it
+    }
+}
+```
+
+Check A needs the election logs, so in lab mode (logs on other machines) only check B runs.
+
+Tested: 4 unit tests (clean run, foreign requests counted once, nothing assigned, a run with only failures is not called "unassigned"), plus two real runs on 3 local nodes: a clean run gave no warnings, and a run where a second load generator sent 40 requests mid-run was reported as "the nodes handled 40 requests that are not in this run's CSV".
+
+---
+
 ## How to run everything
 
 ```bash
