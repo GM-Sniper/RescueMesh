@@ -13,6 +13,9 @@ mod broadcast;
 mod election;
 mod election_log;
 mod fault_log;
+// P6, TEMPORARY UNTIL P4'S DFS: SHARED STATE IN ONE FOLDER FOR ALL NODES (--shared-state-dir).
+// NOTE FOR P1/P4: P6 ADDED THIS `mod` LINE, THE --shared-state-dir FLAG AND THE `with_store` CALL IN STEP 5.
+mod file_store;
 // P5: automatic fault injector (Step B). Does nothing unless [faults] enabled = true.
 mod fault_round;
 mod heartbeat;
@@ -62,6 +65,11 @@ struct Args {
     /// sizes one iteration is about 0.7 us of CPU, so 30000 is about 20 ms per plan.
     #[arg(long)]
     planner_iterations: Option<usize>,
+    /// P6, TEMPORARY until the DFS: a folder for shared state. Give every node the SAME folder
+    /// (one machine: any folder; lab: a network share all 3 reach), so the cluster has ONE set of
+    /// resources. Without it, each node keeps its own private copy (P4's in-memory store).
+    #[arg(long)]
+    shared_state_dir: Option<std::path::PathBuf>,
 }
 
 /// `--planner-iterations`: replaces the config's `[planner] iterations` for this node.
@@ -117,11 +125,17 @@ async fn main() -> anyhow::Result<()> {
     let election_log_path = format!("logs/elections-node{}.csv", args.id);
     let election_log = ElectionLog::open(&election_log_path, args.id, &run_id)
         .with_context(|| format!("cannot open election log {election_log_path}"))?;
-    let state = Arc::new(
-        NodeState::new(args.id, config, peers)
-            .with_fault_log(fault_log)
-            .with_election_log(election_log),
-    );
+    let mut node_state = NodeState::new(args.id, config, peers)
+        .with_fault_log(fault_log)
+        .with_election_log(election_log);
+    // P6 (SEE NOTE AT THE TOP): ONE SHARED SET OF RESOURCES FOR THE WHOLE CLUSTER, UNTIL THE DFS.
+    if let Some(dir) = &args.shared_state_dir {
+        let shared = file_store::FileStore::open(dir, store::default_resources())
+            .with_context(|| format!("cannot open the shared-state folder {}", dir.display()))?;
+        node_state = node_state.with_store(Arc::new(shared));
+        tracing::info!(dir = %dir.display(), "shared state: one folder for all nodes");
+    }
+    let state = Arc::new(node_state);
 
     // 6. Background tasks: CPU sampling for the load score (P3), heartbeats to
     //    each peer, and the detector ticker.

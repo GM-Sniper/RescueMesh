@@ -582,6 +582,109 @@ Tested: 4 unit tests (clean run, foreign requests counted once, nothing assigned
 
 ---
 
+## 16. Step B, Fri Oct 30: one set of resources for the whole system (TEMPORARY, until P4's DFS)
+
+**Problem:** each node used its own private `InMemoryStore` ([state.rs](../crates/node/src/state.rs), `NodeState::new`), so 3 nodes meant 3 copies of the 10 starting resources. With multicast all 3 nodes win elections, so runs showed **30** resources assigned, and the same resource could go to up to 3 incidents. P1 and P4 confirmed the system must have **10 in total**, also with multicast.
+
+**Fix:** a temporary shared store, `crates/node/src/file_store.rs`, that implements P4's `SharedState` interface on **one folder all nodes use**. When the DFS-backed store exists it replaces this file; the handler, election and load generator don't change.
+
+```text
+<shared-state-dir>/
+  state.toml                  resources, assignments, incidents that got a resource   (small: at most 10 each)
+  requests/<request_id>.toml  one per committed request: the create-if-absent record
+  state.lock                  file lock: one node at a time changes the state
+```
+
+- `commit` follows P4's InMemoryStore rules inside the lock: request already committed → `AlreadyCommitted`; a planned resource not free → `ResourceTaken`; otherwise mark the resources, then write the request record.
+- Files are written to a temporary file and renamed, so nobody reads a half-written file.
+- Reading or writing problems (e.g. a network share dropping) come back as `StateUnavailable`, as the interface expects.
+
+| Change | File | Owner |
+|---|---|---|
+| New shared-folder store + 5 tests | `crates/node/src/file_store.rs` | P6 (new) |
+| `--shared-state-dir <dir>` flag; uses the store when given | `crates/node/src/main.rs` | P1 (marked in capitals) |
+| `with_store` usable outside tests | `crates/node/src/state.rs` | P1/P4 (marked) |
+| `default_resources()` moved out, same constants | `crates/node/src/store.rs` | P4 (marked) |
+| `serde`, `toml` dependencies | `crates/node/Cargo.toml` | (already in the workspace) |
+| Runner: shared state on by default; fresh folder per run (local), `shared_state_dir` (lab) | `crates/loadgen/src/bin/experiment.rs` | P6 |
+
+Without `--shared-state-dir`, a node behaves exactly as before (its own private copy).
+
+**Tests:** two nodes see each other's assignments; a request committed on one node is found on another; **3 nodes racing 30 commits for 10 resources give out exactly 10, none twice**; an empty plan is stored and takes nothing; a restarted node keeps the shared state.
+
+**Result** (3 local nodes, same short ramp, release):
+
+```text
+shared state ON:   960 requests, 10 got a resource, 10 different resources, 0 errors   # one set of 10 ✅
+shared state OFF: 1159 requests, 30 got a resource                                    # 3 private copies ❌
+```
+
+All 3 nodes still win elections with the shared store (325 / 325 / 310). Throughput was a bit lower in this run (79 vs 96 ok/s), as expected from the file lock.
+
+**Running nodes by hand:** give all 3 nodes the same empty folder, e.g. `cargo run --release -p node -- --id 1 --shared-state-dir shared-state` (and the same for 2 and 3). Empty it before each run, or the resources stay taken from the previous run.
+
+---
+
+## 17. Step B, Fri Oct 30: reliability per scenario
+
+Plan task: "success percentage, failed count and lost-request count per scenario (no failure, one node down, network cut), from the request CSV status column and the fault CSV". Unblocked by P1's client failure handling (PR #23) and P5's fault log.
+
+**Definitions** (the plan asked P6 to confirm what counts as lost):
+
+| Term | Meaning | From the CSV |
+|---|---|---|
+| success % | requests that got a plan, out of all requests | `status = ok` |
+| failed | at least one attempt got no plan | `attempts > 1` or `status != ok` |
+| retried | got a plan, but only after a retry (failover worked) | `status = ok` and `attempts > 1` |
+| **lost** | **no plan after all attempts** | `status = timeout` or `error` |
+
+**Scenarios.** Each request gets the scenario that was going on while it ran (from sending until its reply), taken from the fault logs:
+- **one node down** = overlaps a `MUTE_START`..`MUTE_END` window in P5's `logs/faults-node<N>.csv` (the node hangs and answers nothing);
+- **network cut** = overlaps a `CUT_START`..`CUT_END` window in `logs/faults-runner.csv` (the node's program is stopped, so calls fail at once, then restarted with the same shared state);
+- **no failure** = neither. `PEER_DOWN`/`PEER_UP` rows are ignored: they say when others *noticed*, not when the fault was.
+
+**New program** `crates/loadgen/src/bin/reliability.rs`:
+
+```bash
+cargo run --release -p loadgen --bin reliability -- results/<run>/<run>.csv --faults results/<run>/logs/faults-node1.csv results/<run>/logs/faults-runner.csv
+```
+
+**Experiment runner:** a new `[[faults]]` list causes failures on a timer while the load runs, and every run now saves `reliability.txt`.
+
+```toml
+[[faults]]
+kind = "mute"        # one node down: P5's injector (inject --node 2 --duration 10000ms --wait 5s)
+node = 2
+at_secs = 10         # seconds after the load starts
+duration_secs = 10   # a mute lasts at most 20 s
+
+[[faults]]
+kind = "cut"         # network cut: the runner stops node 3's program, then starts it again (local mode only)
+node = 3
+at_secs = 30
+duration_secs = 8
+```
+
+Also in the runner: a 1 s wait before stopping the nodes, so the last election rows are written (Farida's review of PR #24).
+
+**Result** (`experiments/reliability-local.toml`, 3 local nodes, 4 clients for 50 s, shared state):
+
+```text
+scenario        requests        ok   success  failed  retried   lost        p50        p95
+no failure          2362      2362   100.00%       0        0      0   50.05 ms   80.34 ms
+one node down        819       819   100.00%       2        2      0   41.63 ms   63.89 ms
+network cut          650       650   100.00%       3        3      0   40.96 ms   71.98 ms
+all                 3831      3831   100.00%       5        5      0   46.42 ms   77.60 ms
+```
+
+**No request was lost** in any scenario: when a node was muted or cut off, the other two took over, and the few requests caught mid-failure (5) got their plan on a retry. Win share per 10 s window shows the failover: node 2 fell to 0.1% while muted (10-20 s) and node 3 to 7.7% while cut off (30-40 s).
+
+Tests (`cargo test -p loadgen`): requests split by the fault they overlap (a request sent just before a fault but still running counts as affected); a fault with no end lasts its planned duration; `PEER_DOWN` rows are not faults; a cut wins over a mute when both overlap; older CSVs without `attempts` still work.
+
+**Observation for P1/P3:** around the faults, the elections log shows a few split decisions (7 elections where nodes named different winners in one run) and loadgen counts ~170 late plans (a second plan for a request that already had one). With the shared store only one plan can be committed per request, so a second plan is the stored one returned again; worth checking with the election design.
+
+---
+
 ## How to run everything
 
 ```bash

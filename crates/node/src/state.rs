@@ -86,7 +86,8 @@ impl NodeState {
 
     /// Replaces this node's own store. Tests give several nodes the same one, so they
     /// share state the way they will through the DFS.
-    #[cfg(test)]
+    /// NOTE FOR P1/P4: P6 REMOVED `#[cfg(test)]` HERE SO main.rs CAN PLUG IN THE TEMPORARY
+    /// SHARED-FOLDER STORE (--shared-state-dir, file_store.rs) UNTIL THE DFS IS CONNECTED.
     pub fn with_store(mut self, store: Arc<dyn SharedState>) -> Self {
         self.store = store;
         self

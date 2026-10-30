@@ -13,3 +13,8 @@ stage_secs = 30                    # 2.5 minutes in total
 # Multicast to all 3 nodes (no `target`). Check the retry timing on the lab network:
 attempts = 3
 attempt_timeout_ms = 2000
+
+# TEMPORARY until P4's DFS: the 3 nodes share ONE set of resources through a folder all 3 machines
+# reach, e.g. a Windows shared folder. Replace the path; empty the folder before each run.
+# Or set `shared_state = false` to give each node its own private copy (the old behaviour).
+shared_state_dir = '\\REPLACE-ME\rescuemesh-state'
