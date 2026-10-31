@@ -263,6 +263,18 @@ impl SubmitOutcome {
         self.plan.as_ref().map(|plan| !plan.assignments.is_empty())
     }
 
+    /// How the request ended, for the CSV's `outcome` column (Step C, P6's reliability %):
+    /// - "committed": a plan came back that was made and saved for this request
+    /// - "duplicate": a plan came back, but it was already saved for this request_id (a retry found it)
+    /// - "failed":    no plan (timeout or error)
+    pub fn outcome(&self) -> &'static str {
+        match (self.status, self.duplicate) {
+            (SubmitStatus::Ok, false) => "committed",
+            (SubmitStatus::Ok, true) => "duplicate",
+            _ => "failed",
+        }
+    }
+
     /// Builds the outcome for a request that got no usable reply.
     fn failed(request_id: String, latency_us: u64, status: SubmitStatus, error: String) -> Self {
         SubmitOutcome {
@@ -498,5 +510,17 @@ mod tests {
         let out = client(&nodes, FAST).submit(pb::Incident::default()).await;
         assert_eq!(out.status, SubmitStatus::Ok, "{out:?}");
         assert_eq!((out.attempts, out.executor_node, out.duplicate), (2, Some(1), true));
+    }
+
+    #[test]
+    fn outcome_is_committed_duplicate_or_failed() {
+        let mut out = SubmitOutcome::failed("r1".into(), 0, SubmitStatus::Timeout, "no reply".into());
+        assert_eq!(out.outcome(), "failed");
+        out.status = SubmitStatus::Error;
+        assert_eq!(out.outcome(), "failed");
+        out.status = SubmitStatus::Ok;
+        assert_eq!(out.outcome(), "committed");
+        out.duplicate = true;
+        assert_eq!(out.outcome(), "duplicate", "a retry that found the stored plan");
     }
 }

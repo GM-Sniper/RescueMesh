@@ -1,9 +1,9 @@
 # The 3 real lab machines. Before running: replace each REPLACE-ME with that
-# machine's IPv4 address (ipconfig), keep the port. Until then a node refuses to
+# machine's IPv4 address (hostname -I), keep the port. Until then a node refuses to
 # start ("addr ... is not ip:port"), so fake addresses can never be used by mistake.
 # Every machine uses this same file; only --id differs:
 #   cargo run --release -p node -- --id N --config config/nodes.lab.toml
-# Allow node.exe through each machine's firewall (private networks).
+# Open TCP 50051 in each machine's firewall if it has one. Full steps: docs/lab-setup.md
 
 [[nodes]]
 id = 1
