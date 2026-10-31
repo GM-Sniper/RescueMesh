@@ -9,6 +9,7 @@
 //! |--------------|----------------------------------|----------|---------|-------------|
 //! | `MUTE_START` | the muted node, when it goes silent | set   | empty   | set         |
 //! | `MUTE_END`   | the muted node, when it wakes up    | set   | empty   | empty       |
+//! | `READY`      | the muted node, when P3's rejoin rule passes (rejoin.rs) | set | empty | empty |
 //! | `PEER_DOWN`  | each other node, when its detector suspects a peer | empty | set | empty |
 //! | `PEER_UP`    | each other node, when that peer is heard again     | empty | set | empty |
 //!
@@ -67,6 +68,12 @@ impl FaultLog {
     /// This node's silence for `fault_id` just ended.
     pub fn mute_end(&self, fault_id: &str) {
         self.write("MUTE_END", fault_id, None, None);
+    }
+
+    /// P3: after the mute for `fault_id`, the rejoin rule passed and this node may win
+    /// elections again. Recovery time = this row's time - the MUTE_END row's time.
+    pub fn ready(&self, fault_id: &str) {
+        self.write("READY", fault_id, None, None);
     }
 
     /// The failure detector just suspected `peer`.

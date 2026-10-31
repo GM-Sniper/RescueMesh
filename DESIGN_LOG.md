@@ -145,3 +145,19 @@ SeaweedFS is a service we use. The consistency rules are ours: how create-if-abs
 | 24 concurrent creates over 3 filers all succeeded, and the filers sometimes ended up holding different winners | 0 of 8 rounds had exactly one winner; filers disagreed in 3 of 8 (4 of 8 and 6 of 8 in earlier runs) | The filers replicate metadata asynchronously, so writes to different filers are last-writer-wins |
 | 3 filers with their own local stores do share metadata, with no central database | A write on one filer was readable on the others after 3 to 28 ms (median 7 ms, localhost) | Check passes, but the sharing is asynchronous |
 | The **S3 gateway's** `If-None-Match: *` did give exactly one winner over two gateways on different filers | 8 of 8 scripted rounds, 11 of 11 earlier manual rounds, and 4 of 4 rounds with a filer killed | The only tested way to get create-if-absent from SeaweedFS. Why it works is UNVERIFIED (likely a shared lock among filers). **Needs Yasmina's decision**: use the S3 gateway, test the filer gRPC exclusive-create (UNVERIFIED), or reconsider |
+
+
+## P3: Rejoin readiness rule (Step C)
+
+Code: `crates/node/src/rejoin.rs`, called by the mute hook in `service.rs` when a mute ends.
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| A node is not ready from the start of a mute until it has (1) dropped its election decisions from before the mute, (2) read the shared state once, (3) heard a heartbeat from at least one peer since waking. Only then do its bids carry `ready = true` | Ready as soon as the mute ends; a fixed wait (the plan's fallback: 3 s) | After a mute the node's load score is 0, so it would win every election at once with stale decisions and no proof it can reach the state or its peers. The three checks are the ones in Yasmina's placeholder (PR #30), so they test exactly what the node needs, and usually pass in well under a fixed 3 s |
+| A not-ready node still answers bid calls, with `ready = false` | Stay silent until ready | It counts as answered, so peers do not wait the full bid timeout for it, but it cannot win (already in the election rule) |
+| The "reload" is one successful `snapshot()` | A separate reload call on the state interface | Nodes keep no copy of the state; they read it on every request. So nothing needs reloading, only proof the state is reachable. The rule retries every 50 ms while the state is unavailable |
+| Dropped in-flight work = the election table is cleared | Keep old decisions | A request we had won may have been re-elected without us. A cleared table makes a client retry run a fresh election. Requests held at the mute gate are already dropped by the gate |
+| The node writes a `READY` row to the fault log when the rule passes | Log only to the console | P6 measures recovery time as `READY` time minus `MUTE_END` time, on the same node, so no clock offset between machines |
+| A node with no peers is ready once it can read the state | Wait for a heartbeat forever | Nobody could ever send it one. Only happens in single-node tests |
+
+Expected recovery time: up to one heartbeat interval (500 ms) plus one state read. Measured on the real machines in Step D.

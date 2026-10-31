@@ -2,7 +2,7 @@
 //! Shared as `Arc<NodeState>`: cheap to clone, all clones point to the same struct.
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::NodeId;
@@ -43,6 +43,11 @@ pub struct NodeState {
     /// Private: used only through heard_from / check_peers / alive_peers, so the
     /// time always comes from the same clock and the lock is held only briefly.
     detector: Mutex<FailureDetector>,
+    /// P3: when we last heard from any peer. The rejoin rule waits for one after a mute.
+    last_heard: Mutex<Option<Instant>>,
+    /// P3: false from a mute until the rejoin rule passes (see rejoin.rs). Our bids
+    /// carry it, and a not-ready bid cannot win.
+    ready: AtomicBool,
     /// P5's fault CSV (MUTE_START/END, PEER_DOWN/UP). None in tests, so they write no files.
     pub fault_log: Option<FaultLog>,
     /// P3: every election this node has taken part in (see election.rs).
@@ -66,6 +71,8 @@ impl NodeState {
             store: Arc::new(InMemoryStore::with_default_resources()),
             muted_until: Mutex::new(None),
             detector: Mutex::new(detector),
+            last_heard: Mutex::new(None),
+            ready: AtomicBool::new(true),
             fault_log: None,
             election: Mutex::new(ElectionTable::new()),
             election_log: None,
@@ -154,6 +161,24 @@ impl NodeState {
     /// "We just heard from `peer`": a reply to our heartbeat, or a heartbeat it sent us.
     pub fn heard_from(&self, peer: NodeId) {
         self.detector.lock().unwrap().record(peer, now_std());
+        // Clients (0) and unknown IDs are not peers, so they do not count for rejoin.
+        if self.peers.ids().any(|p| p == peer) {
+            *self.last_heard.lock().unwrap() = Some(Instant::now());
+        }
+    }
+
+    /// True if some peer was heard at or after `since`.
+    pub fn heard_any_since(&self, since: Instant) -> bool {
+        matches!(*self.last_heard.lock().unwrap(), Some(t) if t >= since)
+    }
+
+    /// P3: may this node win elections right now? See rejoin.rs.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::SeqCst);
     }
 
     /// Re-checks every peer; returns only the changes (PeerDown / PeerUp).

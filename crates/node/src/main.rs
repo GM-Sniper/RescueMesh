@@ -22,6 +22,8 @@ mod load;
 // BELOW. NOTHING ELSE IN THIS FILE CHANGED. PLEASE KEEP BOTH LINES WHEN YOU MERGE MAIN INTO STEPA/P1.
 mod node_metrics;
 mod peers;
+// P3: rejoin readiness rule after a mute (Step C).
+mod rejoin;
 mod service;
 mod state;
 // P4: in-memory implementation of the shared-state interface (common::shared_state).

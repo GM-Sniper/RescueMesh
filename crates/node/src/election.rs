@@ -503,8 +503,8 @@ fn own_bid(state: &NodeState) -> Bid {
     Bid {
         node_id: state.id,
         load_score: state.load_report().load_score,
-        // TODO(P3): false while the shared state (P4's DFS) cannot be reached.
-        ready: true,
+        // False after a mute until the rejoin rule passes (rejoin.rs).
+        ready: state.is_ready(),
     }
 }
 
@@ -935,6 +935,37 @@ mod tests {
         let r = request("r7");
         let winners = tokio::join!(run_election(&n1, &r), run_election(&n2, &r));
         assert_eq!(winners, (Some(2), Some(2)));
+    }
+
+    #[tokio::test]
+    async fn node_back_from_a_mute_cannot_win_until_ready() {
+        let cfg = three_node_config();
+        let (n1, n2, n3) = (
+            serve(1, &cfg).await,
+            serve(2, &cfg).await,
+            serve(3, &cfg).await,
+        );
+        // Node 3 is idle (score 0) but has not passed the rejoin rule yet.
+        let _busy1 = [n1.start_request(), n1.start_request()];
+        let _busy2 = n2.start_request();
+        n3.set_ready(false);
+        let r = request("r7");
+        let winners = tokio::join!(
+            run_election(&n1, &r),
+            run_election(&n2, &r),
+            run_election(&n3, &r)
+        );
+        assert_eq!(winners, (Some(2), Some(2), Some(2)));
+
+        // Ready again: the next request goes to node 3, the least loaded.
+        n3.set_ready(true);
+        let r = request("r8");
+        let winners = tokio::join!(
+            run_election(&n1, &r),
+            run_election(&n2, &r),
+            run_election(&n3, &r)
+        );
+        assert_eq!(winners, (Some(3), Some(3), Some(3)));
     }
 
     // ---- Part 2: waiting only for peers the detector reports alive ----
