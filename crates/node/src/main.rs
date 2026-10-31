@@ -65,7 +65,8 @@ struct Args {
     run_id: Option<String>,
     /// Extra planner work on this node only: replaces `[planner] iterations` from the
     /// shared config, to make it a slower machine in load-balancing tests. At the default
-    /// sizes one iteration is about 0.7 us of CPU, so 30000 is about 20 ms per plan.
+    /// sizes one iteration is about 0.32 us of CPU (since P2's #27), so 30000 is about 10 ms
+    /// per plan, 900000 about 0.3 s and 9000000 about 3 s.
     #[arg(long)]
     planner_iterations: Option<usize>,
 }
