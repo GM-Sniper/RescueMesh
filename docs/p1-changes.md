@@ -129,3 +129,32 @@ Failure detection across all runs: a muted or stopped node was suspected 1.07 to
 5. **Windows only.** A stopped process on localhost takes about 2 s to refuse a connection on Windows, so elections waited the 300 ms bid timeout until the node was suspected. On Linux the refusal is immediate; check in the lab.
 
 **Next:** fix 1 and 2, rerun case 3 (and the others) locally, then repeat everything in the lab on Nov 1 once loadgen uses `connect_all` (P6).
+
+## Step C: the failure cases again, on shared state, after the fixes (Oct 31)
+
+**What changed since Oct 29.** The Submit fix (section 14 of `docs/p1-design-log.md`) fixes findings 1 and 2. P5's #33 puts the state in SeaweedFS for all 3 nodes and cuts a muted node off from it (finding 3). P1's new request log (`logs/requests-nodeN.csv`, see below) shows what each node did with each request.
+
+**How it was tested.** Same as Oct 29, on one Windows laptop: 3 real nodes (release build) with `backend = "s3"` against a local SeaweedFS 4.48 (one `weed server -s3`), the real injector for mutes, and loadgen with multicast (the default since #24). The bucket was deleted before each run. After each run: the request CSV, the nodes' fault logs and request logs, and every object in the bucket were checked. Plan time per planner iteration is now about 0.32 us (P2's #27 halved it): 900 000 iterations take about 290 ms, 9 000 000 about 3 s.
+
+| Run | What was done | Requests | Result |
+|---|---|---|---|
+| Multicast, silent node | Node 3 muted for 15 s, 10 requests/s | 300 | 300 committed, 0 retries. Longest wait 315 ms (the bid timeout, before node 3 was suspected 1.43 to 1.46 s after the mute) |
+| Case 1: network cut | Node 3's process stopped at 8 s, started again 15 s later | 300 | 300 committed, 0 retries. Suspected 1.52 to 1.58 s after the stop. After the restart node 3 read the shared state and took 56 requests |
+| Case 2: winner took the request, then died | Every plan about 300 ms; node 2 muted twice (8 s, 5 s) | 150 | 150 committed, 1 retry. The request node 2 was planning when muted: its save was refused (`error:unavailable` at 304 ms), the client retried at 2.05 s, both live nodes re-elected, node 3 saved it at **2.58 s** |
+| Case 3: slow request | Node 1's plans about 3 s, over the 2 s deadline; 1 request every 5 s | 6, run twice | **6 committed in both runs** (Oct 29: 1 failed in each). Node 1 kept planning after the first attempt gave up; the retry at 2.03 s joined that work (no second START on node 1); plan at 2.9 to 3.2 s |
+
+In every run the bucket held exactly one saved request per request_id (300, 300, 150, 6, 6), and no resource was in two plans.
+
+**Request log, as P6 will read it.** Each node writes a START row when it starts working on a request and an END row when it stops, with how it ended (`committed`, `duplicate`, `lost` = another node won, or `error:<code>`) and how long it took. In case 2 the retried request reads: START on all 3 at 0 ms, nodes 1 and 3 `lost` at 1 ms, node 2 `error:unavailable` at 304 ms (muted mid-plan), START again on nodes 1 and 3 at 2046 ms (the retry), node 3 `committed` at 2584 ms. A switched-off node writes no END, so a START without an END is a request that was unfinished when its node died. No run had one: no process was stopped mid-request.
+
+### Findings from Oct 29, now
+
+1. **Slow request never succeeds:** fixed (case 3).
+2. **Same request handled twice on one node:** fixed. The retry, and a peer's bid, join the work already running.
+3. **Two assignments across nodes:** fixed by #33. One shared store, and a muted node's save is refused.
+4. **Rejoin (P3):** in P3's #32, not merged yet.
+5. **Windows only, slow connection refusal:** not seen to matter here; check on Linux in the lab.
+
+**`duplicate` on a first attempt is not a bug.** With shared state, a node that gets the client's copy after the winner saved the plan answers from the store (19 node-side `duplicate` ENDs in case 1). The client keeps the first plan it gets, so all 300 were `committed` on the client side. P6's "committed twice" report is this: one saved plan, returned twice. The bucket checks above show no request was ever saved twice.
+
+**Next:** the same runs on the 3 lab PCs (Nov 1, `docs/lab-setup.md`), with one SeaweedFS per PC.
