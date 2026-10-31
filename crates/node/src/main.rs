@@ -22,6 +22,8 @@ mod load;
 // BELOW. NOTHING ELSE IN THIS FILE CHANGED. PLEASE KEEP BOTH LINES WHEN YOU MERGE MAIN INTO STEPA/P1.
 mod node_metrics;
 mod peers;
+// P1: START/END row per Submit, for P6's measurements (Step C).
+mod request_log;
 mod service;
 mod state;
 // P4: in-memory implementation of the shared-state interface (common::shared_state).
@@ -44,6 +46,7 @@ use tracing_subscriber::EnvFilter;
 use crate::election_log::ElectionLog;
 use crate::fault_log::FaultLog;
 use crate::peers::Peers;
+use crate::request_log::RequestLog;
 use crate::service::NodeService;
 use crate::state::NodeState;
 
@@ -120,12 +123,17 @@ async fn main() -> anyhow::Result<()> {
     let election_log_path = format!("logs/elections-node{}.csv", args.id);
     let election_log = ElectionLog::open(&election_log_path, args.id, &run_id)
         .with_context(|| format!("cannot open election log {election_log_path}"))?;
+    // P1: request CSV (START/END per Submit), same run_id, for P6's lost-request cases.
+    let request_log_path = format!("logs/requests-node{}.csv", args.id);
+    let request_log = RequestLog::open(&request_log_path, args.id, &run_id)
+        .with_context(|| format!("cannot open request log {request_log_path}"))?;
     // P5, Step C: the shared-state backend. "memory" (default) keeps P4's per-node store;
     // "s3" connects to the SeaweedFS S3 gateway named in [shared_state] (see s3_store.rs).
     let backend = config.shared_state.clone();
     let mut node_state = NodeState::new(args.id, config, peers)
         .with_fault_log(fault_log)
-        .with_election_log(election_log);
+        .with_election_log(election_log)
+        .with_request_log(request_log);
     if backend.backend == StateBackend::S3 {
         let s3 = s3_store::S3Store::connect(&backend, store::default_resources())
             .await

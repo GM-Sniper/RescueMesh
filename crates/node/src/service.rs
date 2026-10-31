@@ -138,11 +138,18 @@ fn start_or_join(state: &Arc<NodeState>, req: SubmitRequest) -> watch::Receiver<
         // request_id can be stuck "in progress" with nobody working on it.
         let _entry = InProgressEntry { state: &state, request_id: req.request_id.clone() };
         let request_id = req.request_id.clone();
+        let started = std::time::Instant::now();
+        if let Some(log) = &state.request_log {
+            log.start(&request_id); // for P6: a START with no END = unfinished when the node died
+        }
         let counted = state.start_request(); // real work: counts in our load (P3)
         let outcome = handle_submit(&state, req).await.map(Response::into_inner);
         drop(counted); // stop counting before anyone sees the result
         if let Err(status) = &outcome {
             tracing::debug!(%request_id, %status, "submit failed");
+        }
+        if let Some(log) = &state.request_log {
+            log.end(&request_id, &outcome, started.elapsed());
         }
         let _ = send.send(Some(outcome)); // an error here only means nobody is waiting any more
     });
@@ -587,6 +594,37 @@ iterations = 20000
         assert!(svc.submit(Request::new(bad)).await.is_err());
         wait_until_idle(&svc).await; // an error must not leave the request stuck "in progress"
         assert_eq!(svc.state.in_flight(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_log_has_one_start_and_end_per_piece_of_work() {
+        use crate::request_log::RequestLog;
+        let mut path = std::env::temp_dir();
+        path.push(format!("rescuemesh-test-{}-svc-requests.csv", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let cfg = ClusterConfig::parse("[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n").unwrap();
+        let peers = Peers::new(&cfg, 1).unwrap();
+        let state = NodeState::new(1, cfg, peers).with_request_log(RequestLog::open(&path, 1, "t").unwrap());
+        let svc = NodeService::new(Arc::new(state));
+
+        // Two copies at once (client + retry) are one piece of work: one START, one END.
+        let (a, b) = tokio::join!(svc.submit(submit_req("q1", 1)), svc.submit(submit_req("q1", 1)));
+        a.unwrap();
+        b.unwrap();
+        // A later retry is new work that finds the stored plan.
+        svc.submit(submit_req("q1", 1)).await.unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        let events: Vec<String> = text
+            .lines()
+            .skip(1) // header
+            .map(|l| {
+                let c: Vec<&str> = l.split(',').collect();
+                format!("{} {} {}", c[2], c[3], c[4])
+            })
+            .collect();
+        assert_eq!(events, ["q1 START ", "q1 END committed", "q1 START ", "q1 END duplicate"]);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test(start_paused = true)]

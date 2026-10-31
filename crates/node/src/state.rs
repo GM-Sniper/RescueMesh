@@ -23,6 +23,7 @@ use crate::election_log::ElectionLog;
 use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
+use crate::request_log::RequestLog;
 use crate::peers::Peers;
 use crate::store::InMemoryStore;
 use crate::gated_store::MuteGatedStore;
@@ -58,6 +59,9 @@ pub struct NodeState {
     /// already running instead of planning again (see service.rs, `start_or_join`).
     /// Locked only briefly, never across a wait.
     pub in_progress: Mutex<HashMap<String, watch::Receiver<Option<SubmitResult>>>>,
+    /// P1's request CSV: START and END of each Submit's work, for P6's measurements
+    /// (see request_log.rs). None in tests, so they write no files.
+    pub request_log: Option<RequestLog>,
 }
 
 /// One Submit's result, copied to everyone waiting for it.
@@ -85,7 +89,14 @@ impl NodeState {
             election: Mutex::new(ElectionTable::new()),
             election_log: None,
             in_progress: Mutex::new(HashMap::new()),
+            request_log: None,
         }
+    }
+
+    /// Turns on the request CSV (main does this; tests leave it off).
+    pub fn with_request_log(mut self, log: RequestLog) -> Self {
+        self.request_log = Some(log);
+        self
     }
 
     /// Turns on the fault CSV (main does this; tests leave it off).
