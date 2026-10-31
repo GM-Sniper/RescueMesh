@@ -820,3 +820,23 @@ latency p50 / p95:  mute  before 17.9 / 34.8 ms, during 15.7 / 23.8 ms, after 17
 3. **Foreign traffic** in the first attempt: 2,262 requests (steady ~85/s) reached the nodes in the 26 s before our load started and took all 10 resources. Nothing else was running afterwards, and the nodes listen on `0.0.0.0`, so a client on the same network can reach them. The safeguards flagged it and the run was discarded.
 
 **Not the plan's 2.6 s failover:** with multicast every live node already has the request, so failover is about one bid timeout (0.3-0.6 s). The 2.6 s case still shows as the ~2 s max latency during a failure (requests that hit the client deadline and were saved by a retry).
+
+## 20. Step C, Sat Oct 31: checks after merging PR #26, and the "foreign traffic" explained
+
+**After merging `main` (PR #26 outcome column, PR #28 P3's test fix) into `StepC/p6`:** everything builds, and every test in the workspace passes (node 134, loadgen 29 across the binaries, client 9). The node test that used to fail is fixed by PR #28. The dry run's CSV now ends with P1's `outcome` column, and `reliability.txt` splits ok into committed and duplicate (for example 2,946 committed + 316 duplicate, 0 lost).
+
+**Observation for P1/P3: duplicates on the first attempt.** Almost all duplicates have `attempts = 1`, so no retry caused them: the same request was committed twice (two nodes, or twice on one node) and the client's first plan was the second, "already stored" reply. This matches P1's own finding in `docs/p1-changes.md` (the same request handled twice). The shared store keeps it to one assignment, so it is not a correctness problem, but it is extra work.
+
+**The "foreign traffic" was our own load generator, copied by the antivirus.** Three runs (one on Oct 31 at 02:51, two today) had 668 to 2,262 requests in the node logs that were not in the CSV, all in the ~26 s before our first request, and they took all 10 resources. What showed the cause:
+
+| Check | Result |
+|---|---|
+| Incidents of the foreign requests | the same as ours (seed 1: Supply 5, Fire 5, Fire 8, ...): sent by a load generator with our settings |
+| Processes connected to the node ports, each second | **two `loadgen.exe`**: one from 15:38:16 to 15:38:38, then the runner's own from 15:38:41 |
+| The runner's `loadgen` | started at 15:38:15 but only sent from 15:38:41: held for 26 s |
+| Antivirus | **AVG Antivirus** active (Windows Defender off) |
+| When it happens | only on the first run after a `cargo build` (a new program) |
+
+AVG holds a newly built program and first runs a sandboxed **copy** of it, with the same arguments, for ~25 s. The copy really reaches `127.0.0.1`, so it sent requests to the nodes. Then the real one ran with the same run ID and overwrote the copy's CSV. (The nodes' 26-43 s slow starts after a build are the same check.)
+
+**Fix in `crates/loadgen/src/bin/experiment.rs`:** before the real run, the runner starts `node`, `loadgen` and `inject` once with `--help`, so AVG checks a harmless run. After a fresh build the next run was clean (no warnings). The first run after a build takes ~50 s longer while AVG checks the `--help` runs. Another option is an AVG exception for the repo's `target` folder, a security setting each person changes themselves. The safeguards (section 15) are what caught this: without them the polluted runs would have looked like "0 resources assigned".

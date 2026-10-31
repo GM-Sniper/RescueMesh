@@ -203,6 +203,15 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Warm-up: run each program once with --help before the real run. Some antivirus programs (AVG
+    // on P6's laptop) hold a newly built program and first run a sandboxed COPY of it, with the same
+    // arguments, for ~25 s. That copy really sent requests to the nodes: 668 to 2,262 "foreign"
+    // requests per run, all the resources taken before our load started. With this warm-up the
+    // antivirus checks a harmless --help run instead, and the real run starts at once.
+    for name in ["node", "loadgen", "inject"] {
+        let _ = Command::new(bin(name)).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).status(); // result unused: only the first launch matters
+    }
+
     println!("experiment {run_id}: results go to {}", out.display());
 
     // 1. Nodes: start them here (local) or have the user start them (lab).
