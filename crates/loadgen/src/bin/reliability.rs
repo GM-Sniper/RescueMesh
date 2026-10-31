@@ -8,16 +8,22 @@
 //! - the fault logs: P5's logs/faults-node<N>.csv (MUTE_START / MUTE_END, written by the muted node)
 //!   and the experiment runner's logs/faults-runner.csv (CUT_START / CUT_END). Same columns.
 //!
-//! Definitions (Step B plan, P6 review note: "confirm what counts as lost"):
-//! - success = the request got a plan (status ok), after however many attempts it took;
+//! Definitions (Step B plan, P6 review note: "confirm what counts as lost"; Step C: DESIGN_LOG.md,
+//! "P6: Failure metrics"):
+//! - ok      = the request got a plan: P1's outcome `committed` or `duplicate` (a retry found the
+//!             stored plan). CSVs without the outcome column: status ok;
 //! - failed  = at least one attempt got no plan: the request needed a retry, or was lost;
 //! - retried = needed more than one attempt but got a plan in the end (failover worked);
-//! - lost    = no plan after all attempts (status timeout or error);
-//! - success % = ok / requests.
+//! - lost    = no plan after all attempts (outcome `failed`, status timeout or error);
+//! - reliability % = ok / requests.
 //!
 //! Scenario of a request: whatever was going on while it ran, from when it was sent until its
 //! reply (or until it gave up). If its time overlaps a cut it counts as "network cut"; else if it
 //! overlaps a mute, "one node down"; otherwise "no failure".
+//!
+//! Every lost request is listed with its failure case (the three cases the client handles):
+//! overlaps a cut -> network cut; overlaps a mute -> winner died after taking the request;
+//! no failure and timed out -> slow request; anything else -> unexplained (check the node logs).
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -66,9 +72,13 @@ struct Window {
 
 /// One request: when it ran and how it ended.
 struct Request {
+    id: String,        // request_id, to list the lost ones
     from_us: u128,
     to_us: u128,
-    ok: bool,
+    ok: bool,          // got a plan: committed or duplicate
+    duplicate: bool,   // the plan was already stored: a retry found it (P1's outcome column)
+    no_resource: bool, // got a plan, but nothing was free (assigned = false)
+    status: String,    // ok / timeout / error: how the last attempt ended
     attempts: u32,
     latency_us: u64,
 }
@@ -78,9 +88,31 @@ struct Request {
 struct Tally {
     requests: u64,
     ok: u64,
-    retried: u64, // ok, but after more than one attempt
-    lost: u64,    // no plan after all attempts
+    duplicates: u64,  // ok, and the plan was found already stored
+    no_resource: u64, // ok, but nothing was free
+    retried: u64,     // ok, but after more than one attempt
+    lost: u64,        // no plan after all attempts
     latencies_us: Vec<u64>,
+}
+
+/// The failure case a lost request is put in (DESIGN_LOG.md, "Which failure case a lost request was").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Case {
+    NetworkCut,
+    WinnerDied,
+    SlowRequest,
+    Unexplained,
+}
+
+impl Case {
+    fn label(self) -> &'static str {
+        match self {
+            Case::NetworkCut => "network cut",
+            Case::WinnerDied => "winner died after taking the request",
+            Case::SlowRequest => "slow request",
+            Case::Unexplained => "unexplained (check the node logs)",
+        }
+    }
 }
 
 fn main() -> anyhow::Result<()> {
@@ -93,16 +125,20 @@ fn main() -> anyhow::Result<()> {
     }
     let windows = parse_windows(&fault_texts)?;
     print_report(&tally(&requests, &windows), &windows);
+    print_lost(&requests, &windows, csv.lines().next().is_some_and(|h| h.split(',').any(|c| c == "outcome")));
     Ok(())
 }
 
-/// Reads the request CSV. Columns are found by name; `attempts` is optional (older CSVs: 1 try each).
+/// Reads the request CSV. Columns are found by name; `attempts`, `assigned` and `outcome` are
+/// optional (older CSVs: 1 try each, no resource info, outcome derived from status).
 fn parse_requests(text: &str) -> anyhow::Result<Vec<Request>> {
     let mut lines = text.lines();
     let header: Vec<&str> = lines.next().context("file is empty")?.split(',').collect();
     let column = |name: &str| header.iter().position(|c| *c == name).with_context(|| format!("column `{name}` is missing"));
-    let (i_ts, i_lat, i_status) = (column("timestamp")?, column("latency_us")?, column("status")?);
+    let (i_ts, i_lat, i_status, i_id) = (column("timestamp")?, column("latency_us")?, column("status")?, column("request_id")?);
     let i_attempts = header.iter().position(|c| *c == "attempts");
+    let i_assigned = header.iter().position(|c| *c == "assigned"); // true = a resource was given
+    let i_outcome = header.iter().position(|c| *c == "outcome");   // P1's column: committed / duplicate / failed
 
     let mut requests = Vec::new();
     for (n, line) in lines.enumerate() {
@@ -122,7 +158,32 @@ fn parse_requests(text: &str) -> anyhow::Result<Vec<Request>> {
             Some(i) => field(i)?.parse().with_context(|| format!("line {line_no}: bad attempts"))?,
             None => 1,
         };
-        requests.push(Request { from_us: sent_us, to_us: sent_us + latency_us as u128, ok: status == "ok", attempts, latency_us });
+        // Outcome: P1's column when the CSV has it, otherwise derived from status (plan task 9:
+        // "P6 derives it from status"). The derived one can't see duplicates: they count as committed.
+        let outcome = match i_outcome {
+            Some(i) => field(i)?,
+            None if status == "ok" => "committed",
+            None => "failed",
+        };
+        if !matches!(outcome, "committed" | "duplicate" | "failed") {
+            bail!("line {line_no}: unknown outcome `{outcome}`");
+        }
+        let ok = outcome != "failed";
+        let assigned = match i_assigned {
+            Some(i) => field(i)? == "true",
+            None => true, // older CSVs: unknown, so don't report a shortage that may not exist
+        };
+        requests.push(Request {
+            id: field(i_id)?.to_string(),
+            from_us: sent_us,
+            to_us: sent_us + latency_us as u128,
+            ok,
+            duplicate: outcome == "duplicate",
+            no_resource: ok && !assigned, // answered, but every resource was taken
+            status: status.to_string(),
+            attempts,
+            latency_us,
+        });
     }
     Ok(requests)
 }
@@ -180,6 +241,8 @@ fn tally(requests: &[Request], windows: &[Window]) -> BTreeMap<Scenario, Tally> 
         t.requests += 1;
         if r.ok {
             t.ok += 1;
+            t.duplicates += r.duplicate as u64;    // a retry found the plan already stored
+            t.no_resource += r.no_resource as u64; // answered, but nothing was free
             t.latencies_us.push(r.latency_us);
             if r.attempts > 1 {
                 t.retried += 1; // failover worked: a later attempt got the plan
@@ -198,19 +261,63 @@ fn print_report(by: &BTreeMap<Scenario, Tally>, windows: &[Window]) {
     let mutes = windows.iter().filter(|w| w.kind == Scenario::NodeDown).count();
     let cuts = windows.iter().filter(|w| w.kind == Scenario::NetworkCut).count();
     println!("reliability ({mutes} node-down and {cuts} network-cut windows in the fault logs):");
-    println!("  {:<14} {:>9} {:>9} {:>9} {:>7} {:>8} {:>6} {:>10} {:>10}", "scenario", "requests", "ok", "success", "failed", "retried", "lost", "p50", "p95");
+    println!("  {:<14} {:>9} {:>9} {:>11} {:>7} {:>8} {:>6} {:>10} {:>10}", "scenario", "requests", "ok", "reliability", "failed", "retried", "lost", "p50", "p95");
     let mut all = Tally::default();
     for (scenario, t) in by {
         print_row(scenario.label(), t);
         all.requests += t.requests;
         all.ok += t.ok;
+        all.duplicates += t.duplicates;
+        all.no_resource += t.no_resource;
         all.retried += t.retried;
         all.lost += t.lost;
         all.latencies_us.extend(&t.latencies_us);
     }
     all.latencies_us.sort_unstable();
     print_row("all", &all);
+    println!("  ok = got a plan: {} committed + {} duplicate (a retry found the stored plan)", all.ok - all.duplicates, all.duplicates);
+    println!("  of the ok ones, {} got no resource (all taken): answered, so not lost", all.no_resource);
     println!("  failed = needed a retry or was lost; retried = got a plan after a retry; lost = no plan after all attempts");
+}
+
+/// The failure case of a lost request, from the faults its time overlaps and how it ended.
+fn case_of(r: &Request, windows: &[Window]) -> Case {
+    match scenario_of(r, windows) {
+        Scenario::NetworkCut => Case::NetworkCut,
+        Scenario::NodeDown => Case::WinnerDied, // the muted node had it and never answered
+        Scenario::NoFailure if r.status == "timeout" => Case::SlowRequest,
+        Scenario::NoFailure => Case::Unexplained, // an error with no failure going on
+    }
+}
+
+/// Every lost request with its failure case ("each one needs an explanation", Step C plan).
+fn print_lost(requests: &[Request], windows: &[Window], has_outcome: bool) {
+    let t0 = requests.iter().map(|r| r.from_us).min().unwrap_or(0); // times from the first request sent
+    let lost: Vec<(Case, &Request)> = requests.iter().filter(|r| !r.ok).map(|r| (case_of(r, windows), r)).collect();
+    if !has_outcome {
+        println!("  (no outcome column in this CSV: outcome derived from status, so duplicates count as committed)");
+    }
+    if lost.is_empty() {
+        println!("lost requests: 0");
+        return;
+    }
+    let mut by_case: BTreeMap<Case, usize> = BTreeMap::new();
+    for (case, _) in &lost {
+        *by_case.entry(*case).or_default() += 1;
+    }
+    println!("lost requests: {}, by failure case:", lost.len());
+    for (case, n) in &by_case {
+        println!("  {:<40} {:>6}", case.label(), n);
+    }
+    const SHOWN: usize = 100; // enough to explain each one; the rest are in the CSV (outcome failed)
+    println!("  {:<40} {:>9} {:>8} {:>8}  {}", "request_id", "sent", "attempts", "status", "case");
+    for (case, r) in lost.iter().take(SHOWN) {
+        let sent = format!("{:.2} s", (r.from_us - t0) as f64 / 1e6);
+        println!("  {:<40} {:>9} {:>8} {:>8}  {}", r.id, sent, r.attempts, r.status, case.label());
+    }
+    if lost.len() > SHOWN {
+        println!("  ... and {} more (rows with no plan in the CSV)", lost.len() - SHOWN);
+    }
 }
 
 fn print_row(label: &str, t: &Tally) {
@@ -224,7 +331,7 @@ fn print_row(label: &str, t: &Tally) {
         }
     };
     println!(
-        "  {:<14} {:>9} {:>9} {:>8.2}% {:>7} {:>8} {:>6} {:>10} {:>10}",
+        "  {:<14} {:>9} {:>9} {:>10.2}% {:>7} {:>8} {:>6} {:>10} {:>10}",
         label, t.requests, t.ok, success, t.retried + t.lost, t.retried, t.lost, pct(50.0), pct(95.0)
     );
 }
@@ -283,8 +390,55 @@ mod tests {
             Window { kind: Scenario::NodeDown, node: 2, from_us: 0, to_us: 100 },
             Window { kind: Scenario::NetworkCut, node: 3, from_us: 50, to_us: 150 },
         ];
-        let r = Request { from_us: 60, to_us: 70, ok: true, attempts: 1, latency_us: 10 };
+        let r = Request { id: "a".into(), from_us: 60, to_us: 70, ok: true, duplicate: false, no_resource: false, status: "ok".into(), attempts: 1, latency_us: 10 };
         assert_eq!(scenario_of(&r, &windows), Scenario::NetworkCut);
+    }
+
+    #[test]
+    fn worked_example_9962_of_10000_is_99_62_percent_with_38_lost() {
+        // The Step C plan's example, as a hand-made CSV: 10,000 requests, 38 got no plan.
+        let mut csv = String::from(CSV);
+        for i in 0..10_000u64 {
+            let status = if i < 38 { "timeout" } else { "ok" };
+            csv += &row(1_000 + i, 5, status, 1);
+        }
+        let requests = parse_requests(&csv).unwrap();
+        let by = tally(&requests, &[]);
+        let t = &by[&Scenario::NoFailure];
+        assert_eq!((t.requests, t.ok, t.lost), (10_000, 9_962, 38));
+        let reliability = 100.0 * t.ok as f64 / t.requests as f64;
+        assert!((reliability - 99.62).abs() < 1e-9, "got {reliability}");
+        // With no failure going on, a timeout is a slow request.
+        assert!(requests.iter().filter(|r| !r.ok).all(|r| case_of(r, &[]) == Case::SlowRequest));
+    }
+
+    #[test]
+    fn outcome_column_counts_duplicates_as_ok_and_failed_as_lost() {
+        let csv = "run_id,timestamp,client_id,request_id,latency_us,executor_node,status,assigned,stage,attempts,no_plan_replies,outcome\n\
+                   r,1,1,a,1000,1,ok,true,1,1,0,committed\n\
+                   r,2,1,b,1000,2,ok,true,1,2,0,duplicate\n\
+                   r,3,1,c,1000,3,ok,false,1,1,0,committed\n\
+                   r,4,1,d,1000,,timeout,false,1,3,0,failed\n";
+        let by = tally(&parse_requests(csv).unwrap(), &[]);
+        let t = &by[&Scenario::NoFailure];
+        assert_eq!((t.requests, t.ok, t.duplicates, t.no_resource, t.lost), (4, 3, 1, 1, 1));
+    }
+
+    #[test]
+    fn a_lost_request_gets_the_case_of_the_failure_it_ran_in() {
+        let windows = vec![
+            Window { kind: Scenario::NodeDown, node: 2, from_us: 10_000_000, to_us: 20_000_000 },
+            Window { kind: Scenario::NetworkCut, node: 3, from_us: 30_000_000, to_us: 38_000_000 },
+        ];
+        let csv = format!(
+            "{CSV}{}{}{}{}",
+            row(12_000, 6_000, "timeout", 3), // during the mute
+            row(31_000, 10, "error", 3),      // during the cut
+            row(50_000, 6_000, "timeout", 3), // no failure: slow
+            row(60_000, 10, "error", 3),      // no failure, fast error: unexplained
+        );
+        let cases: Vec<Case> = parse_requests(&csv).unwrap().iter().map(|r| case_of(r, &windows)).collect();
+        assert_eq!(cases, [Case::WinnerDied, Case::NetworkCut, Case::SlowRequest, Case::Unexplained]);
     }
 
     #[test]

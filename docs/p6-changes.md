@@ -739,3 +739,84 @@ On the lab machines, use `--release` for real measurements and `--config config/
 - Switch from the mock to P1's real node once `Submit` is wired (only `--node` changes).
 - Wed Oct 21: small run first, then the 1000-request run on the 3 real machines, then the stats script on its CSV.
 - Step B: line up loadgen CSVs with `node_metrics` and P5's fault logs for the plots.
+
+## 18. Step C, Sat Oct 31: metric definitions, failover and recovery time, latency around a failure
+
+Plan tasks: "Metric definitions in the design log", "Script for failover time and recovery time from the node fault CSVs and the request CSV", "Latency in three windows (before, during, after a failure) per run".
+
+**Definitions:** new section "P6: Failure metrics (Step C)" at the end of `DESIGN_LOG.md` (failover, detection, recovery, reliability %, lost requests, which failure case a lost request was, clocks). Waiting for review by P5, P3 and P1.
+
+**New program** `crates/loadgen/src/bin/failover.rs`. For every mute or cut in the fault logs it prints:
+
+| Line | Meaning | From |
+|---|---|---|
+| detected | first time a live node suspected the failed one | `PEER_DOWN` in the live nodes' fault logs |
+| answered (failover) | first plan from a live node that could only have come without the failed node: sent after the failure started, or caught by it and saved by a retry | request CSV (`timestamp + latency_us`, `executor_node`, `attempts`) |
+| ready (recovery) | **STAND-IN** until P3 logs a readiness event: the first election the returning node wins after it is back | `MUTE_END`/`CUT_END`, then P3's `elections-node<N>.csv` |
+| latency before / during / after | p50, p95, max and lost requests; before and after are as long as the failure, and stop at the neighbouring failures | request CSV |
+
+```bash
+cargo run --release -p loadgen --bin failover -- results/<run>/<run>.csv --faults results/<run>/logs/faults-node1.csv results/<run>/logs/faults-node2.csv results/<run>/logs/faults-node3.csv results/<run>/logs/faults-runner.csv --elections results/<run>/logs/elections-node1.csv results/<run>/logs/elections-node2.csv results/<run>/logs/elections-node3.csv
+```
+
+**Experiment runner:** every run with fault logs now also saves `failover.txt`.
+
+**Result** on the Step B reliability run (`results/reliability-local-1793394717`):
+
+```text
+failure 1: node 2 muted, 10.03 s -> 20.03 s (10.00 s)
+  detected     11.30 s   detection   1.27 s
+  answered     10.35 s   failover    0.32 s
+  ready        20.04 s   recovery    0.00 s   STAND-IN
+  latency   requests   lost        p50        p95        max
+  before        2520      0   16.20 ms   18.81 ms   38.83 ms
+  during        2181      0   16.00 ms   18.19 ms 2034.73 ms
+  after         2432      0   16.25 ms   18.59 ms   31.34 ms
+failure 2: node 3 cut, 29.99 s -> 38.57 s (8.58 s)
+  detected     31.49 s   detection   1.49 s
+  answered     30.31 s   failover    0.32 s
+  ready        38.57 s   recovery    0.00 s   STAND-IN
+```
+
+- **Failover 0.32 s, not the plan's 2.6 s:** with multicast every live node gets every request, so the client does not have to wait for its 2 s deadline. The two live nodes wait one bid timeout (300 ms) for the silent node's bid, then elect without it. The 2.6 s case still happens to a few requests (the 2034 ms max "during"): those hit the deadline and were saved by the retry.
+- **Recovery 0.00 s** because no readiness rule exists yet: a returning node bids at once. When P3's rule (reload state, then set ready) is in, this number becomes real.
+- **Latency:** p50 and p95 are the same before, during and after: a failure only hurts the few requests caught in it (the max), and the system is back to normal right after.
+
+Tests (`cargo test -p loadgen --bin failover`): the plan's worked examples give 1.5 s detection, 2.6 s failover and 1.7 s recovery (with a request elected just before the mute and one answered by the muted node, which must not count); no answer while the node is down is "not measured", never 0; a node that never came back has no recovery; a cut is measured like a mute; latency is split into the three windows; the side windows stop at the neighbouring failures.
+
+## 19. Step C, Sat Oct 31: lost requests explained, and the fail-recover dry run
+
+### Task 4: reliability % and lost requests (`crates/loadgen/src/bin/reliability.rs`)
+
+- Reads **P1's `outcome` column** (`committed` / `duplicate` / `failed`) when the CSV has it; otherwise derives it from `status` and says so. `ok` = committed + duplicate.
+- Prints how many of the ok requests were **duplicates** (a retry found the stored plan) and how many got **no resource** (answered, all resources taken: not lost).
+- The column is now called **reliability** (was "success").
+- **Every lost request is listed** with its request_id, send time, attempts, last status and **failure case**: overlaps a cut → network cut; overlaps a mute → winner died after taking the request; no failure and timed out → slow request; anything else → unexplained (check the node logs). Counts per case first; the first 100 are listed.
+- New tests: the plan's worked example as a hand-made CSV (10,000 requests, 38 timeouts) gives **9,962 ok, 99.62%, 38 lost**; the outcome column counts duplicates as ok and failed as lost; each lost request gets the case of the failure it ran in.
+
+### Task 6: dry run (`experiments/fail-recover-local.toml`)
+
+Ramp 1 → 2 → 4 → 8 clients, 15 s each. Node 2 muted at 17 s for 8.4 s (the plan's example length); node 3 cut at 47 s for 8 s, under the heaviest load. One command prints everything (`reliability.txt` and `failover.txt` in the run folder):
+
+```bash
+cargo build --release
+cargo run --release -p loadgen --bin experiment -- experiments/fail-recover-local.toml
+```
+
+Result (`results/fail-recover-local-1793408269`, clean run, no warnings):
+
+```text
+reliability 99.99% (7,062 of 7,063), lost 1: network cut (sent 46.96 s, just before the cut, 3 attempts, timeout)
+failure 1: node 2 muted 17.08 -> 25.48 s   detection 1.40 s   failover 0.34 s   recovery 21.81 s (STAND-IN)
+failure 2: node 3 cut   46.99 -> 55.57 s   detection 1.19 s   failover 0.62 s   recovery 0.00 s (STAND-IN)
+latency p50 / p95:  mute  before 17.9 / 34.8 ms, during 15.7 / 23.8 ms, after 17.5 / 36.3 ms
+                    cut   before 18.5 / 50.3 ms, during 33.8 / 212.7 ms, after 129.6 / 310.3 ms
+```
+
+**Three things the dry run found:**
+
+1. **A restarted node waited ~13 s to start** (an earlier run's cut lasted 21 s instead of 8 s). `FileStore::open` took the shared lock just to check that `state.toml` exists, and under 8 clients the two live nodes held that lock almost all the time. Fixed in `crates/node/src/file_store.rs`: when `state.toml` exists, no lock is taken (it only ever appears whole, by rename). After the fix the cut lasts 8.58 s.
+2. **For P3: node 2 won no election for 21.8 s after its mute ended.** The election rows from 25.4 s on hold only the bids of nodes 1 and 3 (node 2's bid is missing), node 1's score stays at 0.89, and node 3 wins 100% of 20-40 s. The fault logs also show `PEER_DOWN`/`PEER_UP` flapping at ~33 s under the heavier stages. Likely the laptop is overloaded (3 nodes and 8 clients on one machine) and heartbeats and bids arrive late. The recovery stand-in reports it honestly as "not taking work", which is why P3's readiness event is the better measure.
+3. **Foreign traffic** in the first attempt: 2,262 requests (steady ~85/s) reached the nodes in the 26 s before our load started and took all 10 resources. Nothing else was running afterwards, and the nodes listen on `0.0.0.0`, so a client on the same network can reach them. The safeguards flagged it and the run was discarded.
+
+**Not the plan's 2.6 s failover:** with multicast every live node already has the request, so failover is about one bid timeout (0.3-0.6 s). The 2.6 s case still shows as the ~2 s max latency during a failure (requests that hit the client deadline and were saved by a retry).

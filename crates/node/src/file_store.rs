@@ -62,6 +62,11 @@ impl FileStore {
     pub fn open(dir: impl AsRef<Path>, starting_resources: Vec<Resource>) -> io::Result<Self> {
         let dir = dir.as_ref().to_path_buf();
         fs::create_dir_all(dir.join(REQUESTS_DIR))?;
+        if dir.join(STATE_FILE).exists() {
+            // Already created (state.toml only appears whole, by rename), so no lock is needed. A
+            // node restarted under heavy load waited ~13 s for the lock here (Step C dry run).
+            return Ok(FileStore { dir });
+        }
         locked(&dir, |d| {
             if !d.join(STATE_FILE).exists() {
                 save(d, &StateFile { resources: starting_resources, ..StateFile::default() })?;

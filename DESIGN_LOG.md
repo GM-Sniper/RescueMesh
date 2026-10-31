@@ -145,3 +145,57 @@ SeaweedFS is a service we use. The consistency rules are ours: how create-if-abs
 | 24 concurrent creates over 3 filers all succeeded, and the filers sometimes ended up holding different winners | 0 of 8 rounds had exactly one winner; filers disagreed in 3 of 8 (4 of 8 and 6 of 8 in earlier runs) | The filers replicate metadata asynchronously, so writes to different filers are last-writer-wins |
 | 3 filers with their own local stores do share metadata, with no central database | A write on one filer was readable on the others after 3 to 28 ms (median 7 ms, localhost) | Check passes, but the sharing is asynchronous |
 | The **S3 gateway's** `If-None-Match: *` did give exactly one winner over two gateways on different filers | 8 of 8 scripted rounds, 11 of 11 earlier manual rounds, and 4 of 4 rounds with a filer killed | The only tested way to get create-if-absent from SeaweedFS. Why it works is UNVERIFIED (likely a shared lock among filers). **Needs Yasmina's decision**: use the S3 gateway, test the filer gRPC exclusive-create (UNVERIFIED), or reconsider |
+
+
+## P6: Failure metrics (Step C)
+
+How the report's failure numbers are measured. The scripts that compute them are `crates/loadgen/src/bin/` (`reliability.rs` now, a failover script next). **Review: P5 (fault logs), P3 (readiness event), P1 (outcome column). The plan asks P6 to confirm these definitions, so they are open to change until reviewed.**
+
+### Where the times come from
+
+| Time | Source | Clock |
+|---|---|---|
+| Failure starts (`t_fail`) | `MUTE_START` in `logs/faults-node<N>.csv`, or `CUT_START` in `logs/faults-runner.csv` | Muted node, or the runner |
+| Failure ends, node is back (`t_back`) | `MUTE_END` or `CUT_END` in the same files | Same |
+| Peer suspected | First `PEER_DOWN` for node N in a live node's fault log | Live node |
+| Request sent | `timestamp` in the request CSV (unix ms) | Client |
+| Request done | `timestamp + latency_us` | Client |
+| Node wins work | `wall_ts_us` of a row in `elections-node<M>.csv` with `winner = N` | Node M |
+
+### Definitions
+
+| Metric | Definition | Worked example (plan) |
+|---|---|---|
+| **Failover time** | `t_answer - t_fail`, per failure. `t_answer` is when the first request finishes that (a) got a plan (outcome `committed` or `duplicate`), (b) was executed by a node other than the failed one, and (c) could only have been answered without the failed node: it was sent at or after `t_fail`, or it was in flight at `t_fail` and needed a retry (`attempts > 1`). If no such request finishes before `t_back`, failover is reported as "not measured", never as 0 | Muted at 10.0 s, suspected at 11.5 s, first request answered by a live node at 12.6 s: 12.6 - 10.0 = **2.6 s** |
+| **Detection time** (supporting number) | First `PEER_DOWN` for the failed node on any live node, minus `t_fail` | 11.5 - 10.0 = **1.5 s** (3 missed 500 ms heartbeats) |
+| **Recovery time** | `t_ready - t_back`, per failure that ends inside the run. `t_ready` is when P3's readiness rule says the returning node is ready to bid again. **Until P3 logs that event**, the stand-in is the first election, on any node, won by the returning node at or after `t_back` | Back at 18.4 s (10.0 s + 8.4 s), ready at 20.1 s: 20.1 - 18.4 = **1.7 s** |
+| **Reliability %** | Requests that ended with a plan (outcome `committed` or `duplicate`) ÷ all requests sent, × 100. Given per run and per scenario (no failure, node down, network cut) | 9,962 of 10,000 = **99.62%** |
+| **Lost requests** | Requests that ended with no plan (outcome `failed`): all requests minus those with a plan. Each one is listed with its request_id, send time, attempts and last status, and is put in one of the three failure cases (below) | 10,000 - 9,962 = **38**, each explained |
+
+### Which failure case a lost request was
+
+The three cases are the ones the client handles (`crates/client/src/lib.rs`). The CSV does not say which node held a request, so the case comes from when the request ran ([sent, done]) and how it failed:
+
+| The request ran during | Last status | Case |
+|---|---|---|
+| A network cut (`CUT_START`..`CUT_END`) | any | Network cut |
+| A mute (`MUTE_START`..`MUTE_END`) | any | Winner died after taking the request |
+| No failure window | `timeout` | Slow request |
+| Anything else | | **Unexplained**: checked by hand in the node logs, and reported as such |
+
+### Decisions
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Failover ends at the first answer that could not have used the failed node (sent after `t_fail`, or retried) | The first answer of any kind after `t_fail`; the moment the node is suspected | A request elected just before the mute can finish a few ms after it and would give a failover of almost 0 that says nothing. Suspicion is only detection: the client still needs an answer. Detection is reported next to failover so both are visible |
+| A failure with no qualifying answer before `t_back` is "not measured", never 0 or the full mute length | Report 0; report the mute length | Either number would be made up. With multicast, live nodes may answer quickly, so a short failover is a real result, but a missing one must look missing |
+| Recovery uses a stand-in (first election won after `t_back`) until P3's readiness event exists | Wait for P3; use `PEER_UP` (other nodes see heartbeats again) | The script and the dry run can be built now. `PEER_UP` only shows the node is alive, not that it reloaded the state and bids again. The stand-in is an **upper bound**: a ready node can still lose elections to a less busy node, so under low load it can overstate recovery. Replaced by the readiness event as soon as it is logged |
+| `duplicate` counts as reliable | Count only `committed` | `duplicate` means a retry found the plan already saved and the client got that plan: the request was answered exactly once. Not counting it would punish the retry that makes the system fault tolerant. "Committed" in the plan's example is read as "ended with a plan" |
+| A plan with no resource (`assigned = false`, all resources taken) counts as reliable, and is reported separately | Count it as lost | The system answered correctly; it just had nothing free. Lost means no answer at all. Mixing the two would hide failures behind resource shortage, or the reverse |
+| One CSV row per request_id; a retry is not a second request | Count every attempt | Reliability is about what the user of the system sees: did their request get a plan. `attempts` keeps the retry count for the failover numbers |
+| A request belongs to a failure if its [sent, done] overlaps the failure window; a cut wins over a mute | Use the send time only | Already the rule in `reliability.rs` (Step B). A request sent just before a mute and stuck in it is exactly the one the mute hurt |
+| Until P1's `outcome` column is merged, the scripts derive it: `status = ok` is a plan, anything else is `failed` | Wait for the column | The plan allows it (task 9: "P6 derives it from status and assigned"). The derived version cannot see `duplicate`, so it is counted as `committed`, which gives the same reliability % |
+
+### Clocks
+
+On one laptop every time comes from the same clock. On the lab machines they do not: failover mixes the node's clock (`t_fail`) with the client's (`done`), and recovery mixes two nodes' clocks. Every failover and recovery time is then off by up to the clock difference between those machines. P1's lab notes list clock sync as a to-do; the lab runs record each machine's offset (for example `w32tm /stripchart` on Windows) so the report can give it as the error bar. Latency and reliability % use one clock each and are not affected.

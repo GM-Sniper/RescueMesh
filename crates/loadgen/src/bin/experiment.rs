@@ -12,6 +12,7 @@
 //!   summary.txt                      the stats script's output
 //!   elections-summary.txt            election metrics and win share (from the nodes' election logs)
 //!   reliability.txt                  success %, failed, retried, lost per scenario (no failure, node down, cut)
+//!   failover.txt                     per failure: detection, failover, recovery time, latency before/during/after
 //!   logs/faults-runner.csv           network cuts the runner caused (`[[faults]] kind = "cut"`)
 //!   node<N>.log                      each node's console output
 //!   logs/faults-node<N>.csv          each node's fault log (P5)
@@ -196,7 +197,7 @@ fn main() -> anyhow::Result<()> {
     // The other programs are built next to this one (target/release or target/debug).
     let bin_dir = std::env::current_exe()?.parent().context("no folder for this program")?.to_path_buf();
     let bin = |name: &str| bin_dir.join(format!("{name}{EXE_SUFFIX}"));
-    for name in ["node", "loadgen", "stats", "elections", "reliability", "inject"] {
+    for name in ["node", "loadgen", "stats", "elections", "reliability", "failover", "inject"] {
         if !bin(name).exists() {
             bail!("{} not found: run `cargo build --release` first (it builds every program)", bin(name).display());
         }
@@ -315,6 +316,21 @@ fn main() -> anyhow::Result<()> {
     }
     fs::write(out.join("reliability.txt"), &reliability.stdout)?;
     print!("{}", String::from_utf8_lossy(&reliability.stdout));
+
+    // 4b3. Failover, recovery and latency around each failure (Step C), only when there were failures.
+    if !fault_logs.is_empty() {
+        let mut failover_cmd = Command::new(bin("failover"));
+        failover_cmd.arg(&csv).arg("--faults").args(&fault_logs); // when each failure started and ended
+        if !election_logs.is_empty() {
+            failover_cmd.arg("--elections").args(&election_logs); // who won when: the recovery stand-in
+        }
+        let failover = failover_cmd.output().context("could not start failover")?;
+        if !failover.status.success() {
+            bail!("failover failed: {}", String::from_utf8_lossy(&failover.stderr));
+        }
+        fs::write(out.join("failover.txt"), &failover.stdout)?;
+        print!("{}", String::from_utf8_lossy(&failover.stdout));
+    }
 
     // 4c. Safeguards: say so when this run's results can't be trusted, and keep the warnings in the folder.
     let csv_text = fs::read_to_string(&csv)?;
