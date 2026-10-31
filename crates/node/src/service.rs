@@ -277,6 +277,8 @@ pub(crate) async fn handle_inject_fault(
     }
 
     let duration = Duration::from_millis(cmd.duration_ms);
+    // P3: not ready from now until the rejoin rule passes after the mute.
+    state.set_ready(false);
     state.mute_for(duration);
     tracing::info!(
         fault_id = %cmd.fault_id,
@@ -298,6 +300,7 @@ pub(crate) async fn handle_inject_fault(
         if let Some(log) = &state.fault_log {
             log.mute_end(&fault_id);
         }
+        crate::rejoin::rejoin(&state, &fault_id).await;
     });
 
     // Sent even though we are now muted: this request passed the gate before the mute.
@@ -574,7 +577,11 @@ mod tests {
             .skip(1) // header
             .map(|l| l.split(',').take(6).collect::<Vec<_>>().join(","))
             .collect();
-        assert_eq!(events, ["t,1,MUTE_START,f1,,10000", "t,1,MUTE_END,f1,,"]);
+        // No peers here, so the rejoin rule passes as soon as the state is read.
+        assert_eq!(
+            events,
+            ["t,1,MUTE_START,f1,,10000", "t,1,MUTE_END,f1,,", "t,1,READY,f1,,"]
+        );
     }
 
     // ---- Task 5c: an incoming heartbeat counts as hearing from its sender.

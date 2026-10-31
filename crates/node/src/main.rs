@@ -22,6 +22,8 @@ mod load;
 // BELOW. NOTHING ELSE IN THIS FILE CHANGED. PLEASE KEEP BOTH LINES WHEN YOU MERGE MAIN INTO STEPA/P1.
 mod node_metrics;
 mod peers;
+// P3: rejoin readiness rule after a mute (Step C).
+mod rejoin;
 mod service;
 mod state;
 // P4: in-memory implementation of the shared-state interface (common::shared_state).
@@ -141,6 +143,11 @@ async fn main() -> anyhow::Result<()> {
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
     fault_round::spawn(state.clone());
+    // P3: a (re)started node has missed what happened while it was down, like a muted one,
+    // so it bids again only once the rejoin rule passes (rejoin.rs).
+    state.set_ready(false);
+    let rejoining = state.clone();
+    tokio::spawn(async move { rejoin::rejoin(&rejoining, "startup").await });
     // P6 (SEE NOTE AT THE TOP, P1): ONE ROW PER SECOND TO logs/node_metrics-node<ID>.CSV
     node_metrics::spawn(state.clone(), format!("logs/node_metrics-node{}.csv", args.id))
         .context("cannot open the node_metrics log")?;
