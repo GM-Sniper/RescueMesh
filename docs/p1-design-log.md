@@ -321,3 +321,20 @@ Node 2's plans took 19.6 ms on average when it won (vs 0.8 ms in the baseline), 
 - A muted node's task can't commit any more: since PR #33 every shared-state call returns `StateUnavailable` while muted (`gated_store.rs`), so the task ends with an error and the client's retry goes to a live node.
 
 **Evidence.** Tests in `service.rs`: `slow_plan_is_saved_even_if_the_caller_stops_waiting`, `same_request_arriving_twice_at_once_is_planned_once`, `finished_requests_leave_the_in_progress_table`. The Oct 29 local run of case 3 is in `docs/p1-changes.md`.
+
+## 15. Request log for P6's lost-request cases (Step C)
+
+**What.** `logs/requests-nodeN.csv` (`request_log.rs`): a START row when the Submit task starts and an END row when it stops, with how it ended (`committed`, `duplicate`, `lost`, `error:<code>`) and how long it took. Same `run_id` and `wall_ts_us` as the fault and election logs, so P6 can join them. For measurements only: the node never reads it back, and in-flight tracking stays on the client (Step C plan).
+
+**Why.** P6 must say which failure case each retried or lost request was. The client's CSV only shows that an attempt got no plan. The node logs show why: no START on a node (the request never reached it), a START with no END (the node was working on it when it died), or an END after the client's 2 s deadline (the node was slow).
+
+**Decisions.**
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Rows written from the Submit task in `start_or_join` | From the `submit` handler | A retry or a peer's bid that joins work already running writes no second START, so one row pair = one piece of work |
+| START written when the work starts, not only at the end | One row per finished request | A switched-off node can't write anything when it dies. Its START is already on disk |
+| A file of its own | More events in P5's fault log | The fault log is about nodes; this is one row pair per request per node, much more |
+| Each row flushed at once | A buffer | So a crash loses at most the row being written. The cost is one small write per row |
+
+**Evidence.** Tests in `request_log.rs` (row format, END details, header once across a restart) and `service.rs` (`request_log_has_one_start_and_end_per_piece_of_work`). The Oct 31 runs in `docs/p1-changes.md` read like the design says: in case 2 the muted winner's END is `error:unavailable` and the retry's winner logs `committed`.
