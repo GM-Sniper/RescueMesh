@@ -81,6 +81,18 @@ Checked: the plan's worked example (queue 4, CPU 50 %, service 20 ms) gives 0.39
 **For P6 (node_metrics):** call `state.load_report()` once per second and log `queue_len`, `cpu_pct`, `service_ms`, `load_score`.
 
 
+## P3: Election (Step C)
+
+Code: `crates/node/src/election.rs`.
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Tie rule confirmed by the team on Oct 30: lowest load score wins, ties go to the lowest node ID (see the load metric table above) | Ties to the highest ID; random | Every node reaches the same answer from the same bids with no extra message. Confirmed for Step C as the plan asked |
+| A node still sends its bid to peers the detector suspects, but only waits for the peers it reports alive. With one node down that is 4 bid calls sent and 2 bids received per election (6 and 6 with all 3 up), not the 2 messages in the Step C plan's worked example | Send only to alive peers, so 2 calls per election | A peer suspected by mistake (a short network hiccup) still gets the bids and can still take part. The two extra calls cost no time, because nobody waits for them. Checked by `csv_row_with_a_node_down_has_two_bids_and_two_calls` |
+
+Election on retry was already checked: `retry_after_the_winner_fails_elects_a_new_one_in_round_1` mutes the round-0 winner, and the client's retry elects a new winner in round 1 without it.
+
+
 ## P4: Store and Change Log
 
 **SUPERSEDED on Oct 21** by "P4: Shared state in a distributed file system" at the end of this file. The log, `applied` map and replication path described here were removed from the code. Kept for history; the code is on branch `p4/backup-step-a-store`.
