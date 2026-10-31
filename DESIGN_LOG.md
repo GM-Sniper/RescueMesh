@@ -94,7 +94,7 @@ P3's Q4: keep the plan from the lower origin `node_id`. Step A: **first applied 
 
 ## P4: Shared state in a distributed file system (DRAFT, for Yasmina to edit)
 
-Code and usage: `crates/common/src/shared_state.rs`, `docs/p4-changes.md`. Replaces the section "P4: Store and Change Log" above. Status as of Oct 23: **SeaweedFS is the chosen candidate, pending the spike. The spike has run; its result changes how SeaweedFS can be used (see the last table).**
+Code and usage: `crates/common/src/shared_state.rs`, `docs/p4-changes.md`. Replaces the section "P4: Store and Change Log" above. Status as of Oct 29: **SeaweedFS is chosen, and the four decisions in "Locked decisions" below were recorded on Oct 29 from Yasmina's written instructions. The Oct 23 spike result (last table) is what led to decision 1.** This section is still a DRAFT for Yasmina to edit.
 
 ### What changed and what stayed
 
@@ -114,9 +114,18 @@ On Oct 21 the design changed: shared state lives in an existing distributed file
 | The interface is an `async` trait whose methods can fail | A synchronous, infallible trait (simplest for the in-memory store) | A DFS write is a network call and can fail. A synchronous trait now would make P1, P3 and P6 rewrite every call site later |
 | `#[async_trait]` (boxed futures) | Native `async fn` in traits | Nodes hold `Arc<dyn SharedState>` so the backend is chosen at start-up. Native async fn in traits cannot be used behind `dyn` |
 | `commit` returns an enum with four cases: `Committed`, `AlreadyCommitted(plan)`, `ResourceTaken`, `StateUnavailable` | `Result<Plan, Error>`; separate calls for "create" and "check" | Each case needs different caller behavior, and an enum makes the compiler force every caller to handle all four. A separate check-then-create has a gap in which two nodes both pass the check |
-| `commit(request_id, incident, plan)`: the incident is a parameter | `commit(request_id, plan)` as first specified | A `Plan` holds only an incident id, and the stored state needs the incident (as `Open` when the plan is empty). Open question 1 in `docs/p4-changes.md` |
-| An unknown resource is reported as `ResourceTaken` | A fifth variant for "unknown resource" | The spec had four variants and the caller's cure is the same (snapshot, plan again). Open question 2 |
+| `commit(request_id, incident, plan)`: the incident is a parameter | `commit(request_id, plan)` as first specified | Locked decision 2 below |
+| An unknown resource is its own outcome, `UnknownResource` | Folding it into `ResourceTaken` (what the first version did) | Locked decision 3 below |
 | In-memory store stays behind the trait for now | Wait for the DFS backend before landing the interface | The interface unblocks P1, P2, P3 and P6 today. Each node's in-memory copy is NOT shared, so no cross-node guarantee exists until the DFS backend does |
+
+### Locked decisions (Oct 29)
+
+| # | Decision | Alternatives | Why |
+|---|---|---|---|
+| 1 | Create-if-absent goes through the SeaweedFS **S3 gateway** with `If-None-Match: *`. **Oct 29 spike 2 caveat: two writers both won in the first race after a filer rejoined; see the last table and open question 9 in `docs/p4-changes.md`. Decision left as locked; its safety is in question** | The filer's gRPC exclusive-create (`o_excl`): untested, needs the SeaweedFS `.proto` files wired into Rust, **kept as the fallback**. Plain filer HTTP PUT: failed (the header is ignored, last writer wins). Other DFSs: see the table below | It is the only route that passed our race tests (Oct 23 spike, see the table at the end) |
+| 2 | `commit(request_id, incident, plan)` | Embed the incident in `Plan` | The stored state needs the incident, and passing it explicitly is clearer than a hidden lookup. Embedding it would change P2's `Plan` type and hide data inside it |
+| 3 | `CommitOutcome` has a separate `UnknownResource { resource_id }` variant | Fold it into `ResourceTaken` (the first version did) | `ResourceTaken` means "take a fresh snapshot and retry", an ordinary race. An unknown resource cannot be fixed by retrying, so it must not look the same, or a caller would loop on a bug. Landed as its own commit (`Add UnknownResource to CommitOutcome`); `handle_submit` in `service.rs` was the only `match` that needed a new arm |
+| 4 | **Rejoin readiness (placeholder, P4 may refine):** a returning node is ready when (a) its S3 gateway is reachable, (b) it has read the resource listing once, and (c) it has passed one heartbeat round | Replaying a log or copying a snapshot (the old design) | State lives in the DFS, so there is nothing to replay. The three conditions check that the node can reach the state, can read it, and is seen by its peers. Not implemented yet; see open question 8 in `docs/p4-changes.md` |
 
 ### Report note (ready to paste)
 
@@ -129,7 +138,8 @@ SeaweedFS is a service we use. The consistency rules are ours: how create-if-abs
 | **Our own thin replication layer** with a file API | It is the replication we already had (a log and sync between nodes), plus the work of defining a file protocol. It moves the same problem rather than removing it |
 | **GlusterFS, Ceph, Lustre, BeeGFS** | Linux-only or too heavy to install and run on the team's mixed lab machines. Platform support: UNVERIFIED for each, not checked in detail |
 | **Windows DFS Replication** | Windows Server only, multi-master, and no atomic create-if-absent |
-| **JuiceFS** | Keeps its metadata in a separate database (Redis, MySQL and similar), which centralizes the state |
+| **JuiceFS** | Mainly setup cost: it needs three pieces (the file system client, a metadata database, and an object store) to install and run on every lab machine. Corrected Oct 29: the earlier reason, "metadata is centralized", is too strong, because the metadata database can itself be replicated (UNVERIFIED: JuiceFS's supported metadata engines and their replication were not checked) |
+| **HDFS** | Central NameNode; high availability needs a standby NameNode plus JournalNodes plus ZooKeeper; files are write-once (no in-place update); a Linux and Java stack with poor Windows support; small records (ours are under 1 KB) are a poor fit. All of these points are UNVERIFIED: none was checked against HDFS documentation or tried |
 | **XtreemFS** | Server runs only on Linux and Solaris. Maintenance status: UNVERIFIED |
 | **etcd, ZooKeeper** | Strong atomic operations, but they are coordination stores, not file systems |
 | **NFS** | One central server |
@@ -145,3 +155,54 @@ SeaweedFS is a service we use. The consistency rules are ours: how create-if-abs
 | 24 concurrent creates over 3 filers all succeeded, and the filers sometimes ended up holding different winners | 0 of 8 rounds had exactly one winner; filers disagreed in 3 of 8 (4 of 8 and 6 of 8 in earlier runs) | The filers replicate metadata asynchronously, so writes to different filers are last-writer-wins |
 | 3 filers with their own local stores do share metadata, with no central database | A write on one filer was readable on the others after 3 to 28 ms (median 7 ms, localhost) | Check passes, but the sharing is asynchronous |
 | The **S3 gateway's** `If-None-Match: *` did give exactly one winner over two gateways on different filers | 8 of 8 scripted rounds, 11 of 11 earlier manual rounds, and 4 of 4 rounds with a filer killed | The only tested way to get create-if-absent from SeaweedFS. Why it works is UNVERIFIED (likely a shared lock among filers). **Needs Yasmina's decision**: use the S3 gateway, test the filer gRPC exclusive-create (UNVERIFIED), or reconsider |
+
+### Spike 2 result (Oct 29, SeaweedFS 4.48, Windows 11, localhost, 3 masters / 3 volume servers on 3 racks with replication 010 / 3 filers / 3 S3 gateways)
+
+| Finding | Evidence | Consequence |
+|---|---|---|
+| S3 `If-None-Match: *` gave exactly one winner and every filer and gateway agreed | 12 of 12 rounds with 24 writers; 10 of 10 with 3 writers; also 12 of 12 with a volume server killed and 12 of 12 with a filer and its gateway killed | Supports decision 1 in normal operation and during a crash |
+| `If-Match` with a shared etag gives exactly one winner | 12 of 12 rounds | Usable later for updates (for example resource leases) |
+| **Two writers both won in the first race after the killed filer and gateway were restarted; the three filers then held different values** | Writers 8 and 23, both through the same gateway; filers 8888 and 8890 held `writer-23`, filer 8889 held `writer-8`. Seen once, not reproduced, test stopped as instructed | Decision 1 does not hold during recovery. Cause is UNVERIFIED (hypothesis: the filers' lock ownership changes when the cluster membership changes). Open questions 8 to 10 |
+| A client-side timeout does not mean the write failed | 10 of 10 timed-out writes landed (reply held back); 5 of 5 landed after a paused gateway resumed | A timed-out `commit` must be `StateUnavailable`; the retry with the same `request_id` returns `412`, which maps to `AlreadyCommitted` |
+| Contended creates are slow for the losers | 24 writers: losers wait about 1 s each, slowest 13-18 s. 3 writers: slowest about 1 s | `commit` needs a timeout of several seconds. Only the elected executor should commit |
+| Reads after a commit were never stale on localhost | 0 of 150 new-key reads and 0 of 150 updated-key reads | Not proof for a real network (UNVERIFIED) |
+| The S3 gateway works with no credentials | Every run was anonymous | Minimal config is none; security is a deployment question |
+| Not run | Check d (kill masters), rejoin of masters, gateway with credentials, replication `020` | Needs a rerun once the two-winner window is understood |
+| Spike 3 (Oct 29): the double win did not recur | 0 two-winner rounds in 360 post-restart or post-mute races (30 runs; 5 s and 90 s outages, kill and suspend, offsets 0-60 s); writer-token read-back: 0 false alarms | Rate unknown; the spike-2 condition (kill during a running race) was not re-created. No hold time can be derived. Decisions unchanged. Details and open questions 13 and 14 in `docs/p4-changes.md` |
+| Spike 3: masters | 1 of 3 down: creates hang 8-25 s during election, then work. 2 of 3 down: reads of existing and never-read data work, every create hangs. Recovery 17-35 s after restart | `commit` needs a timeout; a timeout is `StateUnavailable` |
+
+### Assigned versus completed (Oct 29, from Yasmina's discussion with teammates)
+
+Code: `crates/common/src/shared_state.rs` (trait, types), `crates/node/src/store.rs` (in-memory implementation and tests). Usage: `docs/p4-changes.md` and `docs/p4-team-note.md`. Status: implemented for the in-memory store only; nothing is wired into the failure detector or the election.
+
+**The model.** Each request record has an owner node id and a status: `Assigned` (resources reserved, not yet confirmed done), `Completed`, or `Released` (the owner was declared failed, its resources were freed, the request waits for a new owner). `commit` stores the plan as `Assigned` with the executing node as owner. A commit over a `Released` record atomically moves it to `Assigned` with the new owner, and exactly one concurrent committer wins; `AlreadyCommitted` applies only to `Assigned` or `Completed`. A returning node forgets all in-flight work and re-reads state from shared state; it never resumes anything.
+
+| # | Decision | Alternatives | Why |
+|---|---|---|---|
+| 1 | **No special "late owner" handling.** A node that returns and tries `mark_completed` is checked against the record: if the record is `Released` or owned by another node, the call is rejected (`NotCurrentOwner`) and nothing changes | Let the returned node finish and overwrite the record | Overwriting could clobber the new owner's work. One conditional check handles every case |
+| 2 | **The node elected to handle a failed peer's cleanup releases that peer's requests**, using `release_unfinished_requests_of_failed_node`. The release stays conditional anyway | Every survivor releases independently | One cleaner avoids duplicate work. Independent release would need conflict handling for no benefit. The condition is a safety net: the election can briefly give two winners after a restart (spike 2 findings), and then a second release finds `AlreadyReleased` and does nothing |
+| 3 | **A new election picks the new executor of a released request.** The cleaning node does not run it itself | Wait only for the client's retry; survivors re-run it directly | See open question A below |
+| 4 | **This reverses the Oct 23 decision that cut server-side takeover.** P3 and P1 must review it. The professor's note that fault tolerance is client-side may conflict with it (UNVERIFIED: I did not see the note) | Keep takeover out and rely on client retries | Yasmina's decision after discussion with teammates; recorded here so the reversal is visible |
+| 5 | **Leases as a backstop for late failure detection: undecided** | Not adding leases; adding a lease expiry to each `Assigned` record | See open question B below |
+| 6 | `commit` takes the owner: `commit(request_id, owner_node_id, incident, plan)`. This changes the signature locked on Oct 29 (`commit(request_id, incident, plan)`) by one parameter | The store is built with its node id; the record's owner is looked up later | The owner must be stored with the record, and an explicit argument is clearer than hidden state in a store that, with a DFS backend, is shared by all nodes. Only `handle_submit` in `service.rs` needed the extra argument (`state.id`) |
+| 7 | `lookup_request` returns `None` for a `Released` record | Return the old plan | A released request needs a fresh plan from its next owner; handing the old plan to a retry would reply with resources that were freed |
+| 8 | `mark_completed` sets the incident `Resolved` and **keeps the resources reserved**; `release` sets the incident back to `Open` and frees the resources | Free the resources on completion | The task only defined freeing on release. Open question C |
+| 9 | Every new outcome enum has its own variants (`NotCurrentOwner`, `AlreadyCompleted`, `NotFound`, `AlreadyReleased`, `StateUnavailable`) | Booleans or errors | Same reason as `CommitOutcome`: each case needs different caller behavior |
+
+**Open questions.**
+- **A. What triggers the new election for a released request** (the cleaning node after releasing, or the client's retry)? For P3 and P1 to settle. Until then a released request is picked up only when a client retries it with the same `request_id`, because `lookup_request` returns `None` and the retry is planned afresh.
+- **B. Leases.** Detection takes at least the failure detector's 1.5 s (UNVERIFIED: figure taken from the task text, not re-checked in `failure_detector.rs`), so for that long a failed node's reservations look alive. A lease would let any node treat an `Assigned` record as expired after a fixed time. Not built.
+- **C. Should completion free the reserved resources?** Today they stay assigned forever after `mark_completed` (as the old store did). If resources are reusable, `mark_completed` must free them. Needs P2/Yasmina.
+- **D. Release is atomic here but not on S3** (see the mapping below): resources are separate objects from the record.
+
+**How each transition maps to a conditional S3 write (documented, NOT built; all UNVERIFIED as a whole design).** Spike 1-3 showed `If-None-Match: *` and `If-Match: <etag>` on `PUT` through the S3 gateway giving exactly one winner (12 of 12 rounds each in spike 2), with the one unexplained double win after a filer restart (spike 2).
+
+| Transition | S3 operations |
+|---|---|
+| commit (new request) | `PUT record` with `If-None-Match: *`. `412` means the record exists: read it, and if `Assigned` or `Completed` return `AlreadyCommitted(plan)` |
+| commit over `Released` | `GET record` (note its etag), check `Released`, then `PUT record` with `If-Match: <etag>` and the new owner and `Assigned`. `412` means someone else won the move: `AlreadyCommitted` |
+| `mark_completed` | `GET record`, check `Assigned` and owner, `PUT record` with `If-Match: <etag>` and `Completed`. `412` means the record changed: read again to produce `NotCurrentOwner` or `AlreadyCompleted` |
+| `release_unfinished_request` | `GET record`, check `Assigned` and the expected owner, `PUT record` with `If-Match: <etag>` and `Released`; then delete or overwrite the reservation objects for the plan's resources. A second call finds `Released` and stops |
+| `list_unfinished_requests_owned_by` | List the record objects and read each (or keep a per-owner index object). Cost not measured |
+
+The weak point is the release: the record and the reservations are different objects, and S3 has no multi-object transaction. If the cleaner dies after writing `Released` and before freeing the resources, the resources stay reserved while the record says `Released`. A rerun of the cleaner would then need to free resources for an `AlreadyReleased` record too (the in-memory store does not need that). Open question D.

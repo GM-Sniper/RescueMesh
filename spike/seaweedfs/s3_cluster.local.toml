@@ -1,0 +1,34 @@
+# Config for run_s3_checks.py against the cluster from start_local_cluster.sh.
+# Copy to s3_cluster.real.toml and change the URLs and [control] to run on the real machines.
+
+[cluster]
+# Gateway i must sit in front of filer i, so "kill filer 1 + gateway 1" removes one entry point.
+gateway_urls = ["http://127.0.0.1:8333", "http://127.0.0.1:8334", "http://127.0.0.1:8335"]
+filer_urls = ["http://127.0.0.1:8888", "http://127.0.0.1:8889", "http://127.0.0.1:8890"]
+bucket = "spikebucket"   # S3 bucket names need at least 3 characters
+
+[race]
+concurrent_puts = 24     # writers fired at the same instant at one key
+rounds = 12              # races per check
+
+[staleness]
+samples = 30             # check f: commits, each read back through every other gateway and filer
+
+[timeout]
+client_timeout_seconds = 1   # check g: the client gives up after this long
+proxy_port = 8399            # check g: the delaying proxy listens here
+samples = 10
+
+# How check b, c, d, g stop/start/pause processes. {action} is stop|start|pause|resume and {name}
+# comes from [control.names]. Needs WEED_BIN and RUN_DIR in the environment for proc_ctl.sh.
+# On the real machines replace the template, for example with
+#   "ssh {name} sudo systemctl {action} seaweedfs"   (UNVERIFIED example; names are hosts there)
+# Leave [control] out to skip b, c, d and the paused-gateway part of g.
+[control]
+command_template = "bash proc_ctl.sh {action} {name}"
+
+[control.names]
+master = ["master0", "master1", "master2"]
+volume = ["volume0", "volume1", "volume2"]
+filer = ["filer0", "filer1", "filer2"]
+gateway = ["s3gateway0", "s3gateway1", "s3gateway2"]

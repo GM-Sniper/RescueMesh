@@ -7,7 +7,7 @@
 //!
 //! The old change log, `applied` map, `entries_since` and replication path were removed when
 //! the design moved to a DFS. Three ideas were kept:
-//! - `request_id` is the dedup key (`plans_by_request`).
+//! - `request_id` is the dedup key (`records_by_request`).
 //! - No clocks decide anything.
 //! - `commit` re-checks inside the write lock that every planned resource is still free,
 //!   because `snapshot()` returns a copy that may be stale.
@@ -21,7 +21,11 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use async_trait::async_trait;
 use common::domain::*;
 use common::generators::generate_snapshot;
-use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
+use common::NodeId;
+use common::shared_state::{
+    CommitOutcome, MarkCompletedOutcome, ReleaseOutcome, RequestRecord, RequestStatus, SharedState,
+    StateUnavailable,
+};
 
 // TODO(P4): remove once clients can offer resources; make configurable only if experiments
 // need a different resource count.
@@ -35,14 +39,16 @@ struct Contents {
     resources: BTreeMap<ResourceId, Resource>,
     /// Keyed by resource id: a resource has at most one assignment.
     assignments: BTreeMap<ResourceId, Assignment>,
-    /// The one stored plan per client request. This is the create-if-absent record.
-    plans_by_request: HashMap<String, Plan>,
+    /// The one stored record per client request: the create-if-absent record, with its owner
+    /// and status (`Assigned`, `Completed`, `Released`).
+    records_by_request: HashMap<String, RequestRecord>,
 }
 
 /// Shared state kept in this process's memory. Implements [`SharedState`].
 ///
-/// Why one `RwLock` around everything: `commit` must check and write several maps as one
-/// atomic step, and a single lock is the simplest way to guarantee that.
+/// Why one `RwLock` around everything: `commit`, `mark_completed` and `release_unfinished_request`
+/// must check and write several maps as one atomic step, and a single lock is the simplest way
+/// to guarantee that.
 pub struct InMemoryStore {
     contents: RwLock<Contents>,
 }
@@ -88,23 +94,36 @@ impl SharedState for InMemoryStore {
         })
     }
 
-    async fn commit(&self, request_id: &str, mut incident: Incident, plan: Plan) -> CommitOutcome {
+    async fn commit(
+        &self,
+        request_id: &str,
+        owner_node_id: NodeId,
+        mut incident: Incident,
+        plan: Plan,
+    ) -> CommitOutcome {
         let mut contents = self.write();
 
         // Create-if-absent: two retries of one request can both get past `lookup_request`,
-        // so the check must be repeated here, inside the lock.
-        if let Some(existing) = contents.plans_by_request.get(request_id) {
-            return CommitOutcome::AlreadyCommitted(existing.clone());
+        // so the check must be repeated here, inside the lock. A `Released` record does not
+        // block the commit: it is waiting for a new owner, and this call becomes that owner.
+        // Because the check and the write share one lock, exactly one concurrent committer
+        // sees `Released`; the others then see `Assigned` and get `AlreadyCommitted`.
+        if let Some(existing) = contents.records_by_request.get(request_id) {
+            if existing.status != RequestStatus::Released {
+                return CommitOutcome::AlreadyCommitted(existing.plan.clone());
+            }
         }
 
         // Every planned resource must exist, be unassigned, and appear only once in the plan.
-        // An unknown resource is reported as "taken" too: from the caller's side the cure is
-        // the same (snapshot again and re-plan). Nothing is written before all checks pass.
+        // "Unknown" is reported apart from "taken": re-planning fixes a race but not a
+        // resource that does not exist. Nothing is written before all checks pass.
         let mut seen_in_this_plan = HashSet::new();
         for assignment in &plan.assignments {
             let resource_id = assignment.resource_id;
-            let is_free = contents.resources.contains_key(&resource_id)
-                && !contents.assignments.contains_key(&resource_id);
+            if !contents.resources.contains_key(&resource_id) {
+                return CommitOutcome::UnknownResource { resource_id };
+            }
+            let is_free = !contents.assignments.contains_key(&resource_id);
             if !is_free || !seen_in_this_plan.insert(resource_id) {
                 return CommitOutcome::ResourceTaken { resource_id };
             }
@@ -124,12 +143,114 @@ impl SharedState for InMemoryStore {
                 .insert(assignment.resource_id, assignment.clone());
         }
         contents.incidents.insert(incident.id, incident);
-        contents.plans_by_request.insert(request_id.to_string(), plan);
+        contents.records_by_request.insert(
+            request_id.to_string(),
+            RequestRecord {
+                request_id: request_id.to_string(),
+                owner_node_id,
+                status: RequestStatus::Assigned,
+                plan,
+            },
+        );
         CommitOutcome::Committed
     }
 
+    async fn mark_completed(&self, request_id: &str, node_id: NodeId) -> MarkCompletedOutcome {
+        let mut contents = self.write();
+        let Some(record) = contents.records_by_request.get(request_id) else {
+            return MarkCompletedOutcome::NotFound;
+        };
+        match (record.status, record.owner_node_id == node_id) {
+            (RequestStatus::Completed, _) => return MarkCompletedOutcome::AlreadyCompleted,
+            (RequestStatus::Assigned, true) => {}
+            (status, _) => {
+                return MarkCompletedOutcome::NotCurrentOwner {
+                    current_status: status,
+                    current_owner_node_id: record.owner_node_id,
+                };
+            }
+        }
+        let incident_id = record.plan.incident_id;
+        contents
+            .records_by_request
+            .get_mut(request_id)
+            .expect("record was found above under the same lock")
+            .status = RequestStatus::Completed;
+        // The reserved resources stay assigned after completion (see open question in
+        // docs/p4-changes.md); only the incident moves on.
+        if let Some(incident) = contents.incidents.get_mut(&incident_id) {
+            incident.status = IncidentStatus::Resolved;
+        }
+        MarkCompletedOutcome::Completed
+    }
+
+    async fn list_unfinished_requests_owned_by(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Vec<RequestRecord>, StateUnavailable> {
+        let contents = self.read();
+        let mut unfinished: Vec<RequestRecord> = contents
+            .records_by_request
+            .values()
+            .filter(|r| r.owner_node_id == node_id && r.status == RequestStatus::Assigned)
+            .cloned()
+            .collect();
+        unfinished.sort_by(|a, b| a.request_id.cmp(&b.request_id));
+        Ok(unfinished)
+    }
+
+    async fn release_unfinished_request(
+        &self,
+        request_id: &str,
+        expected_owner_node_id: NodeId,
+    ) -> ReleaseOutcome {
+        let mut contents = self.write();
+        let Some(record) = contents.records_by_request.get(request_id) else {
+            return ReleaseOutcome::NotFound;
+        };
+        let owner_matches = record.owner_node_id == expected_owner_node_id;
+        match (record.status, owner_matches) {
+            (RequestStatus::Completed, _) => return ReleaseOutcome::AlreadyCompleted,
+            (RequestStatus::Released, true) => return ReleaseOutcome::AlreadyReleased,
+            (RequestStatus::Assigned, true) => {}
+            (status, _) => {
+                return ReleaseOutcome::NotCurrentOwner {
+                    current_status: status,
+                    current_owner_node_id: record.owner_node_id,
+                };
+            }
+        }
+        let incident_id = record.plan.incident_id;
+        let reserved: Vec<ResourceId> = record.plan.assignments.iter().map(|a| a.resource_id).collect();
+        // Only remove an assignment that still belongs to this request's incident, so a
+        // resource that somehow belongs to another incident is never freed by mistake.
+        for resource_id in reserved {
+            if contents
+                .assignments
+                .get(&resource_id)
+                .is_some_and(|a| a.incident_id == incident_id)
+            {
+                contents.assignments.remove(&resource_id);
+            }
+        }
+        if let Some(incident) = contents.incidents.get_mut(&incident_id) {
+            incident.status = IncidentStatus::Open;
+        }
+        contents
+            .records_by_request
+            .get_mut(request_id)
+            .expect("record was found above under the same lock")
+            .status = RequestStatus::Released;
+        ReleaseOutcome::Released
+    }
+
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable> {
-        Ok(self.read().plans_by_request.get(request_id).cloned())
+        Ok(self
+            .read()
+            .records_by_request
+            .get(request_id)
+            .filter(|r| r.status != RequestStatus::Released)
+            .map(|r| r.plan.clone()))
     }
 }
 
@@ -192,6 +313,7 @@ mod tests {
         store
             .commit(
                 request_id,
+                1,
                 incident(incident_id),
                 plan_assigning(incident_id, resource_ids),
             )
@@ -293,12 +415,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unknown_resource_or_one_named_twice_is_reported_as_taken_and_writes_nothing() {
+    async fn an_unknown_resource_is_reported_as_unknown_and_a_repeated_one_as_taken_and_nothing_is_written() {
         let store = store_with_resources(3);
         let empty = store.snapshot().await.unwrap();
         assert_eq!(
             commit(&store, "r1", 10, &[1, 77]).await,
-            CommitOutcome::ResourceTaken { resource_id: 77 }
+            CommitOutcome::UnknownResource { resource_id: 77 }
         );
         assert_eq!(
             commit(&store, "r2", 11, &[2, 2]).await,
@@ -361,5 +483,185 @@ mod tests {
         assert_eq!(incident_ids, [10, 20, 30]);
         assert_eq!(resource_ids, [1, 2, 3, 4]);
         assert_eq!(assigned_ids, [1, 3, 4]);
+    }
+
+    // ---- assigned / completed / released lifecycle ----
+
+    use common::shared_state::release_unfinished_requests_of_failed_node;
+
+    async fn commit_as(
+        store: &InMemoryStore,
+        owner: NodeId,
+        request_id: &str,
+        incident_id: u64,
+        resource_ids: &[u64],
+    ) -> CommitOutcome {
+        store
+            .commit(
+                request_id,
+                owner,
+                incident(incident_id),
+                plan_assigning(incident_id, resource_ids),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn completing_a_request_twice_returns_already_completed_the_second_time() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        assert_eq!(store.mark_completed("r1", 1).await, MarkCompletedOutcome::Completed);
+        assert_eq!(store.mark_completed("r1", 1).await, MarkCompletedOutcome::AlreadyCompleted);
+        assert_eq!(
+            store.snapshot().await.unwrap().incidents[0].status,
+            IncidentStatus::Resolved
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_completed_by_the_wrong_node_is_rejected_and_changes_nothing() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        assert_eq!(
+            store.mark_completed("r1", 2).await,
+            MarkCompletedOutcome::NotCurrentOwner {
+                current_status: RequestStatus::Assigned,
+                current_owner_node_id: 1
+            }
+        );
+        assert_eq!(store.mark_completed("missing", 1).await, MarkCompletedOutcome::NotFound);
+        // Still Assigned to node 1, so node 1 can complete it.
+        assert_eq!(store.mark_completed("r1", 1).await, MarkCompletedOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn a_failed_nodes_requests_are_released_and_their_resources_become_free() {
+        let store = store_with_resources(4);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        commit_as(&store, 1, "r2", 11, &[2]).await;
+        commit_as(&store, 2, "r3", 12, &[3]).await; // another node's request: must be untouched
+
+        let unfinished = store.list_unfinished_requests_owned_by(1).await.unwrap();
+        let ids: Vec<_> = unfinished.iter().map(|r| r.request_id.as_str()).collect();
+        assert_eq!(ids, ["r1", "r2"]);
+
+        let outcomes = release_unfinished_requests_of_failed_node(&store, 1).await.unwrap();
+        assert_eq!(
+            outcomes,
+            vec![
+                ("r1".to_string(), ReleaseOutcome::Released),
+                ("r2".to_string(), ReleaseOutcome::Released)
+            ]
+        );
+        let snapshot = store.snapshot().await.unwrap();
+        let assigned: Vec<_> = snapshot.assignments.iter().map(|a| a.resource_id).collect();
+        assert_eq!(assigned, [3], "only node 2's resource is still reserved");
+        assert!(store.list_unfinished_requests_owned_by(1).await.unwrap().is_empty());
+        assert_eq!(store.lookup_request("r1").await.unwrap(), None, "released: a retry plans afresh");
+        // The freed resource can be taken by someone else at once.
+        assert_eq!(commit_as(&store, 2, "r4", 13, &[1]).await, CommitOutcome::Committed);
+    }
+
+    #[tokio::test]
+    async fn a_released_request_committed_by_a_new_node_rejects_the_old_owners_mark_completed() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        store.release_unfinished_request("r1", 1).await;
+
+        assert_eq!(commit_as(&store, 2, "r1", 10, &[2]).await, CommitOutcome::Committed);
+        assert_eq!(
+            store.mark_completed("r1", 1).await,
+            MarkCompletedOutcome::NotCurrentOwner {
+                current_status: RequestStatus::Assigned,
+                current_owner_node_id: 2
+            }
+        );
+        assert_eq!(store.mark_completed("r1", 2).await, MarkCompletedOutcome::Completed);
+    }
+
+    #[tokio::test]
+    async fn releasing_the_same_request_twice_is_a_no_op() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        assert_eq!(store.release_unfinished_request("r1", 1).await, ReleaseOutcome::Released);
+        let after_first = store.snapshot().await.unwrap();
+        assert_eq!(store.release_unfinished_request("r1", 1).await, ReleaseOutcome::AlreadyReleased);
+        assert_eq!(store.snapshot().await.unwrap(), after_first);
+        assert_eq!(store.release_unfinished_request("missing", 1).await, ReleaseOutcome::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_release_naming_the_wrong_owner_changes_nothing() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        let before = store.snapshot().await.unwrap();
+        assert_eq!(
+            store.release_unfinished_request("r1", 2).await,
+            ReleaseOutcome::NotCurrentOwner {
+                current_status: RequestStatus::Assigned,
+                current_owner_node_id: 1
+            }
+        );
+        assert_eq!(store.snapshot().await.unwrap(), before);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_concurrent_commits_on_a_released_request_give_exactly_one_winner() {
+        let store = Arc::new(store_with_resources(8));
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        store.release_unfinished_request("r1", 1).await;
+
+        let tasks: Vec<_> = (2..=7u64)
+            .map(|new_owner| {
+                let store = store.clone();
+                // Each contender plans a different free resource, as separate nodes would.
+                tokio::spawn(async move { commit_as(&store, new_owner as NodeId, "r1", 10, &[new_owner]).await })
+            })
+            .collect();
+        let mut committed = 0;
+        let mut already_committed = 0;
+        for task in tasks {
+            match task.await.unwrap() {
+                CommitOutcome::Committed => committed += 1,
+                CommitOutcome::AlreadyCommitted(_) => already_committed += 1,
+                other => panic!("unexpected outcome {other:?}"),
+            }
+        }
+        assert_eq!((committed, already_committed), (1, 5));
+        assert_eq!(store.snapshot().await.unwrap().assignments.len(), 1, "one reservation only");
+    }
+
+    #[tokio::test]
+    async fn a_completed_request_is_never_released() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        store.mark_completed("r1", 1).await;
+        assert_eq!(store.release_unfinished_request("r1", 1).await, ReleaseOutcome::AlreadyCompleted);
+        assert!(store.list_unfinished_requests_owned_by(1).await.unwrap().is_empty());
+        assert_eq!(store.snapshot().await.unwrap().assignments.len(), 1);
+        // And committing over a Completed record is AlreadyCommitted, not a re-assignment.
+        assert!(matches!(
+            commit_as(&store, 2, "r1", 10, &[2]).await,
+            CommitOutcome::AlreadyCommitted(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_returned_nodes_stale_mark_completed_after_a_release_is_rejected() {
+        let store = store_with_resources(3);
+        commit_as(&store, 1, "r1", 10, &[1]).await;
+        // Node 1 is declared failed and its request released; it then comes back and still
+        // believes it owns the request.
+        store.release_unfinished_request("r1", 1).await;
+        assert_eq!(
+            store.mark_completed("r1", 1).await,
+            MarkCompletedOutcome::NotCurrentOwner {
+                current_status: RequestStatus::Released,
+                current_owner_node_id: 1
+            }
+        );
+        // Nothing changed: the request is still waiting for a new owner.
+        assert_eq!(store.lookup_request("r1").await.unwrap(), None);
+        assert!(store.snapshot().await.unwrap().assignments.is_empty());
     }
 }
