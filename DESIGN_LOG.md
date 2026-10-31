@@ -174,3 +174,50 @@ SeaweedFS is a service we use. The consistency rules are ours: how create-if-abs
 | 24 concurrent creates over 3 filers all succeeded, and the filers sometimes ended up holding different winners | 0 of 8 rounds had exactly one winner; filers disagreed in 3 of 8 (4 of 8 and 6 of 8 in earlier runs) | The filers replicate metadata asynchronously, so writes to different filers are last-writer-wins |
 | 3 filers with their own local stores do share metadata, with no central database | A write on one filer was readable on the others after 3 to 28 ms (median 7 ms, localhost) | Check passes, but the sharing is asynchronous |
 | The **S3 gateway's** `If-None-Match: *` did give exactly one winner over two gateways on different filers | 8 of 8 scripted rounds, 11 of 11 earlier manual rounds, and 4 of 4 rounds with a filer killed | The only tested way to get create-if-absent from SeaweedFS. Why it works is UNVERIFIED (likely a shared lock among filers). **Needs Yasmina's decision**: use the S3 gateway, test the filer gRPC exclusive-create (UNVERIFIED), or reconsider |
+
+## P5: Shared-state backend (Step C, Oct 31)
+
+Code: `crates/node/src/s3_store.rs` (backend), `gated_store.rs` (mute cuts state access), `mute.rs`, `[shared_state]` in `crates/common/src/config.rs`. Change notes: `docs/p5-changes.md`, Oct 31. Answers P4's open question 5 above.
+
+### Decision: SeaweedFS through its S3 gateway
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Shared state lives in SeaweedFS, reached through its **S3 gateway** over plain HTTP | Filer HTTP API; filer gRPC `o_excl`; in-memory store per node (fallback) | The filer HTTP API has no create-if-absent (P4's spike). gRPC `o_excl` is untested and needs SeaweedFS's proto files. The in-memory fallback shares nothing between nodes: a client retry on another node would not find the first plan, and "every node reads the same state" could not pass. The S3 gateway gave exactly one winner in every round tested (P4: 8 of 8 over two gateways; P5: 10 of 10 rounds of 24 racing creates) |
+| One gateway per machine; each node uses `http://127.0.0.1:8333` | All nodes use one gateway | One gateway would be a single point of failure. A node whose own gateway is down gets `StateUnavailable` and the client retries elsewhere, which matches a node failure |
+| No auth on the gateway, plain `reqwest` HTTP, no AWS SDK | AWS SDK with signed requests | Lab network only. Saves a large dependency and a credentials setup on 3 machines. Note: if `AWS_ACCESS_KEY_ID` is set in the gateway's environment, SeaweedFS turns auth on and every call gets 403 |
+| `incidents` is empty in an S3 `snapshot()` | List every request record per snapshot | The planner only reads resources and assignments. Listing every request would make each request slower than the last (O(n) per request). The consistency check reads `requests/` directly |
+| Per-call deadline 2.5 s, lease 10 s, config check `lease >= 4 x deadline` | 1 s deadline | Measured Oct 31: when writers race for one key the gateway's lock backs off, and losers waited up to about 1 s. At 1 s some racing commits timed out |
+
+### The commit path
+
+Objects: `resources/<id>` (written once, create-if-absent), `claims/<resource_id>` (a lease), `requests/<request_id>` (the commit point).
+
+1. `requests/<id>` exists: return its plan (`AlreadyCommitted`).
+2. Claim each planned resource, lowest id first (create-if-absent). An existing claim is taken over with `If-Match` (compare-and-swap, 1 of 24 racing swaps won in testing) only if it has the same `request_id` (an earlier attempt of this request, so a client retry does not wait) or it has expired and its request never committed with that resource. Otherwise release ours and return `ResourceTaken`.
+3. Create `requests/<id>`. Won: mark the claims `confirmed`. Lost to another node: release the claims its plan does not use, confirm the rest, return its plan.
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Claims are leases with an expiry | Claims without expiry; rollback only | A node muted between steps 2 and 3 cannot roll back. Without expiry its resources would be held forever |
+| The commit gives up if half the lease passed before step 3 | No check | Otherwise a claim could expire under a slow commit and another node could take the resource: two assignments |
+| Expiry uses wall clocks (claimer's `expires_at_ms`, reader's clock) | No clocks | Expiry needs time. Safe while the clock offset between machines (P1 measures it, Step D) is far below 10 s. The only place a wall clock decides anything; stated as a limit in the report |
+| `If-Match` on release | Plain DELETE | A plain DELETE could remove another node's newer claim |
+| Muted node: every state call returns `StateUnavailable` at once (`MuteGatedStore`) | Wait until the mute ends | Waiting would commit a plan made from a snapshot up to 20 s old. Failing behaves like a crash |
+
+### Evidence (Oct 31, localhost, SeaweedFS 4.48 on Linux, one gateway)
+
+| Check | Result |
+|---|---|
+| Commit race: 3 stores commit the same request_id, 100 rounds | Exactly 1 `Committed` every round (run 3 times) |
+| Resource race: 3 requests want the same resource, 5 resources | Exactly 1 winner per resource, 2 `ResourceTaken` |
+| Abandoned claim (node died between claim and commit) | Blocks the resource until the lease ends, then it is free |
+| Client retry of the same request on another node | Reuses its own claim at once |
+| End to end: 3 nodes, 1,000 requests at 50/s, one node muted 8 s mid-run (twice: node 2, then node 1) | 1,000 ok, 0 timeout, 0 error. 1,000 records for 1,000 request_ids, no resource in two plans, all claims confirmed. Detection 1.32 s after the mute |
+
+Not yet tested: two gateways on different machines under load (P4's spike tested two gateways, without load), a filer crash during a commit, and timing on the real network.
+
+### Operations notes
+
+- **Reset between runs = DELETE the bucket** (`curl -X DELETE http://127.0.0.1:8333/rescuemesh`), not a new bucket name. Each bucket gets its own volumes, and after a handful of buckets the volume server returned HTTP 500 "No writable volumes".
+- Start `weed` with `-volume.max` raised (or `-master.volumeSizeLimitMB` lowered) on machines with small disks.
