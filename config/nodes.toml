@@ -54,3 +54,10 @@ min_duration_ms = 2000 # shortest silence (faults under ~1.5 s are never detecte
 max_duration_ms = 20000 # longest silence; the spec allows up to 20 s
 min_gap_ms = 10000     # wait between faults, counted from when all nodes are alive again
 max_gap_ms = 30000
+
+[shared_state]          # P5, Step C. See DESIGN_LOG.md, "P5: Shared-state backend"
+backend = "memory"      # "memory" = each node keeps its own copy (nothing shared); "s3" = SeaweedFS
+endpoint = "http://127.0.0.1:8333"  # this machine's own S3 gateway (one per machine)
+bucket = "rescuemesh"   # reset between runs = DELETE this bucket, never a new name per run
+lease_ms = 10000        # a resource claim frees itself after this if its request never commits
+request_timeout_ms = 2500  # per gateway call; racing writers can wait ~1 s on the gateway's lock

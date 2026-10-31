@@ -29,6 +29,11 @@ use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
 const DEFAULT_RESOURCE_SEED: u64 = 42;
 const DEFAULT_RESOURCE_COUNT: usize = 10;
 
+/// The starting resources every node (and the S3 backend's first writer) uses.
+pub fn default_resources() -> Vec<Resource> {
+    generate_snapshot(DEFAULT_RESOURCE_SEED, 0, DEFAULT_RESOURCE_COUNT).resources
+}
+
 #[derive(Default)]
 struct Contents {
     incidents: BTreeMap<IncidentId, Incident>,
@@ -61,9 +66,7 @@ impl InMemoryStore {
 
     /// Starting resources from fixed constants, identical on every node.
     pub fn with_default_resources() -> Self {
-        let resources =
-            generate_snapshot(DEFAULT_RESOURCE_SEED, 0, DEFAULT_RESOURCE_COUNT).resources;
-        InMemoryStore::new(resources)
+        InMemoryStore::new(default_resources())
     }
 
     // A panic while holding the lock cannot leave `Contents` half-written (all checks come
