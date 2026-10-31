@@ -226,8 +226,56 @@ Pure scheduler, fake time: coordinator is the lowest alive ID · same seed gives
 
 ---
 
+
+## Sat Oct 31: shared-state backend, mute cuts state access, reload (branch `StepC/P5/shared-state-backend`)
+
+Step C plan tasks: backend decision (Fri), mute cuts shared-state access (Fri), state interface on the chosen backend (Sat noon), reload call (Sat noon). Design and evidence: DESIGN_LOG.md, "P5: Shared-state backend".
+
+### What was created
+
+| File | What it is | What you need to know |
+|---|---|---|
+| `crates/common/src/shared_state.rs` | New trait method `reload()`; default = `snapshot()` | **P3:** call it in the rejoin readiness rule. `Ok` = the node can reach the state again and has a fresh copy; `Err` = not ready, do not bid |
+| `crates/node/src/mute.rs` | `MuteSwitch`: the mute end time, moved out of `NodeState` into an `Arc` | No behaviour change. `NodeState::mute_for` / `is_muted` / `wait_while_muted` call through to it |
+| `crates/node/src/gated_store.rs` | `MuteGatedStore`: wraps any backend; every call returns `StateUnavailable` while muted | A handler already running when the mute starts can no longer commit. 3 tests |
+| `crates/node/src/state.rs` | The store is always wrapped in the gate; `with_store` is no longer test-only | Tests that share one store between nodes still work unchanged |
+| `crates/node/src/s3_store.rs` | `S3Store`: the `SharedState` trait on SeaweedFS's S3 gateway | 2 unit tests + 7 tests against a live gateway (`#[ignore]`, see below) |
+| `crates/common/src/config.rs` | Optional `[shared_state]` table: `backend` (`"memory"` default / `"s3"`), `endpoint`, `bucket`, `lease_ms`, `request_timeout_ms` | Without the table nothing changes. 1 new test |
+| `crates/node/src/main.rs` | Connects to the S3 backend at startup when `backend = "s3"` | Retries for about 10 s, then refuses to start with a clear message |
+| `crates/node/src/store.rs` | `default_resources()` made public | Same starting resources on both backends |
+| `Cargo.toml`, `crates/node/Cargo.toml` | `reqwest` (no TLS), `serde_json`, `futures-util` | `futures-util` was already in Cargo.lock |
+
+### How to use it
+
+```toml
+[shared_state]
+backend = "s3"
+endpoint = "http://127.0.0.1:8333"   # this machine's own gateway
+bucket = "rescuemesh"
+```
+
+Run the live tests (needs a gateway on 127.0.0.1:8333):
+`RESCUEMESH_S3=http://127.0.0.1:8333 cargo test -p node s3_store -- --ignored --test-threads=1`
+
+### Found while testing (all fixed or written down)
+
+| Finding | What was done |
+|---|---|
+| SeaweedFS turns S3 auth on if `AWS_ACCESS_KEY_ID` is in its environment: every call 403 | Start `weed` without AWS variables. Written in the design log |
+| A new bucket per run uses up the volume server's volumes (HTTP 500) | Reset = DELETE the bucket. Written in the config comment and the design log (P3's reset script) |
+| Racing conditional PUTs: losers wait up to about 1 s on the gateway's lock; 1 s deadline timed out | Default per-call deadline 2.5 s |
+| `reqwest` follows `HTTP_PROXY` | Proxies turned off in the client: the gateway is on the LAN |
+| Two nodes that both briefly think they won left some claims unconfirmed | The losing committer now confirms the claims the stored plan uses. e2e re-run: all confirmed |
+
+### For other people
+
+- **P1:** with a truly shared state, a node that loses the election can find the winner's plan already stored and reply with `duplicate = true` first. In the e2e run 151 of 1,000 requests had outcome `duplicate` with 0 retries. That is correct, but "duplicate" no longer means "a retry". Please check what the outcome column should say.
+- **P6:** same point for the reliability script: count `duplicate` as answered, not as a retry.
+- **P2:** the race tests above can be the base of your commit-race and resource-race tests. Lease length is 10 s for now; change `lease_ms` if you decide otherwise.
+- **P3:** `reload()` is ready. Reset script: `curl -X DELETE http://<machine>:8333/rescuemesh`, then restart the nodes.
+
 ## Next
 
-- **Step B, blocked:** "test that the election skips suspected peers" (needs P3's election core) and in-flight tracking (needs P1's client multicast and P3's outcome event). Neither is in `main` as of Oct 26.
-- **Step B:** real-machine test with `enabled = true`, under load.
+- **Step B, closed Oct 31:** "election skips suspected peers" is covered by P3's tests in `election.rs` (`peer_marked_down_costs_no_wait`, `muted_peer_not_yet_marked_down_costs_the_full_timeout`). In-flight tracking moved to the client (P1's `RetryPolicy`) and the node-side log moved to P1 in Step C.
+- **Step C:** SeaweedFS on the 3 lab machines (with P1), `run_checks.py` across the real network, then the real-machine test with `[faults] enabled = true` under load.
 - **Later:** switch `fault_id` to the `uuid` crate; replace the fallback coordinator with the fault round once P3's election lands.

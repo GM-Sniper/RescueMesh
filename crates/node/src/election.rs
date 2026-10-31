@@ -857,6 +857,58 @@ mod tests {
         state
     }
 
+    /// A stand-in for a failing node: every call gets an immediate `Unavailable`, the
+    /// one error P1's broadcast retries. A port with nothing on it is not enough:
+    /// connecting fails at once on macOS but hangs on Windows, so the retry (and
+    /// `waited_full_t`) would depend on the machine. Hanging up after accepting is not
+    /// enough either: tonic reports that as `Unknown`, which is never retried.
+    struct UnavailableNode;
+
+    #[tonic::async_trait]
+    impl pb::node_server::Node for UnavailableNode {
+        async fn heartbeat(
+            &self,
+            _: tonic::Request<pb::HeartbeatRequest>,
+        ) -> Result<tonic::Response<pb::HeartbeatReply>, Status> {
+            Err(Status::unavailable("test node is unavailable"))
+        }
+        async fn submit(
+            &self,
+            _: tonic::Request<SubmitRequest>,
+        ) -> Result<tonic::Response<pb::SubmitReply>, Status> {
+            Err(Status::unavailable("test node is unavailable"))
+        }
+        async fn inject_fault(
+            &self,
+            _: tonic::Request<pb::FaultCommand>,
+        ) -> Result<tonic::Response<pb::FaultAck>, Status> {
+            Err(Status::unavailable("test node is unavailable"))
+        }
+        async fn exchange_bid(
+            &self,
+            _: tonic::Request<BidRequest>,
+        ) -> Result<tonic::Response<pb::Bid>, Status> {
+            Err(Status::unavailable("test node is unavailable"))
+        }
+        async fn announce_winner(
+            &self,
+            _: tonic::Request<Coordinator>,
+        ) -> Result<tonic::Response<CoordinatorAck>, Status> {
+            Err(Status::unavailable("test node is unavailable"))
+        }
+    }
+
+    /// Runs `UnavailableNode` on node `id`'s address, in the background.
+    async fn serve_unavailable(id: NodeId, cfg: &ClusterConfig) {
+        let addr = cfg.node(id).unwrap().addr.parse().unwrap();
+        tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(NodeServer::new(UnavailableNode))
+                .serve(addr),
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await; // let it start listening
+    }
+
     /// The pb bid that `from` would send for `request_id`, round 0.
     fn call(request_id: &str, from: NodeId, load_score: f64) -> BidRequest {
         BidRequest {
@@ -1181,7 +1233,8 @@ mod tests {
         let _ = std::fs::remove_file(&path);
 
         let cfg = three_node_config();
-        serve(2, &cfg).await; // node 3 is not running: its call fails fast and is retried
+        serve(2, &cfg).await;
+        serve_unavailable(3, &cfg).await; // answers Unavailable at once: retried once
         let peers = Peers::new(&cfg, 1).unwrap();
         let log = crate::election_log::ElectionLog::open(&path, 1, "run7").unwrap();
         let n1 = Arc::new(NodeState::new(1, cfg.clone(), peers).with_election_log(log));

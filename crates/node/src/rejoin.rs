@@ -5,12 +5,13 @@
 //! straight away. Instead it is not ready from the start of the mute until it has:
 //!
 //! 1. dropped its in-flight work: the election decisions from before the mute;
-//! 2. read the shared state once (the reload): proof it can reach the state again;
+//! 2. reloaded the shared state (P5's `reload()`): proof it can reach the state again;
 //! 3. heard from at least one peer since it woke up: proof it is back on the network.
 //!
 //! Until then its bids carry `ready = false`, so it takes part but cannot win.
 //! When the rule passes it writes a `READY` row to the fault log; P6 measures
-//! recovery time from `MUTE_END` to `READY`.
+//! recovery time from `MUTE_END` to `READY`. A freshly started node runs the same rule
+//! (`main.rs`), with `startup` as the fault_id.
 
 use std::time::Duration;
 
@@ -22,7 +23,7 @@ use crate::state::NodeState;
 /// How often the rule re-checks a condition that has not passed yet.
 const CHECK_EVERY: Duration = Duration::from_millis(50);
 
-/// Runs the rule after the mute for `fault_id` ended, then marks the node ready.
+/// Runs the rule after the mute for `fault_id` ended (or at startup), then marks the node ready.
 pub async fn rejoin(state: &NodeState, fault_id: &str) {
     let woke = Instant::now();
 
@@ -31,9 +32,9 @@ pub async fn rejoin(state: &NodeState, fault_id: &str) {
     //    (Requests held by the mute gate are already dropped by the gate.)
     *state.election.lock().unwrap() = ElectionTable::new();
 
-    // 2. The reload. Nodes keep no copy of the state, they read it per request, so
-    //    reading it once is all a reload needs: it shows the state is reachable.
-    while let Err(why) = state.store.snapshot().await {
+    // 2. P5's reload. Nodes keep no copy of the state, they read it per request, so a
+    //    successful reload is what matters: it shows the state is reachable.
+    while let Err(why) = state.store.reload().await {
         tracing::warn!(%why, "rejoin: shared state not reachable yet");
         sleep(CHECK_EVERY).await;
     }

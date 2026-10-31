@@ -106,3 +106,26 @@ End to end (release build, 3 nodes, P6's loadgen, 1000 requests from 10 clients)
 - Empty plans: a request that finds no free resource is answered at once and its incident stays `Open`. Decide with P4 whether to queue it until a resource is released.
 
 **3. Resource release (P4).** The demo branch frees each resource after `--mission-ms` with a temporary local `Store::release`. P4 replaces it with a "resource released" log entry, so the release replicates in Step B.
+
+## Step C: client failure cases on real nodes (Oct 29)
+
+**How it was tested.** 3 real nodes on one Windows laptop (release build), the real injector for mutes, and P6's loadgen with a temporary local change, never committed: `ClientMiddleware::connect_all` (multicast with the retry policy) instead of `connect`, plus an `attempts` column. Steady traffic, a fault part-way through, then the CSV, the nodes' logs and the election logs were checked. These are the Step C plan's tasks "multicast check" and "the three failure cases"; the lab run on Nov 1 repeats them.
+
+| Run | What was done | Requests | Result |
+|---|---|---|---|
+| Multicast, silent node | Node 3 muted for 15 s, 10 requests/s | 300 | 300 committed, 0 retries. Node 3 suspected 1.07 s after the mute; in that time 10 requests took about 310 ms (the bid timeout), then about 1 ms again. The client never waited for the silent node |
+| Case 1: network cut | Node 3's process stopped, restarted 15 s later | 300 | 298 committed, 2 duplicate, 0 retries, 0 failed. The other two answered every request; 11 took about 310 ms before node 3 was suspected (1.09 s) |
+| Case 2: winner took the request, then died | Node 2 muted twice (8 s, 5 s); every plan made to take about 300 ms so a mute hits a winner mid-plan | 150 | 150 committed. The one request caught mid-plan got no plan, was retried at 2 s, both live nodes logged `winner reported down: re-electing`, node 3 planned it in round 1: **2.35 s** in total (2 s + pause + 0.3 s plan) |
+| Case 3: slow request | Node 1's plans take about 3 s, longer than the 2 s deadline; 1 request every 5 s | 6, run twice | 5 committed, **1 failed** in each run: the request node 1 won never got a plan (see finding 1) |
+
+Failure detection across all runs: a muted or stopped node was suspected 1.07 to 1.27 s after the fault (under 1.5 s, because its last heartbeat was already up to 0.5 s old).
+
+### Findings
+
+1. **Bug (P1): a slow request can never succeed.** When an attempt's deadline passes, the client drops that call, and tonic then cancels the node's Submit handler for it, planning included. Node 1 logged no `submit committed` at all for the request it won, in 6 s with 3 s plans. Each retry starts a fresh plan that is cancelled again at 2 s, so the request fails after 3 attempts (6.07 s) and the node wastes 9 s of CPU. The client tests did not catch it because the fake nodes keep working after the client gives up. **Fix:** run the Submit handler in its own task, so it finishes and commits even if the client stopped waiting; the retry then gets the saved plan (`duplicate`).
+2. **The same request can be handled twice on one node (P1, with P3).** The node runs Submit for the client's call, and also when a peer's bid arrives before the client's copy (P3's rule, so a winner never misses a request). If both arrive close together, both run: two elections, two plans, and the store refuses the second save. No double assignment, but the planner runs twice and the client may see `duplicate` on a first attempt. Seen on 4 of 300 requests right after node 3 restarted, and 1 of 300 in another run. **Fix, together with 1:** a per-node table of requests in progress, so a second caller waits for the first one's result instead of planning again. The same table can feed the log of unfinished requests (P1's next Step C task).
+3. **Two assignments across nodes (P5).** A muted winner keeps planning and saves into its own store; the re-elected node saves its own plan. With one store per node, the request then has two assignments. P5's shared store refuses the second save, and the mute must also cut the muted node's access to it (P5's Step C task).
+4. **Rejoin (P3).** A node that comes back starts winning elections at once. The readiness rule (reload state, then bid) is P3's Step C task.
+5. **Windows only.** A stopped process on localhost takes about 2 s to refuse a connection on Windows, so elections waited the 300 ms bid timeout until the node was suspected. On Linux the refusal is immediate; check in the lab.
+
+**Next:** fix 1 and 2, rerun case 3 (and the others) locally, then repeat everything in the lab on Nov 1 once loadgen uses `connect_all` (P6).

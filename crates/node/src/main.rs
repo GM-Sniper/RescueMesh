@@ -28,6 +28,9 @@ mod service;
 mod state;
 // P4: in-memory implementation of the shared-state interface (common::shared_state).
 mod store;
+mod mute;
+mod gated_store;
+mod s3_store;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -36,7 +39,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::Context;
 use clap::Parser;
 use common::NodeId;
-use common::config::ClusterConfig;
+use common::config::{ClusterConfig, StateBackend};
 use common::pb::node_server::NodeServer;
 use tracing_subscriber::EnvFilter;
 
@@ -119,11 +122,20 @@ async fn main() -> anyhow::Result<()> {
     let election_log_path = format!("logs/elections-node{}.csv", args.id);
     let election_log = ElectionLog::open(&election_log_path, args.id, &run_id)
         .with_context(|| format!("cannot open election log {election_log_path}"))?;
-    let state = Arc::new(
-        NodeState::new(args.id, config, peers)
-            .with_fault_log(fault_log)
-            .with_election_log(election_log),
-    );
+    // P5, Step C: the shared-state backend. "memory" (default) keeps P4's per-node store;
+    // "s3" connects to the SeaweedFS S3 gateway named in [shared_state] (see s3_store.rs).
+    let backend = config.shared_state.clone();
+    let mut node_state = NodeState::new(args.id, config, peers)
+        .with_fault_log(fault_log)
+        .with_election_log(election_log);
+    if backend.backend == StateBackend::S3 {
+        let s3 = s3_store::S3Store::connect(&backend, store::default_resources())
+            .await
+            .with_context(|| format!("cannot reach the shared state at {}/{}", backend.endpoint, backend.bucket))?;
+        node_state = node_state.with_store(Arc::new(s3));
+    }
+    tracing::info!(backend = ?backend.backend, endpoint = %backend.endpoint, bucket = %backend.bucket, "shared state");
+    let state = Arc::new(node_state);
 
     // 6. Background tasks: CPU sampling for the load score (P3), heartbeats to
     //    each peer, and the detector ticker.
@@ -131,6 +143,11 @@ async fn main() -> anyhow::Result<()> {
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
     fault_round::spawn(state.clone());
+    // P3: a (re)started node has missed what happened while it was down, like a muted one,
+    // so it bids again only once the rejoin rule passes (rejoin.rs).
+    state.set_ready(false);
+    let rejoining = state.clone();
+    tokio::spawn(async move { rejoin::rejoin(&rejoining, "startup").await });
     // P6 (SEE NOTE AT THE TOP, P1): ONE ROW PER SECOND TO logs/node_metrics-node<ID>.CSV
     node_metrics::spawn(state.clone(), format!("logs/node_metrics-node{}.csv", args.id))
         .context("cannot open the node_metrics log")?;

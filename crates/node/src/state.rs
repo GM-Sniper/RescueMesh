@@ -13,8 +13,7 @@ use common::pb::node_client::NodeClient;
 use tonic::transport::Channel;
 // tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
 // Also used by the in-flight guard to time requests (P3's service-time average).
-use tokio::time::{Instant, sleep_until};
-
+use tokio::time::Instant;
 use crate::election::ElectionTable;
 use crate::election_log::ElectionLog;
 use crate::failure_detector::{FailureDetector, PeerEvent};
@@ -22,6 +21,8 @@ use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
 use crate::peers::Peers;
 use crate::store::InMemoryStore;
+use crate::gated_store::MuteGatedStore;
+use crate::mute::MuteSwitch;
 
 pub struct NodeState {
     pub id: NodeId,
@@ -35,10 +36,8 @@ pub struct NodeState {
     /// P4: incidents, resources and assignments, behind the shared-state interface.
     /// `dyn` so the in-memory store can later be swapped for the DFS-backed one (see store.rs).
     pub store: Arc<dyn SharedState>,
-    /// When the current mute ends; None = never muted (task 4).
-    /// An end time instead of an on/off flag: nothing has to switch it back off,
-    /// and overlapping mutes just keep the later end.
-    muted_until: Mutex<Option<Instant>>,
+    /// When the current mute ends (task 4). In an `Arc` because the store gate reads it too.
+    mute: Arc<MuteSwitch>,
     /// P5's failure detector: who we currently believe is alive (task 5).
     /// Private: used only through heard_from / check_peers / alive_peers, so the
     /// time always comes from the same clock and the lock is held only briefly.
@@ -62,14 +61,18 @@ impl NodeState {
         let load = LoadCollector::new(config.load);
         // Every peer starts "alive" and gets the full suspect_after to send its first heartbeat.
         let detector = FailureDetector::new(peers.ids(), config.timing.suspect_after(), now_std());
+        let mute = Arc::new(MuteSwitch::default());
         NodeState {
             id,
             config,
             peers,
             in_flight: AtomicUsize::new(0),
             load,
-            store: Arc::new(InMemoryStore::with_default_resources()),
-            muted_until: Mutex::new(None),
+            store:  Arc::new(MuteGatedStore::new(
+                    Arc::new(InMemoryStore::with_default_resources()),
+                mute.clone(),
+            )),
+            mute,
             detector: Mutex::new(detector),
             last_heard: Mutex::new(None),
             ready: AtomicBool::new(true),
@@ -93,9 +96,8 @@ impl NodeState {
 
     /// Replaces this node's own store. Tests give several nodes the same one, so they
     /// share state the way they will through the DFS.
-    #[cfg(test)]
     pub fn with_store(mut self, store: Arc<dyn SharedState>) -> Self {
-        self.store = store;
+        self.store = Arc::new(MuteGatedStore::new(store, self.mute.clone()));
         self
     }
 
@@ -123,30 +125,19 @@ impl NodeState {
 
     /// Go silent for `d` from now. An existing longer mute is kept, never shortened.
     pub fn mute_for(&self, d: Duration) {
-        let until = Instant::now() + d;
-        let mut current = self.muted_until.lock().unwrap();
-        if current.is_none_or(|c| until > c) {
-            *current = Some(until);
-        }
+        self.mute.mute_for(d);
     }
+
 
     /// True while a mute is running. Nobody switches it off: once the end time
     /// has passed, it simply no longer applies.
     pub fn is_muted(&self) -> bool {
-        matches!(*self.muted_until.lock().unwrap(), Some(u) if Instant::now() < u)
+        self.mute.is_muted()
     }
 
     /// Returns at once if not muted; otherwise sleeps until the mute ends.
     pub async fn wait_while_muted(&self) {
-        loop {
-            // Copy the end time out so the lock is released before sleeping.
-            let until = *self.muted_until.lock().unwrap();
-            match until {
-                Some(u) if Instant::now() < u => sleep_until(u).await,
-                _ => return,
-            }
-            // Loop: if the mute was extended while we slept, sleep again.
-        }
+        self.mute.wait_while_muted().await;
     }
 
     /// The one way to get a client for an outgoing call. None while muted:

@@ -35,6 +35,9 @@ pub struct ClusterConfig {
     /// Automatic fault injection (P5). Optional; off unless `enabled = true`.
     #[serde(default)]
     pub faults: Faults,
+    /// Where the shared state lives (P5, Step C). Optional; in-memory unless `backend = "s3"`.
+    #[serde(default)]
+    pub shared_state: SharedStateConfig,
 }
 
 /// One `[[nodes]]` entry.
@@ -131,6 +134,67 @@ impl Faults {
     }
 }
 
+/// Which shared-state backend the nodes use. Lower-case in the file: "memory" or "s3".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum StateBackend {
+    /// One private in-memory store per node (P4's `InMemoryStore`). Nothing is shared.
+    Memory,
+    /// SeaweedFS through its S3 gateway.
+    S3,
+}
+
+/// The `[shared_state]` table (P5, Step C). In-memory by default, so runs without the
+/// table behave exactly as before.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SharedStateConfig {
+    pub backend: StateBackend,
+    /// 127.0.0.1 = the gateway on this node's own machine (one per machine in the lab).
+    pub endpoint: String,
+    /// Reset between runs = DELETE this bucket. Never a new bucket name per run.
+    pub bucket: String,
+    /// A resource claim frees itself after this if its request never commits.
+    pub lease_ms: u64,
+    /// Per HTTP call, not per request.
+    pub request_timeout_ms: u64,
+}
+
+impl Default for SharedStateConfig {
+    fn default() -> Self {
+        SharedStateConfig {
+            backend: StateBackend::Memory,
+            endpoint: "http://127.0.0.1:8333".into(),
+            bucket: "rescuemesh".into(),
+            lease_ms: 10_000,
+            // Racing writers can wait ~1 s on the gateway's lock (measured Oct 31).
+            request_timeout_ms: 2_500,
+        }
+    }
+}
+
+impl SharedStateConfig {
+    fn check(&self) -> anyhow::Result<()> {
+        if self.backend == StateBackend::S3 {
+            if !self.endpoint.starts_with("http://") {
+                bail!("shared_state.endpoint must start with http:// (got {:?})", self.endpoint);
+            }
+            if self.bucket.is_empty() || self.bucket.contains('/') {
+                bail!("shared_state.bucket must be a plain name");
+            }
+        }
+        if self.request_timeout_ms == 0 {
+            bail!("shared_state.request_timeout_ms must be greater than zero");
+        }
+        // The commit gives up if half the lease passes before the record is written,
+        // so the lease must comfortably exceed a few HTTP calls.
+        if self.lease_ms < 4 * self.request_timeout_ms {
+            bail!("shared_state.lease_ms must be at least 4 x request_timeout_ms");
+        }
+        Ok(())
+    }
+}
+
 impl ClusterConfig {
     /// Reads and checks the file. A mistake fails here, at startup, with a clear message.
     pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
@@ -177,6 +241,7 @@ impl ClusterConfig {
         }
 
         self.faults.check()?;
+        self.shared_state.check()?;
         Ok(())
     }
 
@@ -251,7 +316,27 @@ mod tests {
         }
     }
 
-    #[test]
+        #[test]
+    fn shared_state_is_in_memory_by_default_and_checked() {
+        let cfg = ClusterConfig::parse(THREE_NODES).unwrap();
+        assert_eq!(cfg.shared_state.backend, StateBackend::Memory);
+        let on = format!("{THREE_NODES}\n[shared_state]\nbackend = \"s3\"\nbucket = \"run7\"\n");
+        let cfg = ClusterConfig::parse(&on).unwrap();
+        assert_eq!(cfg.shared_state.backend, StateBackend::S3);
+        assert_eq!(cfg.shared_state.bucket, "run7");
+        assert_eq!(cfg.shared_state.lease_ms, 10_000);
+        for bad in [
+            "backend = \"s3\"\nendpoint = \"127.0.0.1:8333\"",
+            "backend = \"s3\"\nbucket = \"a/b\"",
+            "lease_ms = 1000",
+            "backend = \"dfs\"",
+        ] {
+            let text = format!("{THREE_NODES}\n[shared_state]\n{bad}\n");
+            assert!(ClusterConfig::parse(&text).is_err(), "should be refused: {bad}");
+        }
+    }
+
+    #[test]    
     fn minimal_file_uses_defaults() {
         let cfg = ClusterConfig::parse(THREE_NODES).unwrap();
         assert_eq!(cfg.timing.heartbeat_interval_ms, 500);

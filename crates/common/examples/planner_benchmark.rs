@@ -12,12 +12,15 @@ fn main() {
     let weights = Weights::default();
 
     // (number of incidents, number of resources, iterations)
-    let cases: [(usize, usize, usize); 5] = [
+    let cases: [(usize, usize, usize); 8] = [
         (10, 20, 1),
         (50, 50, 1),
         (100, 100, 1),
         (200, 200, 1),
         (100, 100, 10),
+        (300, 300, 1),
+        (500, 500, 1),
+        (500, 500, 10),
     ];
 
     println!("RescueMesh planner workload benchmark");
