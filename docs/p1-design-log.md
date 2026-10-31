@@ -299,3 +299,25 @@ Node 2's plans took 19.6 ms on average when it won (vs 0.8 ms in the baseline), 
 
 **Worked example (failover, replaces the plan's 2.6 s).** The winner is muted just after taking a request at 0 s. The other two suspect it by 1.6 s. The client's deadline ends at 2.0 s, it pauses about 25 ms and multicasts again. The two live nodes elect each other in a few ms (no bid is missing, so no 300 ms wait) and plan in about 50 ms. Plan at about 2.1 s.
 **Not a failure case.** A node muted *before* a request arrives costs only the bid timeout: the other two wait 300 ms for its bid, treat it as out and decide without it. No client retry is needed.
+
+## 14. Submit runs in its own task (Step C, slow-request case)
+
+**The bug (found Oct 29, failure case 3).** tonic runs each call's handler inside the call, and drops it the moment the client stops waiting. So a plan slower than the client's 2 s deadline was thrown away half done: nothing was committed, and each retry started the same plan again, which was just as slow. With slow plans, a request could fail all 3 attempts while the node was alive and working the whole time.
+
+**The fix (`service.rs`).** `submit` no longer does the work itself:
+- `start_or_join` starts the work (`handle_submit`) in its own task with `tokio::spawn`, so it finishes and commits even if the client has gone. The client's retry then finds the stored plan (`duplicate = true`).
+- Before starting, it looks in a table of requests being worked on now (`NodeState::in_progress`, keyed by `request_id`). If the request is already there, it waits for that work instead of starting a second one. This covers a retry that arrives while the first try is still planning, and a peer's bid (`exchange_bid`) for a request this node is already handling.
+- `wait_for` waits for the result through a `watch` channel (one sender, any number of waiters, and a late waiter still sees the result).
+- `InProgressEntry` takes the request out of the table when the task ends, however it ends (result, error or panic), so no request can stay "in progress" with nobody working on it.
+- The task counts itself in P3's load (`start_request`) and stops counting before it sends the result.
+
+**Alternatives.**
+- **A longer client deadline.** Only moves the problem to slower plans, and slows every failover (section 13).
+- **Let the client cancel the work** (the old behaviour). A crashed node can't finish work, but a slow one can, and throwing away finished-but-late work is what made case 3 fail.
+- **No table, just spawn.** Then a retry during a slow plan starts a second plan of the same request on the same node, which costs CPU and makes the load score wrong. Commit's create-if-absent would still keep only one plan, so it's about waste, not correctness.
+
+**Effects to know about.**
+- A node keeps working on a request after the client gave up. That is real work and shows in its load score.
+- A muted node's task can't commit any more: since PR #33 every shared-state call returns `StateUnavailable` while muted (`gated_store.rs`), so the task ends with an error and the client's retry goes to a live node.
+
+**Evidence.** Tests in `service.rs`: `slow_plan_is_saved_even_if_the_caller_stops_waiting`, `same_request_arriving_twice_at_once_is_planned_once`, `finished_requests_leave_the_in_progress_table`. The Oct 29 local run of case 3 is in `docs/p1-changes.md`.
