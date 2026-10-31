@@ -265,7 +265,9 @@ impl SubmitOutcome {
 
     /// How the request ended, for the CSV's `outcome` column (Step C, P6's reliability %):
     /// - "committed": a plan came back that was made and saved for this request
-    /// - "duplicate": a plan came back, but it was already saved for this request_id (a retry found it)
+    /// - "duplicate": a plan came back, but it was already saved for this request_id. Usually a
+    ///   retry found it, but with shared state (PR #33) a slower node can also answer the
+    ///   first attempt from the store. Either way it is one saved plan, never two: a success
     /// - "failed":    no plan (timeout or error)
     pub fn outcome(&self) -> &'static str {
         match (self.status, self.duplicate) {

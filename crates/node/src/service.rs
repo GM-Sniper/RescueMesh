@@ -911,6 +911,32 @@ iterations = 20000
         assert_eq!(again.plan, first.plan);
     }
 
+    // Failure case 2, second half: the winner saved the plan, then died before the client
+    // heard. The retry reaches only the other two; both must answer from the store.
+    #[tokio::test]
+    async fn winner_muted_after_saving_the_others_return_its_plan() {
+        let store = shared_store();
+        let nodes = three_nodes(store.clone()).await;
+        let [mut c1, mut c2, mut c3] = [0, 1, 2].map(|i| nodes[i].1.clone());
+        let (r1, r2, r3) = tokio::join!(
+            c1.submit(submit_req("e5", 7)),
+            c2.submit(submit_req("e5", 7)),
+            c3.submit(submit_req("e5", 7)),
+        );
+        let replies = [r1, r2, r3].map(|r| r.unwrap().into_inner());
+        let first = replies.iter().find(|r| r.plan.is_some()).expect("one plan").clone();
+        let winner = first.executor_node as usize;
+        nodes[winner - 1].0.mute_for(Duration::from_secs(5));
+
+        for other in (1..=3).filter(|&id| id != winner) {
+            let mut client = nodes[other - 1].1.clone();
+            let again = client.submit(submit_req("e5", 7)).await.unwrap().into_inner();
+            assert!(again.duplicate, "node {other} answered from the store");
+            assert_eq!(again.plan, first.plan, "node {other} gave the winner's plan");
+        }
+        assert_eq!(store.snapshot().await.unwrap().incidents.len(), 1, "never planned twice");
+    }
+
     #[tokio::test]
     async fn with_one_node_muted_the_other_two_still_give_one_plan() {
         let nodes = three_nodes(shared_store()).await;
