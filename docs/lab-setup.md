@@ -30,10 +30,10 @@ a lab PC itself. No `sudo` is needed: Rust installs into your home folder.
   in on another PC), there is nothing to copy; still run each node on its own PC. If not,
   copy the folder over the network or USB:
   ```
-  scp -r RescueMesh/target/release/{node,loadgen,inject,stats,experiment} RescueMesh/config  <user>@<ip>:rescuemesh-lab/
+  scp -r RescueMesh/target/release/{node,loadgen,inject,stats,experiment,elections} RescueMesh/config  <user>@<ip>:rescuemesh-lab/
   ```
-  After a USB copy, make them runnable again: `chmod +x node loadgen inject stats experiment`.
-  Add `elections` once PR #24 is merged.
+  After a USB copy, make them runnable again: `chmod +x node loadgen inject stats experiment elections`.
+  Add `reliability` and `failover` once P6's PR #34 is merged.
 
 Run every program from the folder that holds `config/`, so `config/nodes.lab.toml` is found.
 
@@ -54,7 +54,9 @@ Run every program from the folder that holds `config/`, so `config/nodes.lab.tom
   timedatectl                 # want: "System clock synchronized: yes"
   chronyc tracking            # if chrony is installed: "System time" = offset from the time server
   ```
-  Write the offset down for each PC. Under 0.1 s on all 3 is fine. Not synchronized and no
+  Write the offset down for each PC. Under 0.1 s on all 3 is fine. **Required since PR #33:**
+  the shared state's resource claims expire after 10 s by the wall clock, so the offset must
+  stay far below that (P5's design log). Not synchronized and no
   `sudo`: write down `date +%s.%N` on all 3 at the same moment as a rough check, and state
   the clock offset as a limitation in the report.
   **Why:** the nodes never use clocks to decide anything, but P5's and P6's scripts compare
@@ -66,6 +68,34 @@ Run every program from the folder that holds `config/`, so `config/nodes.lab.tom
 - [ ] In `config/nodes.lab.toml`, replace each `REPLACE-ME` with that node's IP; keep `:50051`.
 - [ ] The **same file** on all 3 PCs and on the client machine. Only `--id` differs.
 - [ ] Commit the filled-in file to the repo, so every run says which IPs it used.
+
+## 3b. Shared state: SeaweedFS on each PC (P5 with P1)
+
+Since PR #33 the 3 nodes share one state in SeaweedFS, through its S3 gateway. Each node
+talks to the gateway on its own PC (`endpoint = "http://127.0.0.1:8333"`), so one PC going
+down does not cut the others off.
+
+- [ ] On each PC, get SeaweedFS **4.48** (the version every test used) without `sudo`:
+  ```
+  curl -sSLO https://github.com/seaweedfs/seaweedfs/releases/download/4.48/linux_amd64.tar.gz
+  curl -sSLO https://github.com/seaweedfs/seaweedfs/releases/download/4.48/linux_amd64.tar.gz.md5
+  md5sum linux_amd64.tar.gz; cat linux_amd64.tar.gz.md5     # must match
+  tar xzf linux_amd64.tar.gz                                # gives ./weed
+  ```
+- [ ] **No AWS variables** in the shell that starts `weed`: `env | grep AWS_` must print
+  nothing. If `AWS_ACCESS_KEY_ID` is set, the gateway turns auth on and every call gets 403.
+- [ ] Start it on each PC with its own IP, the masters on all 3 PCs, and 2 copies of every
+  file (P5 confirms the exact flags before the day):
+  ```
+  ./weed server -ip=<this ip> -master.peers=<ip1>:9333,<ip2>:9333,<ip3>:9333 \
+      -master.defaultReplication=001 -dir=$HOME/weed-data -s3 -s3.port=8333
+  ```
+  Firewall (step 2): also open TCP 9333, 19333, 8080, 18080, 8888, 18888 and 8333.
+- [ ] In `config/nodes.lab.toml`, set `backend = "s3"` in `[shared_state]`. If SeaweedFS
+  will not work, `backend = "memory"` still runs everything, but each node then has its own
+  state, and the report must say so.
+- [ ] Reset between runs: `curl -X DELETE http://127.0.0.1:8333/rescuemesh` once, from any
+  PC, then restart the nodes. Never a new bucket name per run (it uses up the volumes).
 
 **Where the client runs:** on a lab PC (a 4th one if there is one, otherwise next to a node).
 A laptop on the campus Wi-Fi is often on a different network from the lab PCs and cannot
@@ -96,7 +126,8 @@ Use one run ID for everything, so P6 can join the files, e.g. `lab-nov1-smoke`.
 - [ ] **Requests end to end:**
   `./loadgen --config config/nodes.lab.toml --requests 30 --clients 3 --rate 10 --run-id lab-nov1-smoke`.
   All 30 should be `committed`, once loadgen uses `connect_all` (P6).
-- [ ] **Collect the logs** (`logs/*.csv` from each node PC, `results/` from the client) into
+- [ ] **Collect the logs** (`logs/*.csv` from each node PC: faults, elections, and the new
+  `requests-nodeN.csv` with each request's START and END, plus `results/` from the client) into
   one folder per run, as the experiment runner prints in lab mode. `scp` works if SSH is on.
 
 ## 5. Then the Step C runs
@@ -144,8 +175,11 @@ survives a machine failure if it is set up for it:
 - [ ] With one PC off: every saved plan can still be read, and P4's create-if-absent check
   (`spike/seaweedfs/run_checks.py`) still gives exactly one winner.
 
-Until the DFS is in, each node has its own in-memory store: test B then **loses that node's
-data**, and the report must say so.
+- [ ] Also from P4's spike 2: restart one PC's SeaweedFS during load and check that no
+  request_id has two saved plans afterwards (P2's consistency check).
+
+With `backend = "memory"` (the fallback), each node has its own in-memory store: test B then
+**loses that node's data**, and the report must say so.
 
 ## If something fails
 
