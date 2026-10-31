@@ -81,6 +81,18 @@ Checked: the plan's worked example (queue 4, CPU 50 %, service 20 ms) gives 0.39
 **For P6 (node_metrics):** call `state.load_report()` once per second and log `queue_len`, `cpu_pct`, `service_ms`, `load_score`.
 
 
+## P3: Election (Step C)
+
+Code: `crates/node/src/election.rs`.
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Tie rule confirmed by the team on Oct 30: lowest load score wins, ties go to the lowest node ID (see the load metric table above) | Ties to the highest ID; random | Every node reaches the same answer from the same bids with no extra message. Confirmed for Step C as the plan asked |
+| A node still sends its bid to peers the detector suspects, but only waits for the peers it reports alive. With one node down that is 4 bid calls sent and 2 bids received per election (6 and 6 with all 3 up), not the 2 messages in the Step C plan's worked example | Send only to alive peers, so 2 calls per election | A peer suspected by mistake (a short network hiccup) still gets the bids and can still take part. The two extra calls cost no time, because nobody waits for them. Checked by `csv_row_with_a_node_down_has_two_bids_and_two_calls` |
+
+Election on retry was already checked: `retry_after_the_winner_fails_elects_a_new_one_in_round_1` mutes the round-0 winner, and the client's retry elects a new winner in round 1 without it.
+
+
 ## P4: Store and Change Log
 
 **SUPERSEDED on Oct 21** by "P4: Shared state in a distributed file system" at the end of this file. The log, `applied` map and replication path described here were removed from the code. Kept for history; the code is on branch `p4/backup-step-a-store`.
@@ -221,3 +233,19 @@ Not yet tested: two gateways on different machines under load (P4's spike tested
 
 - **Reset between runs = DELETE the bucket** (`curl -X DELETE http://127.0.0.1:8333/rescuemesh`), not a new bucket name. Each bucket gets its own volumes, and after a handful of buckets the volume server returned HTTP 500 "No writable volumes".
 - Start `weed` with `-volume.max` raised (or `-master.volumeSizeLimitMB` lowered) on machines with small disks.
+
+## P3: Rejoin readiness rule (Step C)
+
+Code: `crates/node/src/rejoin.rs`, called by the mute hook in `service.rs` when a mute ends, and by `main.rs` when the node starts.
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| A node is not ready from the start of a mute until it has (1) dropped its election decisions from before the mute, (2) read the shared state once, (3) heard a heartbeat from at least one peer since waking. Only then do its bids carry `ready = true` | Ready as soon as the mute ends; a fixed wait (the plan's fallback: 3 s) | After a mute the node's load score is 0, so it would win every election at once with stale decisions and no proof it can reach the state or its peers. The three checks are the ones in Yasmina's placeholder (PR #30), so they test exactly what the node needs, and usually pass in well under a fixed 3 s |
+| A not-ready node still answers bid calls, with `ready = false` | Stay silent until ready | It counts as answered, so peers do not wait the full bid timeout for it, but it cannot win (already in the election rule) |
+| The reload is one successful `store.reload()` (P5, #33) | Read the state with `snapshot()` | `reload()` is the call P5 made for this rule, so a backend can do more there later. Today it is a `snapshot()`: nodes keep no copy of the state, so the read only proves the state is reachable. While muted, the gated store fails it at once. The rule retries every 50 ms while it fails |
+| A freshly started node runs the same rule (fault log `READY` row with fault_id `startup`) | Start ready | A node restarted after a power-off has missed the same things as a muted one (Ramy's review, lab test B). Side effect: a node started alone stays not ready until a second node runs. Tests build nodes ready, so only the real binary does this |
+| Dropped in-flight work = the election table is cleared | Keep old decisions | A request we had won may have been re-elected without us. A cleared table makes a client retry run a fresh election. Requests held at the mute gate are already dropped by the gate |
+| The node writes a `READY` row to the fault log when the rule passes | Log only to the console | P6 measures recovery time as `READY` time minus `MUTE_END` time, on the same node, so no clock offset between machines |
+| A node with no peers is ready once it can read the state | Wait for a heartbeat forever | Nobody could ever send it one. Only happens in single-node tests |
+
+Expected recovery time: up to one heartbeat interval (500 ms) plus one state read. Measured on the real machines in Step D.
