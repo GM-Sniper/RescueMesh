@@ -1,0 +1,22 @@
+# P5: run_checks.py against the 3 lab PCs. Replace IP1..IP3 with the real addresses.
+# Run from any lab PC:  python3 spike/seaweedfs/run_checks.py cluster.real.toml --json results-lab.json
+# Only check 5 (S3 gateway) matters for us. Checks on the plain filer API are EXPECTED to show
+# more than one winner: that is P4's spike finding and the reason we use the S3 gateway.
+[cluster]
+filer_urls = ["http://IP1:8888", "http://IP2:8888", "http://IP3:8888"]
+base_path = "/spike"
+
+[race]
+concurrent_creates = 24
+rounds = 8
+
+[visibility]
+samples = 10
+timeout_seconds = 30
+
+[latency]
+samples = 50
+
+[s3]
+endpoint_urls = ["http://IP1:8333", "http://IP2:8333", "http://IP3:8333"]
+bucket = "spikebucket"
