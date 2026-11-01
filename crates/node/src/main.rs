@@ -24,6 +24,8 @@ mod node_metrics;
 mod peers;
 // P3: rejoin readiness rule after a mute (Step C).
 mod rejoin;
+// P1: START/END row per Submit, for P6's measurements (Step C).
+mod request_log;
 mod service;
 mod state;
 // P4: in-memory implementation of the shared-state interface (common::shared_state).
@@ -46,6 +48,7 @@ use tracing_subscriber::EnvFilter;
 use crate::election_log::ElectionLog;
 use crate::fault_log::FaultLog;
 use crate::peers::Peers;
+use crate::request_log::RequestLog;
 use crate::service::NodeService;
 use crate::state::NodeState;
 
@@ -64,7 +67,8 @@ struct Args {
     run_id: Option<String>,
     /// Extra planner work on this node only: replaces `[planner] iterations` from the
     /// shared config, to make it a slower machine in load-balancing tests. At the default
-    /// sizes one iteration is about 0.7 us of CPU, so 30000 is about 20 ms per plan.
+    /// sizes one iteration is about 0.32 us of CPU (since P2's #27), so 30000 is about 10 ms
+    /// per plan, 900000 about 0.3 s and 9000000 about 3 s.
     #[arg(long)]
     planner_iterations: Option<usize>,
 }
@@ -122,12 +126,17 @@ async fn main() -> anyhow::Result<()> {
     let election_log_path = format!("logs/elections-node{}.csv", args.id);
     let election_log = ElectionLog::open(&election_log_path, args.id, &run_id)
         .with_context(|| format!("cannot open election log {election_log_path}"))?;
+    // P1: request CSV (START/END per Submit), same run_id, for P6's lost-request cases.
+    let request_log_path = format!("logs/requests-node{}.csv", args.id);
+    let request_log = RequestLog::open(&request_log_path, args.id, &run_id)
+        .with_context(|| format!("cannot open request log {request_log_path}"))?;
     // P5, Step C: the shared-state backend. "memory" (default) keeps P4's per-node store;
     // "s3" connects to the SeaweedFS S3 gateway named in [shared_state] (see s3_store.rs).
     let backend = config.shared_state.clone();
     let mut node_state = NodeState::new(args.id, config, peers)
         .with_fault_log(fault_log)
-        .with_election_log(election_log);
+        .with_election_log(election_log)
+        .with_request_log(request_log);
     if backend.backend == StateBackend::S3 {
         let s3 = s3_store::S3Store::connect(&backend, store::default_resources())
             .await

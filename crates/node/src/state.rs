@@ -1,6 +1,7 @@
 //! State shared by every request handler and background task of one node.
 //! Shared as `Arc<NodeState>`: cheap to clone, all clones point to the same struct.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -9,7 +10,10 @@ use common::NodeId;
 use common::config::ClusterConfig;
 use common::load::LoadReport;
 use common::shared_state::SharedState;
+use common::pb::SubmitReply;
 use common::pb::node_client::NodeClient;
+use tokio::sync::watch;
+use tonic::Status;
 use tonic::transport::Channel;
 // tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
 // Also used by the in-flight guard to time requests (P3's service-time average).
@@ -19,6 +23,7 @@ use crate::election_log::ElectionLog;
 use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
+use crate::request_log::RequestLog;
 use crate::peers::Peers;
 use crate::store::InMemoryStore;
 use crate::gated_store::MuteGatedStore;
@@ -54,7 +59,18 @@ pub struct NodeState {
     pub election: Mutex<ElectionTable>,
     /// P3's election CSV (see election_log.rs). None in tests, so they write no files.
     pub election_log: Option<ElectionLog>,
+    /// Submits this node is working on right now, by request_id: where each one's result
+    /// will arrive. A client retry, or a peer's bid for the same request, waits for the work
+    /// already running instead of planning again (see service.rs, `start_or_join`).
+    /// Locked only briefly, never across a wait.
+    pub in_progress: Mutex<HashMap<String, watch::Receiver<Option<SubmitResult>>>>,
+    /// P1's request CSV: START and END of each Submit's work, for P6's measurements
+    /// (see request_log.rs). None in tests, so they write no files.
+    pub request_log: Option<RequestLog>,
 }
+
+/// One Submit's result, copied to everyone waiting for it.
+pub type SubmitResult = Result<SubmitReply, Status>;
 
 impl NodeState {
     pub fn new(id: NodeId, config: ClusterConfig, peers: Peers) -> Self {
@@ -79,7 +95,15 @@ impl NodeState {
             fault_log: None,
             election: Mutex::new(ElectionTable::new()),
             election_log: None,
+            in_progress: Mutex::new(HashMap::new()),
+            request_log: None,
         }
+    }
+
+    /// Turns on the request CSV (main does this; tests leave it off).
+    pub fn with_request_log(mut self, log: RequestLog) -> Self {
+        self.request_log = Some(log);
+        self
     }
 
     /// Turns on the fault CSV (main does this; tests leave it off).

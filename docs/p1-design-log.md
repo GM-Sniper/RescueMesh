@@ -258,7 +258,7 @@ A request that passed the entry gate and is then muted has its reply dropped at 
 
 ## 12. Load knob for one node (Step B, P2's load knob)
 
-**What.** `node --planner-iterations N` replaces `[planner] iterations` (P2's workload knob, PR #22) for that node only. The config file stays the same on all nodes; the flag makes one node a slower machine, so load-balancing tests have something to show. The value is printed in the "node listening" log line, so every run's log says which node was loaded. At the default sizes (10 x 20 work units per iteration, about 3.4 ns per unit) one iteration is about 0.7 us, so 30000 is about 20 ms per plan.
+**What.** `node --planner-iterations N` replaces `[planner] iterations` (P2's workload knob, PR #22) for that node only. The config file stays the same on all nodes; the flag makes one node a slower machine, so load-balancing tests have something to show. The value is printed in the "node listening" log line, so every run's log says which node was loaded. At the default sizes (10 x 20 work units per iteration, about 3.4 ns per unit) one iteration was about 0.7 us, so 30000 was about 20 ms per plan. **Update Oct 31:** P2's #27 halved the cost per iteration; it is now about 0.32 us (900 000 iterations measured at about 290 ms), so 30000 is about 10 ms. The run below was before #27.
 **Alternatives.** An admin RPC (reusing the `FaultCommand` path, as the Step B plan suggested), which can change the load while the node runs; a per-node value in the config file.
 **Why.** The experiments compare whole runs ("baseline" vs "node 2 loaded"), so setting the load at startup is enough, and the flag is a few lines in `main.rs` with no proto change. The real load (queue, CPU, service time) still changes live during every run; only the artificial extra work is fixed. A per-node config value would make the shared config differ between machines. If the demo needs to overload a node mid-run, the RPC can be added on top of the same `PlannerConfig` (decided: not needed for now).
 **Evidence.** Unit test: the flag replaces the config value, and 0 is refused. Live runs, 3 nodes on one laptop (release build), the client multicasting 600 requests at 40/s from 3 clients:
@@ -299,3 +299,42 @@ Node 2's plans took 19.6 ms on average when it won (vs 0.8 ms in the baseline), 
 
 **Worked example (failover, replaces the plan's 2.6 s).** The winner is muted just after taking a request at 0 s. The other two suspect it by 1.6 s. The client's deadline ends at 2.0 s, it pauses about 25 ms and multicasts again. The two live nodes elect each other in a few ms (no bid is missing, so no 300 ms wait) and plan in about 50 ms. Plan at about 2.1 s.
 **Not a failure case.** A node muted *before* a request arrives costs only the bid timeout: the other two wait 300 ms for its bid, treat it as out and decide without it. No client retry is needed.
+
+## 14. Submit runs in its own task (Step C, slow-request case)
+
+**The bug (found Oct 29, failure case 3).** tonic runs each call's handler inside the call, and drops it the moment the client stops waiting. So a plan slower than the client's 2 s deadline was thrown away half done: nothing was committed, and each retry started the same plan again, which was just as slow. With slow plans, a request could fail all 3 attempts while the node was alive and working the whole time.
+
+**The fix (`service.rs`).** `submit` no longer does the work itself:
+- `start_or_join` starts the work (`handle_submit`) in its own task with `tokio::spawn`, so it finishes and commits even if the client has gone. The client's retry then finds the stored plan (`duplicate = true`).
+- Before starting, it looks in a table of requests being worked on now (`NodeState::in_progress`, keyed by `request_id`). If the request is already there, it waits for that work instead of starting a second one. This covers a retry that arrives while the first try is still planning, and a peer's bid (`exchange_bid`) for a request this node is already handling.
+- `wait_for` waits for the result through a `watch` channel (one sender, any number of waiters, and a late waiter still sees the result).
+- `InProgressEntry` takes the request out of the table when the task ends, however it ends (result, error or panic), so no request can stay "in progress" with nobody working on it.
+- The task counts itself in P3's load (`start_request`) and stops counting before it sends the result.
+
+**Alternatives.**
+- **A longer client deadline.** Only moves the problem to slower plans, and slows every failover (section 13).
+- **Let the client cancel the work** (the old behaviour). A crashed node can't finish work, but a slow one can, and throwing away finished-but-late work is what made case 3 fail.
+- **No table, just spawn.** Then a retry during a slow plan starts a second plan of the same request on the same node, which costs CPU and makes the load score wrong. Commit's create-if-absent would still keep only one plan, so it's about waste, not correctness.
+
+**Effects to know about.**
+- A node keeps working on a request after the client gave up. That is real work and shows in its load score.
+- A muted node's task can't commit any more: since PR #33 every shared-state call returns `StateUnavailable` while muted (`gated_store.rs`), so the task ends with an error and the client's retry goes to a live node.
+
+**Evidence.** Tests in `service.rs`: `slow_plan_is_saved_even_if_the_caller_stops_waiting`, `same_request_arriving_twice_at_once_is_planned_once`, `finished_requests_leave_the_in_progress_table`. The Oct 29 local run of case 3 is in `docs/p1-changes.md`.
+
+## 15. Request log for P6's lost-request cases (Step C)
+
+**What.** `logs/requests-nodeN.csv` (`request_log.rs`): a START row when the Submit task starts and an END row when it stops, with how it ended (`committed`, `duplicate`, `lost`, `error:<code>`) and how long it took. Same `run_id` and `wall_ts_us` as the fault and election logs, so P6 can join them. For measurements only: the node never reads it back, and in-flight tracking stays on the client (Step C plan).
+
+**Why.** P6 must say which failure case each retried or lost request was. The client's CSV only shows that an attempt got no plan. The node logs show why: no START on a node (the request never reached it), a START with no END (the node was working on it when it died), or an END after the client's 2 s deadline (the node was slow).
+
+**Decisions.**
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Rows written from the Submit task in `start_or_join` | From the `submit` handler | A retry or a peer's bid that joins work already running writes no second START, so one row pair = one piece of work |
+| START written when the work starts, not only at the end | One row per finished request | A switched-off node can't write anything when it dies. Its START is already on disk |
+| A file of its own | More events in P5's fault log | The fault log is about nodes; this is one row pair per request per node, much more |
+| Each row flushed at once | A buffer | So a crash loses at most the row being written. The cost is one small write per row |
+
+**Evidence.** Tests in `request_log.rs` (row format, END details, header once across a restart) and `service.rs` (`request_log_has_one_start_and_end_per_piece_of_work`). The Oct 31 runs in `docs/p1-changes.md` read like the design says: in case 2 the muted winner's END is `error:unavailable` and the retry's winner logs `committed`.
