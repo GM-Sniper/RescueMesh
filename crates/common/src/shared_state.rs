@@ -16,8 +16,7 @@ use std::fmt;
 
 use async_trait::async_trait;
 
-use crate::domain::{Incident, Plan, ResourceId, Snapshot};
-
+use crate::domain::{Incident, IncidentId, Plan, ResourceId, Snapshot};
 /// The shared state could not be reached well enough to give a trustworthy answer.
 ///
 /// A separate type (instead of a bare string) so callers can match on "unavailable" and
@@ -112,7 +111,17 @@ pub trait SharedState: Send + Sync {
     /// `Ok(None)` means "definitely not committed"; if that cannot be known, the answer is
     /// `Err(StateUnavailable)`, never `Ok(None)`.
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable>;
-        /// P5, Step C: called by a node coming back from a mute (P3's rejoin readiness rule)
+    /// Resolve an incident and release every resource assigned to it.
+    ///
+    /// Repeating the same resolve request is safe. Reusing its ID
+    /// for a different incident returns an error.
+    async fn resolve(
+        &self,
+        request_id: &str,
+        incident_id: IncidentId,
+    ) -> Result<(), StateUnavailable>;
+
+    /// P5, Step C: called by a node coming back from a mute (P3's rejoin readiness rule)
     /// before it bids again. `Ok` means the shared state is reachable and the returned copy
     /// is current as of this call; `Err` means the node is not ready yet and must not bid.
     async fn reload(&self) -> Result<Snapshot, StateUnavailable> {

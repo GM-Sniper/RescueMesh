@@ -20,6 +20,14 @@ pub fn plan_with_workload(
     now: u64,
     config: &PlannerConfig,
 ) -> Plan {
+    if incident.status == IncidentStatus::Resolved {
+        return Plan {
+            incident_id: incident.id,
+            priority: 0.0,
+            assignments: Vec::new(),
+        };
+    }
+
     perform_matching_workload(config, w, now);
 
     let age_min = now.saturating_sub(incident.timestamp) as f64 / 60_000.0;
@@ -118,6 +126,25 @@ mod tests {
             location: Zone::new(x, y),
             lease_expiry: 0,
         }
+    }
+
+    #[test]
+    fn resolved_incident_gets_no_assignments() {
+        let mut incident = inc();
+        incident.status = IncidentStatus::Resolved;
+
+        let snapshot = Snapshot {
+            resources: vec![
+                res(1, ResourceType::Ambulance, 0, 0),
+                res(2, ResourceType::FireTruck, 1, 1),
+            ],
+            ..Default::default()
+        };
+
+        let result = plan(&incident, &snapshot, &Weights::default(), 1_000);
+
+        assert_eq!(result.incident_id, incident.id);
+        assert!(result.assignments.is_empty());
     }
 
     #[test]

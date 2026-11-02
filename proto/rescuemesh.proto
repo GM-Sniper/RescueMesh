@@ -41,10 +41,16 @@ message HeartbeatReply {
 
 message SubmitRequest {
   string request_id = 1;    // client-generated Uuid; same ID on every retry
-  oneof kind {              // what the client is submitting
-    Incident incident = 2;  // Step A: the only kind
-    // Later kinds get NEW numbers, e.g. ResourceOffer offer = 3; ResourceRequest need = 4;
+  oneof kind {
+    Incident incident = 2;
+    ResolveIncident resolve = 3;
   }
+}
+
+// An incident is over: free the resources assigned to it.
+// No election and no plan: any node can process the request.
+message ResolveIncident {
+  uint64 incident_id = 1;
 }
 
 message SubmitReply {

@@ -42,6 +42,8 @@ struct Contents {
     assignments: BTreeMap<ResourceId, Assignment>,
     /// The one stored plan per client request. This is the create-if-absent record.
     plans_by_request: HashMap<String, Plan>,
+    /// Resolve request IDs are idempotent and cannot be reused for another incident.
+    resolutions_by_request: HashMap<String, IncidentId>,
 }
 
 /// Shared state kept in this process's memory. Implements [`SharedState`].
@@ -100,6 +102,17 @@ impl SharedState for InMemoryStore {
             return CommitOutcome::AlreadyCommitted(existing.clone());
         }
 
+        // A resolved incident must never receive new resource assignments.
+        if contents
+            .incidents
+            .get(&incident.id)
+            .is_some_and(|existing| existing.status == IncidentStatus::Resolved)
+        {
+            return CommitOutcome::StateUnavailable(StateUnavailable {
+                reason: format!("incident {} is already resolved", incident.id),
+            });
+        }
+
         // Every planned resource must exist, be unassigned, and appear only once in the plan.
         // An unknown resource is reported as "taken" too: from the caller's side the cure is
         // the same (snapshot again and re-plan). Nothing is written before all checks pass.
@@ -127,8 +140,49 @@ impl SharedState for InMemoryStore {
                 .insert(assignment.resource_id, assignment.clone());
         }
         contents.incidents.insert(incident.id, incident);
-        contents.plans_by_request.insert(request_id.to_string(), plan);
+        contents
+            .plans_by_request
+            .insert(request_id.to_string(), plan);
         CommitOutcome::Committed
+    }
+
+    async fn resolve(
+        &self,
+        request_id: &str,
+        incident_id: IncidentId,
+    ) -> Result<(), StateUnavailable> {
+        let mut contents = self.write();
+
+        // Repeating the same resolve request is safe.
+        if let Some(&previous_id) = contents.resolutions_by_request.get(request_id) {
+            if previous_id == incident_id {
+                return Ok(());
+            }
+
+            return Err(StateUnavailable {
+                reason: format!(
+                    "resolve request ID {request_id} was already used for incident {previous_id}"
+                ),
+            });
+        }
+
+        // Mark the incident as resolved if it exists.
+        // An unknown incident is a successful no-op.
+        if let Some(incident) = contents.incidents.get_mut(&incident_id) {
+            incident.status = IncidentStatus::Resolved;
+        }
+
+        // Release only resources assigned to this incident.
+        contents
+            .assignments
+            .retain(|_, assignment| assignment.incident_id != incident_id);
+
+        // Remember the request so retries are safe and request IDs cannot be reused.
+        contents
+            .resolutions_by_request
+            .insert(request_id.to_string(), incident_id);
+
+        Ok(())
     }
 
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable> {
@@ -205,6 +259,7 @@ mod tests {
     fn default_resources_are_the_same_on_every_node() {
         let first = InMemoryStore::with_default_resources();
         let second = InMemoryStore::with_default_resources();
+
         assert_eq!(first.read().resources.len(), DEFAULT_RESOURCE_COUNT);
         assert_eq!(
             first.read().resources.values().collect::<Vec<_>>(),
@@ -215,12 +270,21 @@ mod tests {
     #[tokio::test]
     async fn same_request_committed_twice_leaves_one_record_and_returns_already_committed() {
         let store = store_with_resources(3);
-        assert_eq!(commit(&store, "r1", 10, &[1]).await, CommitOutcome::Committed);
+
+        assert_eq!(
+            commit(&store, "r1", 10, &[1]).await,
+            CommitOutcome::Committed
+        );
+
         let before = store.snapshot().await.unwrap();
 
         // A retry may even have been planned differently; the stored plan still wins.
         let second = commit(&store, "r1", 10, &[2]).await;
-        assert_eq!(second, CommitOutcome::AlreadyCommitted(plan_assigning(10, &[1])));
+
+        assert_eq!(
+            second,
+            CommitOutcome::AlreadyCommitted(plan_assigning(10, &[1]))
+        );
 
         let after = store.snapshot().await.unwrap();
         assert_eq!(after, before, "the second commit must not change the state");
@@ -231,6 +295,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_commits_of_one_request_id_give_exactly_one_committed() {
         let store = Arc::new(store_with_resources(8));
+
         let tasks: Vec<_> = (1..=8u64)
             .map(|resource_id| {
                 let store = store.clone();
@@ -242,6 +307,7 @@ mod tests {
 
         let mut committed = 0;
         let mut already_committed = 0;
+
         for task in tasks {
             match task.await.unwrap() {
                 CommitOutcome::Committed => committed += 1,
@@ -249,6 +315,7 @@ mod tests {
                 other => panic!("unexpected outcome {other:?}"),
             }
         }
+
         assert_eq!(committed, 1);
         assert_eq!(already_committed, 7);
         assert_eq!(store.snapshot().await.unwrap().assignments.len(), 1);
@@ -257,24 +324,34 @@ mod tests {
     #[tokio::test]
     async fn two_requests_planning_the_same_free_resource_only_one_gets_it() {
         let store = store_with_resources(3);
-        assert_eq!(commit(&store, "first", 10, &[1]).await, CommitOutcome::Committed);
+
+        assert_eq!(
+            commit(&store, "first", 10, &[1]).await,
+            CommitOutcome::Committed
+        );
 
         // "second" planned from a snapshot taken before "first" committed; resource 2 is
         // valid but must not be written when resource 1 is taken.
         let outcome = commit(&store, "second", 11, &[2, 1]).await;
+
         assert_eq!(outcome, CommitOutcome::ResourceTaken { resource_id: 1 });
+
         let snapshot = store.snapshot().await.unwrap();
         assert_eq!(snapshot.assignments.len(), 1);
         assert_eq!(snapshot.incidents.len(), 1);
         assert_eq!(store.lookup_request("second").await.unwrap(), None);
 
         // After planning again with a free resource, the same request succeeds.
-        assert_eq!(commit(&store, "second", 11, &[2]).await, CommitOutcome::Committed);
+        assert_eq!(
+            commit(&store, "second", 11, &[2]).await,
+            CommitOutcome::Committed
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_requests_for_one_resource_give_exactly_one_winner() {
         let store = Arc::new(store_with_resources(1));
+
         let tasks: Vec<_> = (1..=6u64)
             .map(|number| {
                 let store = store.clone();
@@ -283,8 +360,10 @@ mod tests {
                 )
             })
             .collect();
+
         let mut committed = 0;
         let mut taken = 0;
+
         for task in tasks {
             match task.await.unwrap() {
                 CommitOutcome::Committed => committed += 1,
@@ -292,6 +371,7 @@ mod tests {
                 other => panic!("unexpected outcome {other:?}"),
             }
         }
+
         assert_eq!((committed, taken), (1, 5));
     }
 
@@ -299,42 +379,56 @@ mod tests {
     async fn an_unknown_resource_or_one_named_twice_is_reported_as_taken_and_writes_nothing() {
         let store = store_with_resources(3);
         let empty = store.snapshot().await.unwrap();
+
         assert_eq!(
             commit(&store, "r1", 10, &[1, 77]).await,
             CommitOutcome::ResourceTaken { resource_id: 77 }
         );
+
         assert_eq!(
             commit(&store, "r2", 11, &[2, 2]).await,
             CommitOutcome::ResourceTaken { resource_id: 2 }
         );
+
         assert_eq!(store.snapshot().await.unwrap(), empty);
     }
 
     #[tokio::test]
     async fn lookup_request_finds_committed_plans_and_returns_none_otherwise() {
         let store = store_with_resources(3);
+
         assert_eq!(store.lookup_request("r1").await.unwrap(), None);
+
         commit(&store, "r1", 10, &[1]).await;
+
         assert_eq!(
             store.lookup_request("r1").await.unwrap(),
             Some(plan_assigning(10, &[1]))
         );
+
         assert_eq!(store.lookup_request("other").await.unwrap(), None);
     }
 
     #[tokio::test]
     async fn a_request_with_no_free_resource_is_stored_as_open_with_an_empty_plan() {
         let store = store_with_resources(3);
-        assert_eq!(commit(&store, "r1", 10, &[]).await, CommitOutcome::Committed);
+
+        assert_eq!(
+            commit(&store, "r1", 10, &[]).await,
+            CommitOutcome::Committed
+        );
 
         let snapshot = store.snapshot().await.unwrap();
+
         assert_eq!(snapshot.incidents.len(), 1);
         assert_eq!(snapshot.incidents[0].status, IncidentStatus::Open);
         assert!(snapshot.assignments.is_empty());
+
         assert_eq!(
             store.lookup_request("r1").await.unwrap(),
             Some(plan_assigning(10, &[]))
         );
+
         // A retry gets the same empty plan, not a fresh attempt.
         assert_eq!(
             commit(&store, "r1", 10, &[1]).await,
@@ -345,8 +439,11 @@ mod tests {
     #[tokio::test]
     async fn committing_with_resources_marks_the_incident_assigned() {
         let store = store_with_resources(3);
+
         commit(&store, "r1", 10, &[2]).await;
+
         let snapshot = store.snapshot().await.unwrap();
+
         assert_eq!(snapshot.incidents[0].status, IncidentStatus::Assigned);
         assert_eq!(snapshot.assignments[0].resource_id, 2);
     }
@@ -354,15 +451,130 @@ mod tests {
     #[tokio::test]
     async fn snapshot_lists_are_sorted_by_id() {
         let store = store_with_resources(4);
+
         commit(&store, "a", 30, &[4]).await;
         commit(&store, "b", 10, &[1]).await;
         commit(&store, "c", 20, &[3]).await;
+
         let snapshot = store.snapshot().await.unwrap();
+
         let incident_ids: Vec<_> = snapshot.incidents.iter().map(|i| i.id).collect();
         let resource_ids: Vec<_> = snapshot.resources.iter().map(|r| r.id).collect();
         let assigned_ids: Vec<_> = snapshot.assignments.iter().map(|a| a.resource_id).collect();
+
         assert_eq!(incident_ids, [10, 20, 30]);
         assert_eq!(resource_ids, [1, 2, 3, 4]);
         assert_eq!(assigned_ids, [1, 3, 4]);
+    }
+
+    #[tokio::test]
+    async fn resolving_incident_releases_its_resources_only() {
+        let store = store_with_resources(3);
+
+        commit(&store, "r1", 10, &[1, 2]).await;
+        commit(&store, "r2", 20, &[3]).await;
+
+        store.resolve("resolve-1", 10).await.unwrap();
+
+        let snapshot = store.snapshot().await.unwrap();
+
+        let resolved = snapshot
+            .incidents
+            .iter()
+            .find(|incident| incident.id == 10)
+            .unwrap();
+
+        assert_eq!(resolved.status, IncidentStatus::Resolved);
+        assert_eq!(snapshot.assignments.len(), 1);
+        assert_eq!(snapshot.assignments[0].incident_id, 20);
+        assert_eq!(snapshot.assignments[0].resource_id, 3);
+    }
+
+    #[tokio::test]
+    async fn resolving_the_same_incident_twice_is_safe() {
+        let store = store_with_resources(2);
+
+        commit(&store, "r1", 10, &[1]).await;
+
+        store.resolve("resolve-1", 10).await.unwrap();
+        store.resolve("resolve-1", 10).await.unwrap();
+
+        let snapshot = store.snapshot().await.unwrap();
+
+        assert_eq!(snapshot.assignments.len(), 0);
+        assert_eq!(snapshot.incidents[0].status, IncidentStatus::Resolved);
+    }
+
+    #[tokio::test]
+    async fn resolve_request_id_cannot_be_reused_for_another_incident() {
+        let store = store_with_resources(2);
+
+        commit(&store, "r1", 10, &[1]).await;
+        commit(&store, "r2", 20, &[2]).await;
+
+        store.resolve("resolve-1", 10).await.unwrap();
+
+        let result = store.resolve("resolve-1", 20).await;
+
+        assert!(result.is_err());
+
+        let snapshot = store.snapshot().await.unwrap();
+
+        assert_eq!(snapshot.incidents[1].status, IncidentStatus::Assigned);
+        assert_eq!(snapshot.assignments.len(), 1);
+        assert_eq!(snapshot.assignments[0].incident_id, 20);
+    }
+
+    #[tokio::test]
+    async fn released_resource_can_be_assigned_to_another_incident() {
+        let store = store_with_resources(1);
+
+        commit(&store, "r1", 10, &[1]).await;
+        store.resolve("resolve-1", 10).await.unwrap();
+
+        assert_eq!(
+            commit(&store, "r2", 20, &[1]).await,
+            CommitOutcome::Committed
+        );
+
+        let snapshot = store.snapshot().await.unwrap();
+
+        assert_eq!(snapshot.assignments.len(), 1);
+        assert_eq!(snapshot.assignments[0].incident_id, 20);
+        assert_eq!(snapshot.assignments[0].resource_id, 1);
+    }
+
+    #[tokio::test]
+    async fn resolved_incident_cannot_be_committed_again() {
+        let store = store_with_resources(2);
+
+        commit(&store, "r1", 10, &[1]).await;
+        store.resolve("resolve-1", 10).await.unwrap();
+
+        let result = commit(&store, "r2", 10, &[2]).await;
+
+        assert!(matches!(result, CommitOutcome::StateUnavailable(_)));
+
+        let snapshot = store.snapshot().await.unwrap();
+
+        assert_eq!(snapshot.assignments.len(), 0);
+        assert_eq!(snapshot.incidents[0].status, IncidentStatus::Resolved);
+    }
+
+    #[tokio::test]
+    async fn resolving_unknown_incident_succeeds_without_releasing_resources() {
+        let store = store_with_resources(2);
+
+        commit(&store, "r1", 10, &[1]).await;
+
+        let result = store.resolve("resolve-unknown", 999).await;
+
+        assert!(result.is_ok());
+
+        let snapshot = store.snapshot().await.unwrap();
+
+        assert_eq!(snapshot.assignments.len(), 1);
+        assert_eq!(snapshot.assignments[0].incident_id, 10);
+        assert_eq!(snapshot.assignments[0].resource_id, 1);
     }
 }

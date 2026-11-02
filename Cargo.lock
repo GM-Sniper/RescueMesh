@@ -714,6 +714,7 @@ dependencies = [
  "clap",
  "client",
  "common",
+ "rand",
  "serde",
  "tokio",
  "toml",
