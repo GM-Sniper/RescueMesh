@@ -34,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use common::config::ClusterConfig; // P1's config loader: the same node list the nodes and clients use
+use common::config::{ClusterConfig, StateBackend}; // P1's config loader: the same node list the nodes and clients use
 use serde::Deserialize;
 
 /// Command line: just the experiment file.
@@ -58,9 +58,6 @@ struct Experiment {
     attempt_timeout_ms: Option<u64>, // multicast: how long one attempt waits for a plan
     #[serde(default)]
     planner_iterations: BTreeMap<String, usize>, // local mode: make some nodes slower, e.g. { "2" = 30000 } (P2's knob)
-    #[serde(default = "default_true")]
-    shared_state: bool,    // TEMPORARY until the DFS: all nodes share one set of resources (false = one private copy per node)
-    shared_state_dir: Option<PathBuf>, // lab mode: a folder all 3 machines reach (network share); local mode uses one per run
     #[serde(default = "default_seed")]
     seed: u64,             // incident seed; same seed = same incidents
     #[serde(default)]
@@ -97,7 +94,6 @@ enum FaultKind {
 }
 
 fn default_seed() -> u64 { 1 }
-fn default_true() -> bool { true }
 fn default_stage_secs() -> f64 { 30.0 }
 
 /// The nodes this runner started, with their IDs. Dropping it stops them, so they never outlive
@@ -121,7 +117,6 @@ struct NodeLauncher<'a> {
     run_id: &'a str,
     out: &'a Path,
     planner_iterations: &'a BTreeMap<String, usize>,
-    shared_dir: Option<&'a Path>,
 }
 
 impl NodeLauncher<'_> {
@@ -130,10 +125,7 @@ impl NodeLauncher<'_> {
         let log = OpenOptions::new().create(true).append(true).open(self.out.join(format!("node{id}.log")))?;
         let mut cmd = Command::new(&self.node_bin);
         cmd.args(["--id", &id.to_string(), "--run-id", self.run_id]) // run_id joins its logs with the CSV
-            .arg("--config").arg(self.cluster_path);
-        if let Some(dir) = self.shared_dir {
-            cmd.arg("--shared-state-dir").arg(dir); // every node gets the SAME folder: one set of resources
-        }
+            .arg("--config").arg(self.cluster_path); // its [shared_state] says where the shared state is
         if let Some(n) = self.planner_iterations.get(&id.to_string()) {
             cmd.args(["--planner-iterations", &n.to_string()]); // P2's knob: a slower node, for load-balancing tests
         }
@@ -215,18 +207,17 @@ fn main() -> anyhow::Result<()> {
     println!("experiment {run_id}: results go to {}", out.display());
 
     // 1. Nodes: start them here (local) or have the user start them (lab).
-    // Shared state (TEMPORARY until the DFS): one folder for all nodes, so the cluster has ONE set of
-    // resources. Local mode: a fresh folder inside this run's folder, so every run starts with all
-    // resources free. Lab mode: the network folder from the file (it must be empty for a fresh start).
-    let shared_dir: Option<PathBuf> = match (exp.shared_state, exp.start_nodes, &exp.shared_state_dir) {
-        (false, _, _) => None,
-        (true, true, _) => Some(out.join("shared-state")),
-        (true, false, Some(dir)) => Some(dir.clone()),
-        (true, false, None) => bail!(
-            "lab mode needs `shared_state_dir` (a folder all 3 machines reach, e.g. a network share) \
-             so the nodes share one set of resources; or set `shared_state = false`"
-        ),
-    };
+    // Shared state: [shared_state] in the cluster file (P5). With SeaweedFS ("s3") a node fills an
+    // EMPTY bucket with the 10 starting resources, so a fresh run = delete the bucket before any node
+    // starts (P5's rule: never a new bucket name per run, SeaweedFS runs out of volumes).
+    let state = &cluster.shared_state;
+    let s3 = state.backend == StateBackend::S3;
+    if s3 && exp.start_nodes {
+        reset_bucket(&state.endpoint, &state.bucket)?; // the nodes start right after, on an empty bucket
+        println!("shared state: SeaweedFS bucket {}/{} reset", state.endpoint, state.bucket);
+    } else if !s3 {
+        println!("note: shared_state.backend = \"memory\" in {}: each node has its OWN resources (nothing shared)", cluster_path.display());
+    }
 
     let launcher = NodeLauncher {
         node_bin: bin("node"),
@@ -235,12 +226,11 @@ fn main() -> anyhow::Result<()> {
         run_id: &run_id,
         out: &out,
         planner_iterations: &exp.planner_iterations,
-        shared_dir: shared_dir.as_deref(),
     };
     let mut nodes = if exp.start_nodes {
         Some(start_nodes(&launcher)?)
     } else {
-        wait_for_lab_nodes(&cluster, &cluster_path, &run_id, shared_dir.as_deref())?;
+        wait_for_lab_nodes(&cluster, &cluster_path, &run_id)?;
         None
     };
 
@@ -329,10 +319,7 @@ fn main() -> anyhow::Result<()> {
     // 4b3. Failover, recovery and latency around each failure (Step C), only when there were failures.
     if !fault_logs.is_empty() {
         let mut failover_cmd = Command::new(bin("failover"));
-        failover_cmd.arg(&csv).arg("--faults").args(&fault_logs); // when each failure started and ended
-        if !election_logs.is_empty() {
-            failover_cmd.arg("--elections").args(&election_logs); // who won when: the recovery stand-in
-        }
+        failover_cmd.arg(&csv).arg("--faults").args(&fault_logs); // when each failure started and ended, and READY rows
         let failover = failover_cmd.output().context("could not start failover")?;
         if !failover.status.success() {
             bail!("failover failed: {}", String::from_utf8_lossy(&failover.stderr));
@@ -489,15 +476,42 @@ fn wait_until_listening(child: &mut Child, addr: SocketAddr, limit: Duration) ->
     }
 }
 
+/// Deletes the SeaweedFS bucket, so the nodes started next fill a fresh one with the starting
+/// resources. Same as P5's `curl -X DELETE <endpoint>/<bucket>`, sent by hand: one HTTP request
+/// does not need an HTTP library.
+fn reset_bucket(endpoint: &str, bucket: &str) -> anyhow::Result<()> {
+    let host = endpoint.trim_start_matches("http://").trim_end_matches('/'); // e.g. 127.0.0.1:8333 (the config check requires http://)
+    let not_running = || format!("SeaweedFS is not answering at {endpoint}: start it first (see docs/lab-bringup.md), or set backend = \"memory\"");
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(host)?.next().with_context(not_running)?;
+    let mut conn = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).with_context(not_running)?;
+    conn.set_read_timeout(Some(Duration::from_secs(10)))?; // deleting a full bucket takes a moment
+    write!(conn, "DELETE /{bucket} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+    let mut status_line = String::new();
+    std::io::BufReader::new(conn).read_line(&mut status_line)?; // e.g. "HTTP/1.1 204 No Content"
+    let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if !bucket_is_gone(status) {
+        bail!("could not reset the shared state: DELETE {endpoint}/{bucket} answered {:?}", status_line.trim());
+    }
+    Ok(())
+}
+
+/// After a DELETE: 2xx = deleted, 404 = there was no bucket yet. Both mean "empty now".
+fn bucket_is_gone(status: u16) -> bool {
+    (200..300).contains(&status) || status == 404
+}
+
 /// Lab mode: print how to start each node with this run's --run-id, then wait for Enter.
-fn wait_for_lab_nodes(cluster: &ClusterConfig, cluster_path: &Path, run_id: &str, shared_dir: Option<&Path>) -> anyhow::Result<()> {
-    let shared = shared_dir.map_or(String::new(), |d| format!(" --shared-state-dir {}", d.display()));
+fn wait_for_lab_nodes(cluster: &ClusterConfig, cluster_path: &Path, run_id: &str) -> anyhow::Result<()> {
+    let state = &cluster.shared_state;
+    if state.backend == StateBackend::S3 {
+        // The bucket must be empty BEFORE the nodes start (they fill it with the starting resources).
+        // From a node PC: its endpoint is 127.0.0.1, which is that PC's own gateway (docs/lab-bringup.md).
+        println!("lab mode: first reset the shared state, from any one node PC:");
+        println!("  curl -X DELETE {}/{}", state.endpoint.trim_end_matches('/'), state.bucket);
+    }
     println!("lab mode: start each node on its own machine with");
     for node in &cluster.nodes {
-        println!("  node {} ({}): cargo run --release -p node -- --id {} --config {} --run-id {run_id}{shared}", node.id, node.addr, node.id, cluster_path.display());
-    }
-    if let Some(dir) = shared_dir {
-        println!("  (empty {} first, so the run starts with all resources free)", dir.display());
+        println!("  node {} ({}): cargo run --release -p node -- --id {} --config {} --run-id {run_id}", node.id, node.addr, node.id, cluster_path.display());
     }
     println!("then press Enter here to start the load");
     std::io::stdin().lock().read_line(&mut String::new())?;
@@ -613,5 +627,19 @@ mod tests {
     fn a_run_with_only_failures_is_not_called_unassigned() {
         let run = csv(&[("a", "timeout", ""), ("b", "error", "")]);
         assert!(check_run(&run, &[]).is_empty()); // nothing succeeded, so "no resource" says nothing
+    }
+
+    #[test]
+    fn a_deleted_or_missing_bucket_counts_as_reset() {
+        assert!(bucket_is_gone(204)); // deleted
+        assert!(bucket_is_gone(404)); // first run: there was no bucket yet
+        assert!(!bucket_is_gone(500)); // the gateway failed: the old resources may still be there
+        assert!(!bucket_is_gone(0)); // no answer we could read
+    }
+
+    #[test]
+    fn reset_says_seaweedfs_is_not_running_when_nothing_listens() {
+        let err = reset_bucket("http://127.0.0.1:1", "rescuemesh").unwrap_err(); // port 1: nothing listens there
+        assert!(format!("{err:#}").contains("SeaweedFS is not answering"), "{err:#}");
     }
 }

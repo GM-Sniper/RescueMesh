@@ -840,3 +840,27 @@ latency p50 / p95:  mute  before 17.9 / 34.8 ms, during 15.7 / 23.8 ms, after 17
 AVG holds a newly built program and first runs a sandboxed **copy** of it, with the same arguments, for ~25 s. The copy really reaches `127.0.0.1`, so it sent requests to the nodes. Then the real one ran with the same run ID and overwrote the copy's CSV. (The nodes' 26-43 s slow starts after a build are the same check.)
 
 **Fix in `crates/loadgen/src/bin/experiment.rs`:** before the real run, the runner starts `node`, `loadgen` and `inject` once with `--help`, so AVG checks a harmless run. After a fresh build the next run was clean (no warnings). The first run after a build takes ~50 s longer while AVG checks the `--help` runs. Another option is an AVG exception for the repo's `target` folder, a security setting each person changes themselves. The safeguards (section 15) are what caught this: without them the polluted runs would have looked like "0 resources assigned".
+
+## 21. Step C, Mon Nov 2: GM-Sniper's review of PR #34
+
+GM-Sniper tested the PR merged with main and asked for four changes. All four are done.
+
+**1. Conflicts with main (PR #33, SeaweedFS).** P5's shared state changed the same lines in `crates/node/src/main.rs`, `state.rs` and `store.rs` as the Step B folder store. Merged `main` into `StepC/p6` and kept P5's version of those files; `DESIGN_LOG.md` keeps both sections. `crates/node/Cargo.toml` had `serde` twice (both sides added it on different lines, so git saw no conflict but cargo refused to build): it is now exactly main's.
+
+**2. The folder store is gone; the runner uses `[shared_state]`.** `crates/node/src/file_store.rs` and the node's `--shared-state-dir` flag are deleted (they were TEMPORARY until the real shared state, which #33 is; the lab would have needed a network share). The experiment file loses `shared_state` and `shared_state_dir`. The runner now follows the cluster file:
+- `backend = "s3"`, local mode: it deletes the bucket before starting the nodes (one HTTP `DELETE`, like P5's `curl -X DELETE`), because a node fills an EMPTY bucket with the 10 starting resources. If SeaweedFS is not running it stops with a clear message.
+- `backend = "s3"`, lab mode: it prints the `curl -X DELETE` to run on a node PC before starting the nodes.
+- `backend = "memory"`: it prints a note that each node has its own resources.
+- 2 new tests (the reset's answers, and the message when nothing listens).
+
+**3. Failover = the requests the failure caught.** The plan's 2.6 s example is a request running when the node died: its first attempt is lost, the client waits out its 2 s deadline and a retry gets a plan from a live node. The first version reported the first answer without the failed node instead, which is usually a NEW request that only waits one 300 ms bid timeout (0.3-0.6 s). Now `failover.rs` reports:
+- `failover`: median latency of the requests that got a plan from a live node, needed a retry, and ran while the node was down (count and max shown);
+- `reroute`: the old number, as a second line;
+- "not measured" when no request was caught, never 0.
+
+**4. Recovery from P3's READY row.** P3's rejoin rule (#32) writes `READY` in the node's fault log when the node is ready to bid again (fault_id `startup` after a restart). Recovery = first `READY` of the node after the failure started - when it was back. The stand-in (first election won) is gone; it measured 0.00 s because a returning node has load 0 and wins at once. The `--elections` option is gone too. A restarted node can be READY a few ms before the runner logs `CUT_END` (it logs it once the node accepts connections): recovery is then 0, never negative.
+- `failover.rs`: 9 tests (was 6), including "the caught request, not the first new one", the median, and the cut case.
+
+**Checks.** The workspace builds. All loadgen, client and common tests pass. Two node tests fail, and they are **main's own** (the node code here is identical to main's): `slow_plan_is_saved_even_if_the_caller_stops_waiting` fails in `--release` only ("the plan should take longer than 20 ms": the planner is faster since P2's #27), and `slow_node_wins_fewer_elections` failed once in a full debug run and passed 3 of 3 alone (timing). For P1/P2.
+
+**Dry run** (`experiments/fail-recover-local.toml`, memory backend: SeaweedFS is not installed on this laptop): 3,917 requests, 100% reliability, 0 lost. Node 2 muted: detection 1.27 s, reroute 0.34 s, recovery 0.24 s (READY). Node 3 cut: detection 1.23 s, reroute 0.32 s, recovery 0.00 s (READY 0.3 s before CUT_END). Failover "not measured" in both: no request was retried in this run, so the failure caught none (node 2 held no request at the moment it was muted). Caught requests depend on timing; the lab runs with more load will show them.
