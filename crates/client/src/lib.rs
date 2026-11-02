@@ -83,6 +83,15 @@ pub struct SubmitOutcome {
     pub no_plan_replies: u32,          // replies with no plan: nodes that lost the election, naming the winner
 }
 
+/// How a resolve (issue #36) went.
+#[derive(Debug, Clone)]
+pub struct ResolveOutcome {
+    pub ok: bool,              // a node confirmed it: the incident's resources are free
+    pub latency_us: u64,       // send-to-confirmation time
+    pub attempts: u32,         // tries it used (1 = no retry)
+    pub error: Option<String>, // why it failed; None if ok
+}
+
 /// Connections to the nodes plus the rules for talking to them.
 /// Cloning is cheap (the connections are shared), so many tasks can each hold a copy.
 #[derive(Clone)]
@@ -218,6 +227,42 @@ impl ClientMiddleware {
         outcome.attempts = self.policy.attempts;
         outcome.no_plan_replies = no_plan_replies;
         outcome
+    }
+
+    /// Step D (issue #36): incident `incident_id` is over, so its resources can be freed. Sent to
+    /// every node at once, like a submit, with the same retry policy and one request_id for all
+    /// attempts (the dedup key, so a repeat frees nothing twice). Any node's normal reply is
+    /// success: no election and no plan are involved.
+    pub async fn resolve(&self, incident_id: u64) -> ResolveOutcome {
+        let message = pb::SubmitRequest {
+            request_id: Uuid::new_v4().to_string(),
+            kind: Some(submit_request::Kind::Resolve(pb::ResolveIncident { incident_id })),
+        };
+        let start = Instant::now();
+        let mut last_error = String::from("no node answered");
+        for attempt in 1..=self.policy.attempts {
+            if attempt > 1 {
+                let pause_ms = Uuid::new_v4().as_bytes()[0] as u64 % 51; // same 0-50 ms pause as submit
+                tokio::time::sleep(Duration::from_millis(pause_ms)).await;
+            }
+            let deadline = tokio::time::Instant::now() + self.policy.attempt_timeout;
+            let mut calls = self.send_to_all(&message, deadline);
+            while let Some(joined) = calls.join_next().await {
+                match joined {
+                    Ok((_, Ok(Ok(_)))) => {
+                        calls.detach_all(); // the other nodes may still answer; nobody needs them
+                        return ResolveOutcome { ok: true, latency_us: micros_since(start), attempts: attempt, error: None };
+                    }
+                    Ok((node_id, Ok(Err(status)))) => last_error = format!("node {node_id}: {:?}: {}", status.code(), status.message()),
+                    Ok((node_id, Err(_elapsed))) => last_error = format!("node {node_id}: no reply before the deadline"),
+                    Err(_) => {} // a call task panicked: nothing to read
+                }
+            }
+            if attempt < self.policy.attempts {
+                tokio::time::sleep_until(deadline).await; // same retry rule as submit
+            }
+        }
+        ResolveOutcome { ok: false, latency_us: micros_since(start), attempts: self.policy.attempts, error: Some(last_error) }
     }
 
     /// Starts the same request on every node at once, each in its own task, all with one deadline.
@@ -524,5 +569,29 @@ mod tests {
         assert_eq!(out.outcome(), "committed");
         out.duplicate = true;
         assert_eq!(out.outcome(), "duplicate", "a retry that found the stored plan");
+    }
+
+    // ---- Step D, issue #36: resolve.
+
+    #[tokio::test]
+    async fn resolve_succeeds_on_the_first_normal_reply() {
+        // A resolve's reply has no plan; any node answering normally is enough.
+        let (nodes, _) = start(&[|_| Act::Hang, |_| Act::NoPlan { winner: 0 }, |_| Act::Hang]).await;
+        let out = client(&nodes, FAST).resolve(42).await;
+        assert!(out.ok, "{out:?}");
+        assert_eq!(out.attempts, 1);
+        assert!(out.latency_us < 300_000, "did not wait for the silent nodes");
+    }
+
+    #[tokio::test]
+    async fn resolve_retries_with_one_request_id_then_fails() {
+        let (nodes, seen) = start(&[|_| Act::Fail, |_| Act::Fail, |_| Act::Fail]).await;
+        let out = client(&nodes, FAST).resolve(42).await;
+        assert!(!out.ok);
+        assert_eq!(out.attempts, 3);
+        assert!(out.error.unwrap().contains("fake node fails"));
+        let ids = seen[0].lock().unwrap().clone();
+        assert_eq!(ids.len(), 3, "one call per attempt");
+        assert!(ids.iter().all(|id| *id == ids[0]), "same request_id on every retry");
     }
 }
