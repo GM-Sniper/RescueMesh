@@ -1,27 +1,33 @@
 //! State shared by every request handler and background task of one node.
 //! Shared as `Arc<NodeState>`: cheap to clone, all clones point to the same struct.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::NodeId;
 use common::config::ClusterConfig;
 use common::load::LoadReport;
 use common::shared_state::SharedState;
+use common::pb::SubmitReply;
 use common::pb::node_client::NodeClient;
+use tokio::sync::watch;
+use tonic::Status;
 use tonic::transport::Channel;
 // tokio's Instant follows tokio's fake clock in tests, so a 10 s mute test runs instantly.
 // Also used by the in-flight guard to time requests (P3's service-time average).
-use tokio::time::{Instant, sleep_until};
-
+use tokio::time::Instant;
 use crate::election::ElectionTable;
 use crate::election_log::ElectionLog;
 use crate::failure_detector::{FailureDetector, PeerEvent};
 use crate::fault_log::FaultLog;
 use crate::load::LoadCollector;
+use crate::request_log::RequestLog;
 use crate::peers::Peers;
 use crate::store::InMemoryStore;
+use crate::gated_store::MuteGatedStore;
+use crate::mute::MuteSwitch;
 
 pub struct NodeState {
     pub id: NodeId,
@@ -35,14 +41,17 @@ pub struct NodeState {
     /// P4: incidents, resources and assignments, behind the shared-state interface.
     /// `dyn` so the in-memory store can later be swapped for the DFS-backed one (see store.rs).
     pub store: Arc<dyn SharedState>,
-    /// When the current mute ends; None = never muted (task 4).
-    /// An end time instead of an on/off flag: nothing has to switch it back off,
-    /// and overlapping mutes just keep the later end.
-    muted_until: Mutex<Option<Instant>>,
+    /// When the current mute ends (task 4). In an `Arc` because the store gate reads it too.
+    mute: Arc<MuteSwitch>,
     /// P5's failure detector: who we currently believe is alive (task 5).
     /// Private: used only through heard_from / check_peers / alive_peers, so the
     /// time always comes from the same clock and the lock is held only briefly.
     detector: Mutex<FailureDetector>,
+    /// P3: when we last heard from any peer. The rejoin rule waits for one after a mute.
+    last_heard: Mutex<Option<Instant>>,
+    /// P3: false from a mute until the rejoin rule passes (see rejoin.rs). Our bids
+    /// carry it, and a not-ready bid cannot win.
+    ready: AtomicBool,
     /// P5's fault CSV (MUTE_START/END, PEER_DOWN/UP). None in tests, so they write no files.
     pub fault_log: Option<FaultLog>,
     /// P3: every election this node has taken part in (see election.rs).
@@ -50,26 +59,51 @@ pub struct NodeState {
     pub election: Mutex<ElectionTable>,
     /// P3's election CSV (see election_log.rs). None in tests, so they write no files.
     pub election_log: Option<ElectionLog>,
+    /// Submits this node is working on right now, by request_id: where each one's result
+    /// will arrive. A client retry, or a peer's bid for the same request, waits for the work
+    /// already running instead of planning again (see service.rs, `start_or_join`).
+    /// Locked only briefly, never across a wait.
+    pub in_progress: Mutex<HashMap<String, watch::Receiver<Option<SubmitResult>>>>,
+    /// P1's request CSV: START and END of each Submit's work, for P6's measurements
+    /// (see request_log.rs). None in tests, so they write no files.
+    pub request_log: Option<RequestLog>,
 }
+
+/// One Submit's result, copied to everyone waiting for it.
+pub type SubmitResult = Result<SubmitReply, Status>;
 
 impl NodeState {
     pub fn new(id: NodeId, config: ClusterConfig, peers: Peers) -> Self {
         let load = LoadCollector::new(config.load);
         // Every peer starts "alive" and gets the full suspect_after to send its first heartbeat.
         let detector = FailureDetector::new(peers.ids(), config.timing.suspect_after(), now_std());
+        let mute = Arc::new(MuteSwitch::default());
         NodeState {
             id,
             config,
             peers,
             in_flight: AtomicUsize::new(0),
             load,
-            store: Arc::new(InMemoryStore::with_default_resources()),
-            muted_until: Mutex::new(None),
+            store:  Arc::new(MuteGatedStore::new(
+                    Arc::new(InMemoryStore::with_default_resources()),
+                mute.clone(),
+            )),
+            mute,
             detector: Mutex::new(detector),
+            last_heard: Mutex::new(None),
+            ready: AtomicBool::new(true),
             fault_log: None,
             election: Mutex::new(ElectionTable::new()),
             election_log: None,
+            in_progress: Mutex::new(HashMap::new()),
+            request_log: None,
         }
+    }
+
+    /// Turns on the request CSV (main does this; tests leave it off).
+    pub fn with_request_log(mut self, log: RequestLog) -> Self {
+        self.request_log = Some(log);
+        self
     }
 
     /// Turns on the fault CSV (main does this; tests leave it off).
@@ -86,10 +120,8 @@ impl NodeState {
 
     /// Replaces this node's own store. Tests give several nodes the same one, so they
     /// share state the way they will through the DFS.
-    /// NOTE FOR P1/P4: P6 REMOVED `#[cfg(test)]` HERE SO main.rs CAN PLUG IN THE TEMPORARY
-    /// SHARED-FOLDER STORE (--shared-state-dir, file_store.rs) UNTIL THE DFS IS CONNECTED.
     pub fn with_store(mut self, store: Arc<dyn SharedState>) -> Self {
-        self.store = store;
+        self.store = Arc::new(MuteGatedStore::new(store, self.mute.clone()));
         self
     }
 
@@ -117,30 +149,19 @@ impl NodeState {
 
     /// Go silent for `d` from now. An existing longer mute is kept, never shortened.
     pub fn mute_for(&self, d: Duration) {
-        let until = Instant::now() + d;
-        let mut current = self.muted_until.lock().unwrap();
-        if current.is_none_or(|c| until > c) {
-            *current = Some(until);
-        }
+        self.mute.mute_for(d);
     }
+
 
     /// True while a mute is running. Nobody switches it off: once the end time
     /// has passed, it simply no longer applies.
     pub fn is_muted(&self) -> bool {
-        matches!(*self.muted_until.lock().unwrap(), Some(u) if Instant::now() < u)
+        self.mute.is_muted()
     }
 
     /// Returns at once if not muted; otherwise sleeps until the mute ends.
     pub async fn wait_while_muted(&self) {
-        loop {
-            // Copy the end time out so the lock is released before sleeping.
-            let until = *self.muted_until.lock().unwrap();
-            match until {
-                Some(u) if Instant::now() < u => sleep_until(u).await,
-                _ => return,
-            }
-            // Loop: if the mute was extended while we slept, sleep again.
-        }
+        self.mute.wait_while_muted().await;
     }
 
     /// The one way to get a client for an outgoing call. None while muted:
@@ -155,6 +176,24 @@ impl NodeState {
     /// "We just heard from `peer`": a reply to our heartbeat, or a heartbeat it sent us.
     pub fn heard_from(&self, peer: NodeId) {
         self.detector.lock().unwrap().record(peer, now_std());
+        // Clients (0) and unknown IDs are not peers, so they do not count for rejoin.
+        if self.peers.ids().any(|p| p == peer) {
+            *self.last_heard.lock().unwrap() = Some(Instant::now());
+        }
+    }
+
+    /// True if some peer was heard at or after `since`.
+    pub fn heard_any_since(&self, since: Instant) -> bool {
+        matches!(*self.last_heard.lock().unwrap(), Some(t) if t >= since)
+    }
+
+    /// P3: may this node win elections right now? See rejoin.rs.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::SeqCst)
+    }
+
+    pub fn set_ready(&self, ready: bool) {
+        self.ready.store(ready, Ordering::SeqCst);
     }
 
     /// Re-checks every peer; returns only the changes (PeerDown / PeerUp).

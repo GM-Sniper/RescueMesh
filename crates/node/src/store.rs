@@ -29,9 +29,7 @@ use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
 const DEFAULT_RESOURCE_SEED: u64 = 42;
 const DEFAULT_RESOURCE_COUNT: usize = 10;
 
-/// The starting resources, the same on every node.
-/// NOTE FOR P4: P6 MOVED THIS OUT OF `with_default_resources` (SAME CONSTANTS, SAME RESULT) SO THE
-/// TEMPORARY SHARED-FOLDER STORE (file_store.rs) STARTS FROM EXACTLY THE SAME RESOURCES.
+/// The starting resources every node (and the S3 backend's first writer) uses.
 pub fn default_resources() -> Vec<Resource> {
     generate_snapshot(DEFAULT_RESOURCE_SEED, 0, DEFAULT_RESOURCE_COUNT).resources
 }

@@ -11,5 +11,5 @@ seed = 1
 stages = [2, 4, 8]
 stage_secs = 10
 
-[planner_iterations]   # node ID = iterations; about 0.7 us each, so 30000 is about 20 ms per plan
+[planner_iterations]   # node ID = iterations; about 0.32 us each (since P2's #27), so 30000 is about 10 ms per plan
 "2" = 30000

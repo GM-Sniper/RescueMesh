@@ -112,4 +112,10 @@ pub trait SharedState: Send + Sync {
     /// `Ok(None)` means "definitely not committed"; if that cannot be known, the answer is
     /// `Err(StateUnavailable)`, never `Ok(None)`.
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable>;
+        /// P5, Step C: called by a node coming back from a mute (P3's rejoin readiness rule)
+    /// before it bids again. `Ok` means the shared state is reachable and the returned copy
+    /// is current as of this call; `Err` means the node is not ready yet and must not bid.
+    async fn reload(&self) -> Result<Snapshot, StateUnavailable> {
+        self.snapshot().await
+    }
 }

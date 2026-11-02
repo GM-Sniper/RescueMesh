@@ -12,9 +12,11 @@ anyhow.workspace = true
 sysinfo.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+futures-util.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }  # RUST_LOG=debug shows more
-serde.workspace = true  # P6, TEMPORARY until the DFS: file_store.rs reads and writes the shared-state files
-toml.workspace = true   # P6, TEMPORARY until the DFS: the shared-state files are TOML
 
 [dev-dependencies]
 # Tests only: a paused, fake clock, so a 10 s mute test runs in milliseconds.

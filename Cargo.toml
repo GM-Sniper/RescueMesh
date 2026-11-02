@@ -29,3 +29,8 @@ rand = "=0.8.8"                                       # P2 seeded generators
 async-trait = "=0.1.92"
 # Added by P3 (load collector); only the "system" part, for CPU use:
 sysinfo = { version = "=0.38.4", default-features = false, features = ["system"] }
+# Added by P5 (shared-state backend, Step C): talk to the SeaweedFS S3 gateway over plain HTTP.
+# No TLS and no AWS SDK: the gateway runs without auth inside the lab network.
+reqwest = { version = "=0.13.5", default-features = false }
+serde_json = "=1.0.154"      # request and claim records are stored as JSON objects
+futures-util = "=0.3.34"     # join_all: fetch the claims of every resource in parallel

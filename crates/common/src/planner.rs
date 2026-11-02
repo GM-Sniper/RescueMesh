@@ -1,5 +1,6 @@
 use crate::config::PlannerConfig;
 use crate::domain::*;
+use crate::generators::generate_snapshot;
 
 /// Pure planner v1: no clock, no RNG. Ties broken by lowest resource id.
 ///
@@ -19,7 +20,7 @@ pub fn plan_with_workload(
     now: u64,
     config: &PlannerConfig,
 ) -> Plan {
-    simulate_workload(config);
+    perform_matching_workload(config, w, now);
 
     let age_min = now.saturating_sub(incident.timestamp) as f64 / 60_000.0;
     let priority = w.severity * incident.severity as f64 + w.age * age_min;
@@ -55,27 +56,34 @@ pub fn plan_with_workload(
 
 /// Performs deterministic CPU work proportional to:
 /// workload_incidents * workload_resources * iterations.
-fn simulate_workload(config: &PlannerConfig) {
+/// Performs deterministic incident-resource scoring for a configurable
+/// workload. The generated workload is separate from the live snapshot, so
+/// it adds CPU cost without changing the requested incident's assignment.
+fn perform_matching_workload(config: &PlannerConfig, w: &Weights, now: u64) {
+    // A fixed seed ensures identical workload inputs on every node.
+    let workload = generate_snapshot(42, config.workload_incidents, config.workload_resources);
+
     let mut accumulator = 0.0_f64;
 
-    for incident_index in 0..config.workload_incidents {
-        for resource_index in 0..config.workload_resources {
-            for iteration in 0..config.iterations {
-                // Deterministic arithmetic prevents this from being just an
-                // empty loop, while keeping the result independent of randomness.
-                let value = (incident_index + 1) as f64 * (resource_index + 1) as f64
-                    / (iteration + 1) as f64;
+    for _ in 0..config.iterations {
+        for incident in &workload.incidents {
+            let age_min = now.saturating_sub(incident.timestamp) as f64 / 60_000.0;
 
-                accumulator += value.sqrt();
+            let priority = w.severity * incident.severity as f64 + w.age * age_min;
+
+            for resource in &workload.resources {
+                let capability = resource.rtype.match_score(incident.category);
+                let distance = resource.location.distance(&incident.location) as f64;
+
+                let score = w.capability * capability - w.distance * distance;
+
+                accumulator += priority + score;
             }
         }
     }
 
-    // Keep the computed value observable to the optimizer without affecting
-    // the plan's output.
     std::hint::black_box(accumulator);
 }
-
 fn is_free(r: &Resource, s: &Snapshot, now: u64) -> bool {
     r.available
         && r.quantity > 0
