@@ -187,6 +187,61 @@ SeaweedFS is a service we use. The consistency rules are ours: how create-if-abs
 | 3 filers with their own local stores do share metadata, with no central database | A write on one filer was readable on the others after 3 to 28 ms (median 7 ms, localhost) | Check passes, but the sharing is asynchronous |
 | The **S3 gateway's** `If-None-Match: *` did give exactly one winner over two gateways on different filers | 8 of 8 scripted rounds, 11 of 11 earlier manual rounds, and 4 of 4 rounds with a filer killed | The only tested way to get create-if-absent from SeaweedFS. Why it works is UNVERIFIED (likely a shared lock among filers). **Needs Yasmina's decision**: use the S3 gateway, test the filer gRPC exclusive-create (UNVERIFIED), or reconsider |
 
+
+## P6: Failure metrics (Step C)
+
+How the report's failure numbers are measured. The scripts that compute them are in `crates/loadgen/src/bin/` (`reliability.rs`, `failover.rs`). Updated after GM-Sniper's review of PR #34: failover is the caught requests' latency, recovery uses P3's READY row. **Review: P5 (fault logs), P3 (readiness event), P1 (outcome column). The plan asks P6 to confirm these definitions, so they are open to change until reviewed.**
+
+### Where the times come from
+
+| Time | Source | Clock |
+|---|---|---|
+| Failure starts (`t_fail`) | `MUTE_START` in `logs/faults-node<N>.csv`, or `CUT_START` in `logs/faults-runner.csv` | Muted node, or the runner |
+| Failure ends, node is back (`t_back`) | `MUTE_END` or `CUT_END` in the same files | Same |
+| Peer suspected | First `PEER_DOWN` for node N in a live node's fault log | Live node |
+| Request sent | `timestamp` in the request CSV (unix ms) | Client |
+| Request done | `timestamp + latency_us` | Client |
+| Node ready again (`t_ready`) | First `READY` row of node N in its fault log after `t_fail` (P3's rejoin rule, `rejoin.rs`; fault_id `startup` after a restart) | Node N |
+
+### Definitions
+
+| Metric | Definition | Worked example (plan) |
+|---|---|---|
+| **Failover time** | The latency (sent to plan) of the requests the failure **caught**, per failure: requests that (a) got a plan (outcome `committed` or `duplicate`), (b) from a node other than the failed one, (c) needed a retry (`attempts > 1`), and (d) ran while the node was down ([sent, done] overlaps [`t_fail`, `t_back`]). Reported as the median, with the count and the max. No such request = "not measured", never 0 | Request sent at the mute (10.0 s), first attempt lost, retry answered by a live node at 12.6 s: **2.6 s** (the plan's example, kept for the tests). P1's final values (`docs/p1-design-log.md`, section 13) have no 0.5 s backoff, so a winner that dies after taking a request gives about **2.1 s** (2.0 s deadline + ~25 ms pause + ~50 ms plan); GM-Sniper measured about 2 s on the retried requests |
+| **Reroute time** (supporting number) | `t_answer - t_fail`: the first plan that could only have come without the failed node (sent at or after `t_fail`, or retried), from a live node, before `t_back` | A request sent just after the mute: the muted node does not bid, a live node wins after one 300 ms bid timeout. The local dry runs measured 0.3 to 0.6 s |
+| **Detection time** (supporting number) | First `PEER_DOWN` for the failed node on any live node, minus `t_fail` | 11.5 - 10.0 = **1.5 s** (3 missed 500 ms heartbeats) |
+| **Recovery time** | `t_ready - t_back`, per failure that ends inside the run. `t_ready` is the returning node's first `READY` row after `t_fail`: P3's rejoin rule passed (old decisions dropped, shared state reloaded, a peer heard). A cut node is restarted by the runner and writes `READY` with fault_id `startup`. If `READY` comes before `CUT_END` (the runner logs `CUT_END` only once the node accepts connections), recovery is 0, never negative | Back at 18.4 s (10.0 s + 8.4 s), ready at 20.1 s: 20.1 - 18.4 = **1.7 s** |
+| **Reliability %** | Requests that ended with a plan (outcome `committed` or `duplicate`) ÷ all requests sent, × 100. Given per run and per scenario (no failure, node down, network cut) | 9,962 of 10,000 = **99.62%** |
+| **Lost requests** | Requests that ended with no plan (outcome `failed`): all requests minus those with a plan. Each one is listed with its request_id, send time, attempts and last status, and is put in one of the three failure cases (below) | 10,000 - 9,962 = **38**, each explained |
+
+### Which failure case a lost request was
+
+The three cases are the ones the client handles (`crates/client/src/lib.rs`). The CSV does not say which node held a request, so the case comes from when the request ran ([sent, done]) and how it failed:
+
+| The request ran during | Last status | Case |
+|---|---|---|
+| A network cut (`CUT_START`..`CUT_END`) | any | Network cut |
+| A mute (`MUTE_START`..`MUTE_END`) | any | Winner died after taking the request |
+| No failure window | `timeout` | Slow request |
+| Anything else | | **Unexplained**: checked by hand in the node logs, and reported as such |
+
+### Decisions
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Failover is the latency of the requests the failure caught (retried, answered by a live node), median per failure | The first answer that could not have used the failed node (the first version); the moment the node is suspected | GM-Sniper's review of PR #34: the plan's 2.6 s example is a request caught by the failure, which needs a retry. The first answer without the failed node is usually a NEW request, which only waits one 300 ms bid timeout, so it measured 0.3 to 0.6 s and hid the 2 s a caught request really waits. That number stays as "reroute", a second line. The median, not the first or the worst, because many requests are caught at once under load |
+| A failure with no qualifying answer before `t_back` is "not measured", never 0 or the full mute length | Report 0; report the mute length | Either number would be made up. With multicast, live nodes may answer quickly, so a short failover is a real result, but a missing one must look missing |
+| Recovery ends at P3's `READY` row | The first election the node wins after `t_back` (the first version's stand-in); `PEER_UP` | The stand-in measured 0.00 s: a returning node has a load score of 0, so it won its first election at once, before it was really ready. `PEER_UP` only shows the node is alive, not that it reloaded the state. `READY` is written exactly when the rejoin rule passes |
+| `duplicate` counts as reliable | Count only `committed` | `duplicate` means a retry found the plan already saved and the client got that plan: the request was answered exactly once. Not counting it would punish the retry that makes the system fault tolerant. "Committed" in the plan's example is read as "ended with a plan" |
+| A plan with no resource (`assigned = false`, all resources taken) counts as reliable, and is reported separately | Count it as lost | The system answered correctly; it just had nothing free. Lost means no answer at all. Mixing the two would hide failures behind resource shortage, or the reverse |
+| One CSV row per request_id; a retry is not a second request | Count every attempt | Reliability is about what the user of the system sees: did their request get a plan. `attempts` keeps the retry count for the failover numbers |
+| A request belongs to a failure if its [sent, done] overlaps the failure window; a cut wins over a mute | Use the send time only | Already the rule in `reliability.rs` (Step B). A request sent just before a mute and stuck in it is exactly the one the mute hurt |
+| Until P1's `outcome` column is merged, the scripts derive it: `status = ok` is a plan, anything else is `failed` | Wait for the column | The plan allows it (task 9: "P6 derives it from status and assigned"). The derived version cannot see `duplicate`, so it is counted as `committed`, which gives the same reliability % |
+
+### Clocks
+
+On one laptop every time comes from the same clock. On the lab machines they do not: failover mixes the node's clock (`t_fail`) with the client's (`done`), and recovery mixes two nodes' clocks. Every failover and recovery time is then off by up to the clock difference between those machines. P1's lab notes list clock sync as a to-do; the lab runs record each machine's offset (for example `w32tm /stripchart` on Windows) so the report can give it as the error bar. Latency and reliability % use one clock each and are not affected.
+
 ## P5: Shared-state backend (Step C, Oct 31)
 
 Code: `crates/node/src/s3_store.rs` (backend), `gated_store.rs` (mute cuts state access), `mute.rs`, `[shared_state]` in `crates/common/src/config.rs`. Change notes: `docs/p5-changes.md`, Oct 31. Answers P4's open question 5 above.

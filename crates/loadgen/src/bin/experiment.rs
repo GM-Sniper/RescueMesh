@@ -11,6 +11,9 @@
 //!   <run_id>.csv, <run_id>.meta.txt  the load generator's output
 //!   summary.txt                      the stats script's output
 //!   elections-summary.txt            election metrics and win share (from the nodes' election logs)
+//!   reliability.txt                  success %, failed, retried, lost per scenario (no failure, node down, cut)
+//!   failover.txt                     per failure: detection, failover, recovery time, latency before/during/after
+//!   logs/faults-runner.csv           network cuts the runner caused (`[[faults]] kind = "cut"`)
 //!   node<N>.log                      each node's console output
 //!   logs/faults-node<N>.csv          each node's fault log (P5)
 //!   logs/node_metrics-node<N>.csv    each node's load, once per second (P6)
@@ -22,8 +25,8 @@
 
 use std::collections::BTreeMap; // node ID -> planner iterations
 use std::env::consts::EXE_SUFFIX; // ".exe" on Windows, "" on Linux and macOS
-use std::fs::{self, File};
-use std::io::BufRead;
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufRead, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio}; // start the node, loadgen and stats programs
@@ -31,7 +34,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, bail};
 use clap::Parser;
-use common::config::ClusterConfig; // P1's config loader: the same node list the nodes and clients use
+use common::config::{ClusterConfig, StateBackend}; // P1's config loader: the same node list the nodes and clients use
 use serde::Deserialize;
 
 /// Command line: just the experiment file.
@@ -64,21 +67,80 @@ struct Experiment {
     clients: Option<u64>,  // fixed mode only (loadgen's default if missing)
     requests: Option<u64>, // fixed mode only
     rate: Option<f64>,     // fixed mode only
+    #[serde(default)]
+    faults: Vec<FaultStep>, // reliability scenarios: failures caused on a timer while the load runs
+}
+
+/// One failure to cause during the run, counted from when the load starts. In the file:
+///   [[faults]]
+///   kind = "mute"     # "mute" = one node down (P5's injector: it goes silent, then wakes itself)
+///   node = 2          # "cut"  = network cut (the runner stops the node's program, then restarts it)
+///   at_secs = 10
+///   duration_secs = 8
+#[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+struct FaultStep {
+    kind: FaultKind,
+    node: u32,
+    at_secs: f64,
+    duration_secs: f64,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq)]
+#[serde(rename_all = "lowercase")]
+enum FaultKind {
+    Mute, // the node hangs: calls to it get no answer until the deadline
+    Cut,  // the node is gone: calls to it fail at once (connection refused)
 }
 
 fn default_seed() -> u64 { 1 }
 fn default_stage_secs() -> f64 { 30.0 }
 
-/// The nodes this runner started. Dropping it stops them, so they never outlive the experiment,
-/// even when a step fails half-way.
-struct Nodes(Vec<Child>);
+/// The nodes this runner started, with their IDs. Dropping it stops them, so they never outlive
+/// the experiment, even when a step fails half-way.
+struct Nodes(Vec<(u32, Child)>);
 
 impl Drop for Nodes {
     fn drop(&mut self) {
-        for child in &mut self.0 {
+        for (_, child) in &mut self.0 {
             let _ = child.kill(); // already exited is fine
             let _ = child.wait(); // reap it, so no zombie process is left behind
         }
+    }
+}
+
+/// Everything needed to start one node, so a "cut" node can be started again the same way.
+struct NodeLauncher<'a> {
+    node_bin: PathBuf,
+    cluster: &'a ClusterConfig,
+    cluster_path: &'a Path,
+    run_id: &'a str,
+    out: &'a Path,
+    planner_iterations: &'a BTreeMap<String, usize>,
+}
+
+impl NodeLauncher<'_> {
+    /// Starts node `id` (its console output is appended to node<N>.log) without waiting for it.
+    fn spawn(&self, id: u32) -> anyhow::Result<Child> {
+        let log = OpenOptions::new().create(true).append(true).open(self.out.join(format!("node{id}.log")))?;
+        let mut cmd = Command::new(&self.node_bin);
+        cmd.args(["--id", &id.to_string(), "--run-id", self.run_id]) // run_id joins its logs with the CSV
+            .arg("--config").arg(self.cluster_path); // its [shared_state] says where the shared state is
+        if let Some(n) = self.planner_iterations.get(&id.to_string()) {
+            cmd.args(["--planner-iterations", &n.to_string()]); // P2's knob: a slower node, for load-balancing tests
+        }
+        cmd.current_dir(self.out) // the node writes logs/... relative to here, so each run gets its own copies
+            .stdout(Stdio::from(log.try_clone()?))
+            .stderr(Stdio::from(log))
+            .spawn()
+            .with_context(|| format!("could not start node {id}"))
+    }
+
+    /// Waits until node `id` accepts connections.
+    fn wait_ready(&self, id: u32, child: &mut Child) -> anyhow::Result<()> {
+        let addr: SocketAddr = self.cluster.node(id).context("unknown node")?.addr.parse()?;
+        wait_until_listening(child, addr, Duration::from_secs(15))
+            .with_context(|| format!("node {id} did not start; see node{id}.log in {}", self.out.display()))
     }
 }
 
@@ -105,6 +167,18 @@ fn main() -> anyhow::Result<()> {
     if !exp.planner_iterations.is_empty() && !exp.start_nodes {
         bail!("planner_iterations only works with start_nodes = true; in the lab, pass --planner-iterations to that node by hand");
     }
+    for f in &exp.faults {
+        cluster.node(f.node).with_context(|| format!("a fault names node {}, which is not in {}", f.node, cluster_path.display()))?;
+        if f.at_secs < 0.0 || f.duration_secs <= 0.0 {
+            bail!("fault on node {}: at_secs must be 0 or more and duration_secs more than 0", f.node);
+        }
+        if f.kind == FaultKind::Mute && f.duration_secs > 20.0 {
+            bail!("fault on node {}: a mute lasts at most 20 s (the spec's limit, enforced by the injector)", f.node);
+        }
+        if f.kind == FaultKind::Cut && !exp.start_nodes {
+            bail!("a \"cut\" stops and restarts the node's program, so it needs start_nodes = true");
+        }
+    }
 
     // One folder per run: results/<name>-<unix seconds>/
     let run_id = format!("{}-{}", exp.name, unix_secs());
@@ -115,17 +189,46 @@ fn main() -> anyhow::Result<()> {
     // The other programs are built next to this one (target/release or target/debug).
     let bin_dir = std::env::current_exe()?.parent().context("no folder for this program")?.to_path_buf();
     let bin = |name: &str| bin_dir.join(format!("{name}{EXE_SUFFIX}"));
-    for name in ["node", "loadgen", "stats", "elections"] {
+    for name in ["node", "loadgen", "stats", "elections", "reliability", "failover", "inject"] {
         if !bin(name).exists() {
             bail!("{} not found: run `cargo build --release` first (it builds every program)", bin(name).display());
         }
     }
 
+    // Warm-up: run each program once with --help before the real run. Some antivirus programs (AVG
+    // on P6's laptop) hold a newly built program and first run a sandboxed COPY of it, with the same
+    // arguments, for ~25 s. That copy really sent requests to the nodes: 668 to 2,262 "foreign"
+    // requests per run, all the resources taken before our load started. With this warm-up the
+    // antivirus checks a harmless --help run instead, and the real run starts at once.
+    for name in ["node", "loadgen", "inject"] {
+        let _ = Command::new(bin(name)).arg("--help").stdout(Stdio::null()).stderr(Stdio::null()).status(); // result unused: only the first launch matters
+    }
+
     println!("experiment {run_id}: results go to {}", out.display());
 
     // 1. Nodes: start them here (local) or have the user start them (lab).
-    let nodes = if exp.start_nodes {
-        Some(start_nodes(&bin("node"), &cluster, &cluster_path, &run_id, &out, &exp.planner_iterations)?)
+    // Shared state: [shared_state] in the cluster file (P5). With SeaweedFS ("s3") a node fills an
+    // EMPTY bucket with the 10 starting resources, so a fresh run = delete the bucket before any node
+    // starts (P5's rule: never a new bucket name per run, SeaweedFS runs out of volumes).
+    let state = &cluster.shared_state;
+    let s3 = state.backend == StateBackend::S3;
+    if s3 && exp.start_nodes {
+        reset_bucket(&state.endpoint, &state.bucket)?; // the nodes start right after, on an empty bucket
+        println!("shared state: SeaweedFS bucket {}/{} reset", state.endpoint, state.bucket);
+    } else if !s3 {
+        println!("note: shared_state.backend = \"memory\" in {}: each node has its OWN resources (nothing shared)", cluster_path.display());
+    }
+
+    let launcher = NodeLauncher {
+        node_bin: bin("node"),
+        cluster: &cluster,
+        cluster_path: &cluster_path,
+        run_id: &run_id,
+        out: &out,
+        planner_iterations: &exp.planner_iterations,
+    };
+    let mut nodes = if exp.start_nodes {
+        Some(start_nodes(&launcher)?)
     } else {
         wait_for_lab_nodes(&cluster, &cluster_path, &run_id)?;
         None
@@ -147,9 +250,21 @@ fn main() -> anyhow::Result<()> {
         let stages = exp.stages.iter().map(|c| c.to_string()).collect::<Vec<_>>().join(",");
         load.args(["--stages", &stages, "--stage-secs", &exp.stage_secs.to_string()]);
     }
-    let load_status = load.status().context("could not start loadgen")?; // its progress shows in this terminal
+    let mut load_child = load.spawn().context("could not start loadgen")?; // its progress shows in this terminal
+    let t0 = Instant::now(); // fault times count from here
 
-    drop(nodes); // 3. Stop the nodes we started (no-op in lab mode), before anything else can fail
+    // 2b. Faults (reliability scenarios), on schedule while the load runs.
+    let fault_result = run_faults(&exp.faults, t0, &launcher, &mut nodes, &bin("inject"));
+    let load_status = load_child.wait()?;
+    fault_result?;
+
+    // 3. Stop the nodes we started (no-op in lab mode). First wait a moment: a node writes each
+    // election row one bid timeout (300 ms) after the decision, so stopping at once would lose
+    // the last elections of the run (Farida's review of PR #24).
+    if nodes.is_some() {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+    drop(nodes);
     if !load_status.success() {
         bail!("loadgen failed ({load_status}); see the messages above and the node<N>.log files in {}", out.display());
     }
@@ -175,6 +290,42 @@ fn main() -> anyhow::Result<()> {
         }
         fs::write(out.join("elections-summary.txt"), &report.stdout)?;
         print!("{}", String::from_utf8_lossy(&report.stdout));
+    }
+
+    // 4b2. Reliability per scenario, from the request CSV and every fault log in logs/ (local mode;
+    //      in lab mode the nodes' fault logs are on the other machines, so only the CSV is used).
+    let mut fault_logs: Vec<PathBuf> = Vec::new();
+    if let Ok(entries) = fs::read_dir(out.join("logs")) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with("faults-") && name.ends_with(".csv") {
+                fault_logs.push(entry.path()); // faults-node<N>.csv (P5) and faults-runner.csv (cuts)
+            }
+        }
+    }
+    fault_logs.sort();
+    let mut reliability_cmd = Command::new(bin("reliability"));
+    reliability_cmd.arg(&csv);
+    if !fault_logs.is_empty() {
+        reliability_cmd.arg("--faults").args(&fault_logs);
+    }
+    let reliability = reliability_cmd.output().context("could not start reliability")?;
+    if !reliability.status.success() {
+        bail!("reliability failed: {}", String::from_utf8_lossy(&reliability.stderr));
+    }
+    fs::write(out.join("reliability.txt"), &reliability.stdout)?;
+    print!("{}", String::from_utf8_lossy(&reliability.stdout));
+
+    // 4b3. Failover, recovery and latency around each failure (Step C), only when there were failures.
+    if !fault_logs.is_empty() {
+        let mut failover_cmd = Command::new(bin("failover"));
+        failover_cmd.arg(&csv).arg("--faults").args(&fault_logs); // when each failure started and ended, and READY rows
+        let failover = failover_cmd.output().context("could not start failover")?;
+        if !failover.status.success() {
+            bail!("failover failed: {}", String::from_utf8_lossy(&failover.stderr));
+        }
+        fs::write(out.join("failover.txt"), &failover.stdout)?;
+        print!("{}", String::from_utf8_lossy(&failover.stdout));
     }
 
     // 4c. Safeguards: say so when this run's results can't be trusted, and keep the warnings in the folder.
@@ -204,10 +355,10 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Starts every node of the cluster file on this machine and waits until all of them accept connections.
-fn start_nodes(node_bin: &Path, cluster: &ClusterConfig, cluster_path: &Path, run_id: &str, out: &Path, planner_iterations: &BTreeMap<String, usize>) -> anyhow::Result<Nodes> {
+fn start_nodes(launcher: &NodeLauncher) -> anyhow::Result<Nodes> {
     // A port that already answers belongs to some other program (an old node, the mock server):
     // the experiment would silently measure that instead of the nodes it starts.
-    for node in &cluster.nodes {
+    for node in &launcher.cluster.nodes {
         let addr: SocketAddr = node.addr.parse()?;
         if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
             bail!("something is already listening on {addr} (node {}): stop it first", node.id);
@@ -215,31 +366,97 @@ fn start_nodes(node_bin: &Path, cluster: &ClusterConfig, cluster_path: &Path, ru
     }
 
     let mut nodes = Nodes(Vec::new());
-    for node in &cluster.nodes {
-        let log = File::create(out.join(format!("node{}.log", node.id)))?; // the node's console output
-        let mut cmd = Command::new(node_bin);
-        cmd.args(["--id", &node.id.to_string(), "--run-id", run_id]) // run_id joins its logs with the CSV
-            .arg("--config").arg(cluster_path);
-        if let Some(n) = planner_iterations.get(&node.id.to_string()) {
-            cmd.args(["--planner-iterations", &n.to_string()]); // P2's knob: a slower node, for load-balancing tests
+    for node in &launcher.cluster.nodes {
+        let _ = fs::remove_file(launcher.out.join(format!("node{}.log", node.id))); // a fresh log per run
+        if let Some(n) = launcher.planner_iterations.get(&node.id.to_string()) {
             println!("node {} runs with --planner-iterations {n}", node.id);
         }
-        let child = cmd
-            .current_dir(out) // the node writes logs/... relative to here, so each run gets its own copies
-            .stdout(Stdio::from(log.try_clone()?))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .with_context(|| format!("could not start node {}", node.id))?;
-        nodes.0.push(child); // pushed right away: if a later step fails, Drop still stops this node
+        let child = launcher.spawn(node.id)?;
+        nodes.0.push((node.id, child)); // pushed right away: if a later step fails, Drop still stops this node
     }
-
-    for (child, node) in nodes.0.iter_mut().zip(&cluster.nodes) {
-        let addr: SocketAddr = node.addr.parse()?;
-        wait_until_listening(child, addr, Duration::from_secs(15))
-            .with_context(|| format!("node {} did not start; see node{}.log in {}", node.id, node.id, out.display()))?;
+    for (id, child) in &mut nodes.0 {
+        launcher.wait_ready(*id, child)?;
     }
-    println!("started {} nodes", cluster.nodes.len());
+    println!("started {} nodes", launcher.cluster.nodes.len());
     Ok(nodes)
+}
+
+/// Causes the experiment's faults on schedule, counted from `t0` (when the load started).
+/// - mute: runs P5's injector; the node logs MUTE_START / MUTE_END itself (logs/faults-node<N>.csv).
+/// - cut: stops the node's program, then starts it again; the runner logs CUT_START / CUT_END to
+///   logs/faults-runner.csv, in the same format as P5's fault log, so the reliability script reads both.
+fn run_faults(faults: &[FaultStep], t0: Instant, launcher: &NodeLauncher, nodes: &mut Option<Nodes>, inject_bin: &Path) -> anyhow::Result<()> {
+    if faults.is_empty() {
+        return Ok(());
+    }
+    enum Action { Mute, CutStart, CutEnd }
+    let mut timeline: Vec<(f64, Action, usize, &FaultStep)> = Vec::new(); // usize: the fault's number, so start and end share one fault_id
+    for (i, f) in faults.iter().enumerate() {
+        match f.kind {
+            FaultKind::Mute => timeline.push((f.at_secs, Action::Mute, i, f)),
+            FaultKind::Cut => {
+                timeline.push((f.at_secs, Action::CutStart, i, f));
+                timeline.push((f.at_secs + f.duration_secs, Action::CutEnd, i, f));
+            }
+        }
+    }
+    timeline.sort_by(|a, b| a.0.total_cmp(&b.0)); // run them in time order
+
+    let log_path = launcher.out.join("logs").join("faults-runner.csv");
+    fs::create_dir_all(log_path.parent().expect("logs folder"))?;
+    let mut log = File::create(&log_path)?;
+    writeln!(log, "run_id,node_id,event,fault_id,peer_id,duration_ms,wall_ts_us")?; // P5's fault-log columns
+
+    for (at, action, n, f) in timeline {
+        let due = t0 + Duration::from_secs_f64(at);
+        std::thread::sleep(due.saturating_duration_since(Instant::now())); // wait until this step is due
+        let duration_ms = (f.duration_secs * 1000.0) as u64;
+        match action {
+            Action::Mute => {
+                println!("fault: muting node {} for {} s", f.node, f.duration_secs);
+                // --wait 5s: a busy node can take more than the injector's default 2 s to ack.
+                let status = Command::new(inject_bin)
+                    .args(["--node", &f.node.to_string(), "--duration", &format!("{duration_ms}ms"), "--wait", "5s"])
+                    .arg("--config").arg(launcher.cluster_path)
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .context("could not start the injector")?;
+                if !status.success() {
+                    // No ack is not proof of no mute: the node logs MUTE_START itself, and the
+                    // reliability script uses that log, not this message.
+                    println!("note: the injector got no ack from node {} ({status}); check MUTE_START in logs/faults-node{}.csv", f.node, f.node);
+                }
+            }
+            Action::CutStart => {
+                println!("fault: cutting node {} off for {} s", f.node, f.duration_secs);
+                let child = node_child(nodes, f.node)?;
+                let _ = child.kill(); // its connections close at once: callers get "connection refused"
+                let _ = child.wait();
+                writeln!(log, "{},{},CUT_START,cut-{n},,{duration_ms},{}", launcher.run_id, f.node, wall_ts_us())?;
+            }
+            Action::CutEnd => {
+                let mut child = launcher.spawn(f.node)?; // the same node again, with the same shared state
+                launcher.wait_ready(f.node, &mut child)?;
+                *node_child(nodes, f.node)? = child;
+                writeln!(log, "{},{},CUT_END,cut-{n},,,{}", launcher.run_id, f.node, wall_ts_us())?;
+                println!("fault: node {} is back", f.node);
+            }
+        }
+        log.flush()?;
+    }
+    Ok(())
+}
+
+/// The running program of node `id`.
+fn node_child(nodes: &mut Option<Nodes>, id: u32) -> anyhow::Result<&mut Child> {
+    let nodes = nodes.as_mut().context("a cut needs start_nodes = true")?;
+    nodes.0.iter_mut().find(|(n, _)| *n == id).map(|(_, c)| c).with_context(|| format!("node {id} was not started"))
+}
+
+/// Wall-clock microseconds since 1970, like P5's fault log, so the files can be joined by time.
+fn wall_ts_us() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_micros()).unwrap_or(0)
 }
 
 /// Polls `addr` until it accepts a connection, the node exits, or `limit` passes.
@@ -259,8 +476,39 @@ fn wait_until_listening(child: &mut Child, addr: SocketAddr, limit: Duration) ->
     }
 }
 
+/// Deletes the SeaweedFS bucket, so the nodes started next fill a fresh one with the starting
+/// resources. Same as P5's `curl -X DELETE <endpoint>/<bucket>`, sent by hand: one HTTP request
+/// does not need an HTTP library.
+fn reset_bucket(endpoint: &str, bucket: &str) -> anyhow::Result<()> {
+    let host = endpoint.trim_start_matches("http://").trim_end_matches('/'); // e.g. 127.0.0.1:8333 (the config check requires http://)
+    let not_running = || format!("SeaweedFS is not answering at {endpoint}: start it first (see docs/lab-bringup.md), or set backend = \"memory\"");
+    let addr = std::net::ToSocketAddrs::to_socket_addrs(host)?.next().with_context(not_running)?;
+    let mut conn = TcpStream::connect_timeout(&addr, Duration::from_secs(2)).with_context(not_running)?;
+    conn.set_read_timeout(Some(Duration::from_secs(10)))?; // deleting a full bucket takes a moment
+    write!(conn, "DELETE /{bucket} HTTP/1.1\r\nHost: {host}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+    let mut status_line = String::new();
+    std::io::BufReader::new(conn).read_line(&mut status_line)?; // e.g. "HTTP/1.1 204 No Content"
+    let status: u16 = status_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if !bucket_is_gone(status) {
+        bail!("could not reset the shared state: DELETE {endpoint}/{bucket} answered {:?}", status_line.trim());
+    }
+    Ok(())
+}
+
+/// After a DELETE: 2xx = deleted, 404 = there was no bucket yet. Both mean "empty now".
+fn bucket_is_gone(status: u16) -> bool {
+    (200..300).contains(&status) || status == 404
+}
+
 /// Lab mode: print how to start each node with this run's --run-id, then wait for Enter.
 fn wait_for_lab_nodes(cluster: &ClusterConfig, cluster_path: &Path, run_id: &str) -> anyhow::Result<()> {
+    let state = &cluster.shared_state;
+    if state.backend == StateBackend::S3 {
+        // The bucket must be empty BEFORE the nodes start (they fill it with the starting resources).
+        // From a node PC: its endpoint is 127.0.0.1, which is that PC's own gateway (docs/lab-bringup.md).
+        println!("lab mode: first reset the shared state, from any one node PC:");
+        println!("  curl -X DELETE {}/{}", state.endpoint.trim_end_matches('/'), state.bucket);
+    }
     println!("lab mode: start each node on its own machine with");
     for node in &cluster.nodes {
         println!("  node {} ({}): cargo run --release -p node -- --id {} --config {} --run-id {run_id}", node.id, node.addr, node.id, cluster_path.display());
@@ -379,5 +627,19 @@ mod tests {
     fn a_run_with_only_failures_is_not_called_unassigned() {
         let run = csv(&[("a", "timeout", ""), ("b", "error", "")]);
         assert!(check_run(&run, &[]).is_empty()); // nothing succeeded, so "no resource" says nothing
+    }
+
+    #[test]
+    fn a_deleted_or_missing_bucket_counts_as_reset() {
+        assert!(bucket_is_gone(204)); // deleted
+        assert!(bucket_is_gone(404)); // first run: there was no bucket yet
+        assert!(!bucket_is_gone(500)); // the gateway failed: the old resources may still be there
+        assert!(!bucket_is_gone(0)); // no answer we could read
+    }
+
+    #[test]
+    fn reset_says_seaweedfs_is_not_running_when_nothing_listens() {
+        let err = reset_bucket("http://127.0.0.1:1", "rescuemesh").unwrap_err(); // port 1: nothing listens there
+        assert!(format!("{err:#}").contains("SeaweedFS is not answering"), "{err:#}");
     }
 }

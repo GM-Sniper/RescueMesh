@@ -582,6 +582,109 @@ Tested: 4 unit tests (clean run, foreign requests counted once, nothing assigned
 
 ---
 
+## 16. Step B, Fri Oct 30: one set of resources for the whole system (TEMPORARY, until P4's DFS)
+
+**Problem:** each node used its own private `InMemoryStore` ([state.rs](../crates/node/src/state.rs), `NodeState::new`), so 3 nodes meant 3 copies of the 10 starting resources. With multicast all 3 nodes win elections, so runs showed **30** resources assigned, and the same resource could go to up to 3 incidents. P1 and P4 confirmed the system must have **10 in total**, also with multicast.
+
+**Fix:** a temporary shared store, `crates/node/src/file_store.rs`, that implements P4's `SharedState` interface on **one folder all nodes use**. When the DFS-backed store exists it replaces this file; the handler, election and load generator don't change.
+
+```text
+<shared-state-dir>/
+  state.toml                  resources, assignments, incidents that got a resource   (small: at most 10 each)
+  requests/<request_id>.toml  one per committed request: the create-if-absent record
+  state.lock                  file lock: one node at a time changes the state
+```
+
+- `commit` follows P4's InMemoryStore rules inside the lock: request already committed → `AlreadyCommitted`; a planned resource not free → `ResourceTaken`; otherwise mark the resources, then write the request record.
+- Files are written to a temporary file and renamed, so nobody reads a half-written file.
+- Reading or writing problems (e.g. a network share dropping) come back as `StateUnavailable`, as the interface expects.
+
+| Change | File | Owner |
+|---|---|---|
+| New shared-folder store + 5 tests | `crates/node/src/file_store.rs` | P6 (new) |
+| `--shared-state-dir <dir>` flag; uses the store when given | `crates/node/src/main.rs` | P1 (marked in capitals) |
+| `with_store` usable outside tests | `crates/node/src/state.rs` | P1/P4 (marked) |
+| `default_resources()` moved out, same constants | `crates/node/src/store.rs` | P4 (marked) |
+| `serde`, `toml` dependencies | `crates/node/Cargo.toml` | (already in the workspace) |
+| Runner: shared state on by default; fresh folder per run (local), `shared_state_dir` (lab) | `crates/loadgen/src/bin/experiment.rs` | P6 |
+
+Without `--shared-state-dir`, a node behaves exactly as before (its own private copy).
+
+**Tests:** two nodes see each other's assignments; a request committed on one node is found on another; **3 nodes racing 30 commits for 10 resources give out exactly 10, none twice**; an empty plan is stored and takes nothing; a restarted node keeps the shared state.
+
+**Result** (3 local nodes, same short ramp, release):
+
+```text
+shared state ON:   960 requests, 10 got a resource, 10 different resources, 0 errors   # one set of 10 ✅
+shared state OFF: 1159 requests, 30 got a resource                                    # 3 private copies ❌
+```
+
+All 3 nodes still win elections with the shared store (325 / 325 / 310). Throughput was a bit lower in this run (79 vs 96 ok/s), as expected from the file lock.
+
+**Running nodes by hand:** give all 3 nodes the same empty folder, e.g. `cargo run --release -p node -- --id 1 --shared-state-dir shared-state` (and the same for 2 and 3). Empty it before each run, or the resources stay taken from the previous run.
+
+---
+
+## 17. Step B, Fri Oct 30: reliability per scenario
+
+Plan task: "success percentage, failed count and lost-request count per scenario (no failure, one node down, network cut), from the request CSV status column and the fault CSV". Unblocked by P1's client failure handling (PR #23) and P5's fault log.
+
+**Definitions** (the plan asked P6 to confirm what counts as lost):
+
+| Term | Meaning | From the CSV |
+|---|---|---|
+| success % | requests that got a plan, out of all requests | `status = ok` |
+| failed | at least one attempt got no plan | `attempts > 1` or `status != ok` |
+| retried | got a plan, but only after a retry (failover worked) | `status = ok` and `attempts > 1` |
+| **lost** | **no plan after all attempts** | `status = timeout` or `error` |
+
+**Scenarios.** Each request gets the scenario that was going on while it ran (from sending until its reply), taken from the fault logs:
+- **one node down** = overlaps a `MUTE_START`..`MUTE_END` window in P5's `logs/faults-node<N>.csv` (the node hangs and answers nothing);
+- **network cut** = overlaps a `CUT_START`..`CUT_END` window in `logs/faults-runner.csv` (the node's program is stopped, so calls fail at once, then restarted with the same shared state);
+- **no failure** = neither. `PEER_DOWN`/`PEER_UP` rows are ignored: they say when others *noticed*, not when the fault was.
+
+**New program** `crates/loadgen/src/bin/reliability.rs`:
+
+```bash
+cargo run --release -p loadgen --bin reliability -- results/<run>/<run>.csv --faults results/<run>/logs/faults-node1.csv results/<run>/logs/faults-runner.csv
+```
+
+**Experiment runner:** a new `[[faults]]` list causes failures on a timer while the load runs, and every run now saves `reliability.txt`.
+
+```toml
+[[faults]]
+kind = "mute"        # one node down: P5's injector (inject --node 2 --duration 10000ms --wait 5s)
+node = 2
+at_secs = 10         # seconds after the load starts
+duration_secs = 10   # a mute lasts at most 20 s
+
+[[faults]]
+kind = "cut"         # network cut: the runner stops node 3's program, then starts it again (local mode only)
+node = 3
+at_secs = 30
+duration_secs = 8
+```
+
+Also in the runner: a 1 s wait before stopping the nodes, so the last election rows are written (Farida's review of PR #24).
+
+**Result** (`experiments/reliability-local.toml`, 3 local nodes, 4 clients for 50 s, shared state):
+
+```text
+scenario        requests        ok   success  failed  retried   lost        p50        p95
+no failure          2362      2362   100.00%       0        0      0   50.05 ms   80.34 ms
+one node down        819       819   100.00%       2        2      0   41.63 ms   63.89 ms
+network cut          650       650   100.00%       3        3      0   40.96 ms   71.98 ms
+all                 3831      3831   100.00%       5        5      0   46.42 ms   77.60 ms
+```
+
+**No request was lost** in any scenario: when a node was muted or cut off, the other two took over, and the few requests caught mid-failure (5) got their plan on a retry. Win share per 10 s window shows the failover: node 2 fell to 0.1% while muted (10-20 s) and node 3 to 7.7% while cut off (30-40 s).
+
+Tests (`cargo test -p loadgen`): requests split by the fault they overlap (a request sent just before a fault but still running counts as affected); a fault with no end lasts its planned duration; `PEER_DOWN` rows are not faults; a cut wins over a mute when both overlap; older CSVs without `attempts` still work.
+
+**Observation for P1/P3:** around the faults, the elections log shows a few split decisions (7 elections where nodes named different winners in one run) and loadgen counts ~170 late plans (a second plan for a request that already had one). With the shared store only one plan can be committed per request, so a second plan is the stored one returned again; worth checking with the election design.
+
+---
+
 ## How to run everything
 
 ```bash
@@ -636,3 +739,128 @@ On the lab machines, use `--release` for real measurements and `--config config/
 - Switch from the mock to P1's real node once `Submit` is wired (only `--node` changes).
 - Wed Oct 21: small run first, then the 1000-request run on the 3 real machines, then the stats script on its CSV.
 - Step B: line up loadgen CSVs with `node_metrics` and P5's fault logs for the plots.
+
+## 18. Step C, Sat Oct 31: metric definitions, failover and recovery time, latency around a failure
+
+Plan tasks: "Metric definitions in the design log", "Script for failover time and recovery time from the node fault CSVs and the request CSV", "Latency in three windows (before, during, after a failure) per run".
+
+**Definitions:** new section "P6: Failure metrics (Step C)" at the end of `DESIGN_LOG.md` (failover, detection, recovery, reliability %, lost requests, which failure case a lost request was, clocks). Waiting for review by P5, P3 and P1.
+
+**New program** `crates/loadgen/src/bin/failover.rs`. For every mute or cut in the fault logs it prints:
+
+| Line | Meaning | From |
+|---|---|---|
+| detected | first time a live node suspected the failed one | `PEER_DOWN` in the live nodes' fault logs |
+| answered (failover) | first plan from a live node that could only have come without the failed node: sent after the failure started, or caught by it and saved by a retry | request CSV (`timestamp + latency_us`, `executor_node`, `attempts`) |
+| ready (recovery) | **STAND-IN** until P3 logs a readiness event: the first election the returning node wins after it is back | `MUTE_END`/`CUT_END`, then P3's `elections-node<N>.csv` |
+| latency before / during / after | p50, p95, max and lost requests; before and after are as long as the failure, and stop at the neighbouring failures | request CSV |
+
+```bash
+cargo run --release -p loadgen --bin failover -- results/<run>/<run>.csv --faults results/<run>/logs/faults-node1.csv results/<run>/logs/faults-node2.csv results/<run>/logs/faults-node3.csv results/<run>/logs/faults-runner.csv --elections results/<run>/logs/elections-node1.csv results/<run>/logs/elections-node2.csv results/<run>/logs/elections-node3.csv
+```
+
+**Experiment runner:** every run with fault logs now also saves `failover.txt`.
+
+**Result** on the Step B reliability run (`results/reliability-local-1793394717`):
+
+```text
+failure 1: node 2 muted, 10.03 s -> 20.03 s (10.00 s)
+  detected     11.30 s   detection   1.27 s
+  answered     10.35 s   failover    0.32 s
+  ready        20.04 s   recovery    0.00 s   STAND-IN
+  latency   requests   lost        p50        p95        max
+  before        2520      0   16.20 ms   18.81 ms   38.83 ms
+  during        2181      0   16.00 ms   18.19 ms 2034.73 ms
+  after         2432      0   16.25 ms   18.59 ms   31.34 ms
+failure 2: node 3 cut, 29.99 s -> 38.57 s (8.58 s)
+  detected     31.49 s   detection   1.49 s
+  answered     30.31 s   failover    0.32 s
+  ready        38.57 s   recovery    0.00 s   STAND-IN
+```
+
+- **Failover 0.32 s, not the plan's 2.6 s:** with multicast every live node gets every request, so the client does not have to wait for its 2 s deadline. The two live nodes wait one bid timeout (300 ms) for the silent node's bid, then elect without it. The 2.6 s case still happens to a few requests (the 2034 ms max "during"): those hit the deadline and were saved by the retry.
+- **Recovery 0.00 s** because no readiness rule exists yet: a returning node bids at once. When P3's rule (reload state, then set ready) is in, this number becomes real.
+- **Latency:** p50 and p95 are the same before, during and after: a failure only hurts the few requests caught in it (the max), and the system is back to normal right after.
+
+Tests (`cargo test -p loadgen --bin failover`): the plan's worked examples give 1.5 s detection, 2.6 s failover and 1.7 s recovery (with a request elected just before the mute and one answered by the muted node, which must not count); no answer while the node is down is "not measured", never 0; a node that never came back has no recovery; a cut is measured like a mute; latency is split into the three windows; the side windows stop at the neighbouring failures.
+
+## 19. Step C, Sat Oct 31: lost requests explained, and the fail-recover dry run
+
+### Task 4: reliability % and lost requests (`crates/loadgen/src/bin/reliability.rs`)
+
+- Reads **P1's `outcome` column** (`committed` / `duplicate` / `failed`) when the CSV has it; otherwise derives it from `status` and says so. `ok` = committed + duplicate.
+- Prints how many of the ok requests were **duplicates** (a retry found the stored plan) and how many got **no resource** (answered, all resources taken: not lost).
+- The column is now called **reliability** (was "success").
+- **Every lost request is listed** with its request_id, send time, attempts, last status and **failure case**: overlaps a cut → network cut; overlaps a mute → winner died after taking the request; no failure and timed out → slow request; anything else → unexplained (check the node logs). Counts per case first; the first 100 are listed.
+- New tests: the plan's worked example as a hand-made CSV (10,000 requests, 38 timeouts) gives **9,962 ok, 99.62%, 38 lost**; the outcome column counts duplicates as ok and failed as lost; each lost request gets the case of the failure it ran in.
+
+### Task 6: dry run (`experiments/fail-recover-local.toml`)
+
+Ramp 1 → 2 → 4 → 8 clients, 15 s each. Node 2 muted at 17 s for 8.4 s (the plan's example length); node 3 cut at 47 s for 8 s, under the heaviest load. One command prints everything (`reliability.txt` and `failover.txt` in the run folder):
+
+```bash
+cargo build --release
+cargo run --release -p loadgen --bin experiment -- experiments/fail-recover-local.toml
+```
+
+Result (`results/fail-recover-local-1793408269`, clean run, no warnings):
+
+```text
+reliability 99.99% (7,062 of 7,063), lost 1: network cut (sent 46.96 s, just before the cut, 3 attempts, timeout)
+failure 1: node 2 muted 17.08 -> 25.48 s   detection 1.40 s   failover 0.34 s   recovery 21.81 s (STAND-IN)
+failure 2: node 3 cut   46.99 -> 55.57 s   detection 1.19 s   failover 0.62 s   recovery 0.00 s (STAND-IN)
+latency p50 / p95:  mute  before 17.9 / 34.8 ms, during 15.7 / 23.8 ms, after 17.5 / 36.3 ms
+                    cut   before 18.5 / 50.3 ms, during 33.8 / 212.7 ms, after 129.6 / 310.3 ms
+```
+
+**Three things the dry run found:**
+
+1. **A restarted node waited ~13 s to start** (an earlier run's cut lasted 21 s instead of 8 s). `FileStore::open` took the shared lock just to check that `state.toml` exists, and under 8 clients the two live nodes held that lock almost all the time. Fixed in `crates/node/src/file_store.rs`: when `state.toml` exists, no lock is taken (it only ever appears whole, by rename). After the fix the cut lasts 8.58 s.
+2. **For P3: node 2 won no election for 21.8 s after its mute ended.** The election rows from 25.4 s on hold only the bids of nodes 1 and 3 (node 2's bid is missing), node 1's score stays at 0.89, and node 3 wins 100% of 20-40 s. The fault logs also show `PEER_DOWN`/`PEER_UP` flapping at ~33 s under the heavier stages. Likely the laptop is overloaded (3 nodes and 8 clients on one machine) and heartbeats and bids arrive late. The recovery stand-in reports it honestly as "not taking work", which is why P3's readiness event is the better measure.
+3. **Foreign traffic** in the first attempt: 2,262 requests (steady ~85/s) reached the nodes in the 26 s before our load started and took all 10 resources. Nothing else was running afterwards, and the nodes listen on `0.0.0.0`, so a client on the same network can reach them. The safeguards flagged it and the run was discarded.
+
+**Not the plan's 2.6 s failover:** with multicast every live node already has the request, so failover is about one bid timeout (0.3-0.6 s). The 2.6 s case still shows as the ~2 s max latency during a failure (requests that hit the client deadline and were saved by a retry).
+
+## 20. Step C, Sat Oct 31: checks after merging PR #26, and the "foreign traffic" explained
+
+**After merging `main` (PR #26 outcome column, PR #28 P3's test fix) into `StepC/p6`:** everything builds, and every test in the workspace passes (node 134, loadgen 29 across the binaries, client 9). The node test that used to fail is fixed by PR #28. The dry run's CSV now ends with P1's `outcome` column, and `reliability.txt` splits ok into committed and duplicate (for example 2,946 committed + 316 duplicate, 0 lost).
+
+**Observation for P1/P3: duplicates on the first attempt.** Almost all duplicates have `attempts = 1`, so no retry caused them: the same request was committed twice (two nodes, or twice on one node) and the client's first plan was the second, "already stored" reply. This matches P1's own finding in `docs/p1-changes.md` (the same request handled twice). The shared store keeps it to one assignment, so it is not a correctness problem, but it is extra work.
+
+**The "foreign traffic" was our own load generator, copied by the antivirus.** Three runs (one on Oct 31 at 02:51, two today) had 668 to 2,262 requests in the node logs that were not in the CSV, all in the ~26 s before our first request, and they took all 10 resources. What showed the cause:
+
+| Check | Result |
+|---|---|
+| Incidents of the foreign requests | the same as ours (seed 1: Supply 5, Fire 5, Fire 8, ...): sent by a load generator with our settings |
+| Processes connected to the node ports, each second | **two `loadgen.exe`**: one from 15:38:16 to 15:38:38, then the runner's own from 15:38:41 |
+| The runner's `loadgen` | started at 15:38:15 but only sent from 15:38:41: held for 26 s |
+| Antivirus | **AVG Antivirus** active (Windows Defender off) |
+| When it happens | only on the first run after a `cargo build` (a new program) |
+
+AVG holds a newly built program and first runs a sandboxed **copy** of it, with the same arguments, for ~25 s. The copy really reaches `127.0.0.1`, so it sent requests to the nodes. Then the real one ran with the same run ID and overwrote the copy's CSV. (The nodes' 26-43 s slow starts after a build are the same check.)
+
+**Fix in `crates/loadgen/src/bin/experiment.rs`:** before the real run, the runner starts `node`, `loadgen` and `inject` once with `--help`, so AVG checks a harmless run. After a fresh build the next run was clean (no warnings). The first run after a build takes ~50 s longer while AVG checks the `--help` runs. Another option is an AVG exception for the repo's `target` folder, a security setting each person changes themselves. The safeguards (section 15) are what caught this: without them the polluted runs would have looked like "0 resources assigned".
+
+## 21. Step C, Mon Nov 2: GM-Sniper's review of PR #34
+
+GM-Sniper tested the PR merged with main and asked for four changes. All four are done.
+
+**1. Conflicts with main (PR #33, SeaweedFS).** P5's shared state changed the same lines in `crates/node/src/main.rs`, `state.rs` and `store.rs` as the Step B folder store. Merged `main` into `StepC/p6` and kept P5's version of those files; `DESIGN_LOG.md` keeps both sections. `crates/node/Cargo.toml` had `serde` twice (both sides added it on different lines, so git saw no conflict but cargo refused to build): it is now exactly main's.
+
+**2. The folder store is gone; the runner uses `[shared_state]`.** `crates/node/src/file_store.rs` and the node's `--shared-state-dir` flag are deleted (they were TEMPORARY until the real shared state, which #33 is; the lab would have needed a network share). The experiment file loses `shared_state` and `shared_state_dir`. The runner now follows the cluster file:
+- `backend = "s3"`, local mode: it deletes the bucket before starting the nodes (one HTTP `DELETE`, like P5's `curl -X DELETE`), because a node fills an EMPTY bucket with the 10 starting resources. If SeaweedFS is not running it stops with a clear message.
+- `backend = "s3"`, lab mode: it prints the `curl -X DELETE` to run on a node PC before starting the nodes.
+- `backend = "memory"`: it prints a note that each node has its own resources.
+- 2 new tests (the reset's answers, and the message when nothing listens).
+
+**3. Failover = the requests the failure caught.** The plan's 2.6 s example is a request running when the node died: its first attempt is lost, the client waits out its 2 s deadline and a retry gets a plan from a live node. The first version reported the first answer without the failed node instead, which is usually a NEW request that only waits one 300 ms bid timeout (0.3-0.6 s). Now `failover.rs` reports:
+- `failover`: median latency of the requests that got a plan from a live node, needed a retry, and ran while the node was down (count and max shown);
+- `reroute`: the old number, as a second line;
+- "not measured" when no request was caught, never 0.
+
+**4. Recovery from P3's READY row.** P3's rejoin rule (#32) writes `READY` in the node's fault log when the node is ready to bid again (fault_id `startup` after a restart). Recovery = first `READY` of the node after the failure started - when it was back. The stand-in (first election won) is gone; it measured 0.00 s because a returning node has load 0 and wins at once. The `--elections` option is gone too. A restarted node can be READY a few ms before the runner logs `CUT_END` (it logs it once the node accepts connections): recovery is then 0, never negative.
+- `failover.rs`: 9 tests (was 6), including "the caught request, not the first new one", the median, and the cut case.
+
+**Checks.** The workspace builds. All loadgen, client and common tests pass. Two node tests fail, and they are **main's own** (the node code here is identical to main's): `slow_plan_is_saved_even_if_the_caller_stops_waiting` fails in `--release` only ("the plan should take longer than 20 ms": the planner is faster since P2's #27), and `slow_node_wins_fewer_elections` failed once in a full debug run and passed 3 of 3 alone (timing). For P1/P2.
+
+**Dry run** (`experiments/fail-recover-local.toml`, memory backend: SeaweedFS is not installed on this laptop): 3,917 requests, 100% reliability, 0 lost. Node 2 muted: detection 1.27 s, reroute 0.34 s, recovery 0.24 s (READY). Node 3 cut: detection 1.23 s, reroute 0.32 s, recovery 0.00 s (READY 0.3 s before CUT_END). Failover "not measured" in both: no request was retried in this run, so the failure caught none (node 2 held no request at the moment it was muted). Caught requests depend on timing; the lab runs with more load will show them.
