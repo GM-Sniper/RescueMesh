@@ -67,10 +67,18 @@ impl Node for NodeService {
 
     async fn submit(&self, req: Request<SubmitRequest>) -> Result<Response<SubmitReply>, Status> {
         self.gate().await?; // held while muted; not counted as work
+        let req = req.into_inner();
+        // Step D (issue #36): "this incident is over". No election and no plan: the store
+        // makes a repeat harmless, so whichever node gets it frees the resources at once.
+        if let Some(submit_request::Kind::Resolve(resolve)) = &req.kind {
+            let reply = handle_resolve(&self.state, &req.request_id, resolve.incident_id).await?;
+            self.gate().await?; // muted meanwhile: the reply never leaves
+            return Ok(Response::new(reply));
+        }
         // The work runs in its own task (it counts itself in P3's queue and service time).
         // If the client stops waiting, only this wait ends: the work still finishes and
         // commits, and the client's retry gets the stored plan.
-        let reply = wait_for(start_or_join(&self.state, req.into_inner())).await?;
+        let reply = wait_for(start_or_join(&self.state, req)).await?;
         // Muted mid-request: drop the reply. The client retries with the same
         // request_id and gets the stored plan (duplicate = true).
         self.gate().await?;
@@ -284,6 +292,23 @@ async fn handle_submit(
 
 /// A shared-state failure as a gRPC error. `Unavailable` tells the client the same
 /// request_id can be retried: commit is create-if-absent, so a retry cannot double-book.
+/// Step D (issue #36): frees the resources of `incident_id` through P2's `SharedState::resolve`.
+/// The reply has no plan. A store failure is `Unavailable`, so the client retries the same
+/// `request_id` (until P2's stores land, every resolve fails this way).
+async fn handle_resolve(state: &NodeState, request_id: &str, incident_id: u64) -> Result<SubmitReply, Status> {
+    if request_id.is_empty() {
+        return Err(Status::invalid_argument("request_id is empty"));
+    }
+    state.store.resolve(request_id, incident_id).await.map_err(unavailable)?;
+    tracing::debug!(%request_id, incident_id, "resolved");
+    Ok(SubmitReply {
+        request_id: request_id.to_string(),
+        executor_node: state.id,
+        plan: None,
+        duplicate: false,
+    })
+}
+
 fn unavailable(why: StateUnavailable) -> Status {
     tracing::warn!(%why, "shared state unavailable");
     Status::unavailable(why.to_string())
@@ -597,6 +622,85 @@ iterations = 20000
         assert!(svc.submit(Request::new(bad)).await.is_err());
         wait_until_idle(&svc).await; // an error must not leave the request stuck "in progress"
         assert_eq!(svc.state.in_flight(), 0);
+    }
+
+    // ---- Step D, issue #36: P1's part of resolve (proto + handler). P2's stores are not
+    // needed here: a recording fake stands in for them.
+
+    /// The in-memory store, plus a record of every resolve call (P2 builds the real one).
+    struct RecordingStore {
+        inner: crate::store::InMemoryStore,
+        resolved: std::sync::Mutex<Vec<(String, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl common::shared_state::SharedState for RecordingStore {
+        async fn snapshot(&self) -> Result<common::domain::Snapshot, StateUnavailable> {
+            self.inner.snapshot().await
+        }
+        async fn commit(&self, id: &str, incident: common::domain::Incident, plan: Plan) -> CommitOutcome {
+            self.inner.commit(id, incident, plan).await
+        }
+        async fn lookup_request(&self, id: &str) -> Result<Option<Plan>, StateUnavailable> {
+            self.inner.lookup_request(id).await
+        }
+        async fn resolve(&self, request_id: &str, incident_id: u64) -> Result<(), StateUnavailable> {
+            self.resolved.lock().unwrap().push((request_id.to_string(), incident_id));
+            Ok(())
+        }
+    }
+
+    fn service_with_recording_store() -> (NodeService, Arc<RecordingStore>) {
+        let store = Arc::new(RecordingStore {
+            inner: crate::store::InMemoryStore::with_default_resources(),
+            resolved: std::sync::Mutex::new(Vec::new()),
+        });
+        let cfg = ClusterConfig::parse("[[nodes]]\nid = 1\naddr = \"127.0.0.1:50051\"\n").unwrap();
+        let peers = Peers::new(&cfg, 1).unwrap();
+        let state = NodeState::new(1, cfg, peers).with_store(store.clone());
+        (NodeService::new(Arc::new(state)), store)
+    }
+
+    fn resolve_req(request_id: &str, incident_id: u64) -> Request<SubmitRequest> {
+        Request::new(SubmitRequest {
+            request_id: request_id.into(),
+            kind: Some(submit_request::Kind::Resolve(common::pb::ResolveIncident { incident_id })),
+        })
+    }
+
+    #[tokio::test]
+    async fn resolve_goes_straight_to_the_store_with_no_plan() {
+        let (svc, store) = service_with_recording_store();
+        let reply = svc.submit(resolve_req("x1", 42)).await.unwrap().into_inner();
+        assert_eq!(reply.request_id, "x1");
+        assert_eq!(reply.executor_node, 1);
+        assert!(reply.plan.is_none(), "a resolve has no plan");
+        assert_eq!(*store.resolved.lock().unwrap(), [("x1".to_string(), 42)]);
+        assert_eq!(svc.state.in_flight(), 0, "no planning, no queue");
+        assert!(svc.state.in_progress.lock().unwrap().is_empty(), "not a Submit task");
+    }
+
+    #[tokio::test]
+    async fn resolve_before_p2s_stores_land_is_unavailable_so_the_client_retries() {
+        let svc = service(); // today's real stores: only the placeholder exists
+        let err = svc.submit(resolve_req("x1", 42)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable, "{}", err.message());
+    }
+
+    #[tokio::test]
+    async fn resolve_without_a_request_id_is_rejected() {
+        let (svc, store) = service_with_recording_store();
+        let err = svc.submit(resolve_req("", 42)).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(store.resolved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn muted_node_does_not_resolve() {
+        let (svc, store) = service_with_recording_store();
+        svc.state.mute_for(Duration::from_secs(5));
+        assert!(timeout(Duration::from_secs(1), svc.submit(resolve_req("x1", 42))).await.is_err());
+        assert!(store.resolved.lock().unwrap().is_empty(), "held by the mute, never reached the store");
     }
 
     #[tokio::test]

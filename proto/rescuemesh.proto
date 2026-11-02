@@ -42,9 +42,17 @@ message HeartbeatReply {
 message SubmitRequest {
   string request_id = 1;    // client-generated Uuid; same ID on every retry
   oneof kind {              // what the client is submitting
-    Incident incident = 2;  // Step A: the only kind
-    // Later kinds get NEW numbers, e.g. ResourceOffer offer = 3; ResourceRequest need = 4;
+    Incident incident = 2;  // a new incident: elect a node, plan, commit
+    ResolveIncident resolve = 3;  // Step D (issue #36): an incident is over, free its resources
+    // Later kinds get NEW numbers, e.g. ResourceOffer offer = 4; ResourceRequest need = 5;
   }
+}
+
+// An incident is over: free the resources it was assigned (P2's SharedState::resolve).
+// No election and no plan: any node does it, and the reply has no plan. The SubmitRequest's
+// request_id is the dedup key, so a retry or the multicast's other copies free nothing twice.
+message ResolveIncident {
+  uint64 incident_id = 1;   // the incident that is over (Plan.incident_id from its plan)
 }
 
 message SubmitReply {

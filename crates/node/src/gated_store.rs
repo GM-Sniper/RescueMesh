@@ -23,7 +23,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use common::domain::{Incident, Plan, Snapshot};
+use common::domain::{Incident, IncidentId, Plan, Snapshot};
 use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
 
 use crate::mute::MuteSwitch;
@@ -66,6 +66,11 @@ impl SharedState for MuteGatedStore {
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable> {
         self.check()?;
         self.inner.lookup_request(request_id).await
+    }
+
+    async fn resolve(&self, request_id: &str, incident_id: IncidentId) -> Result<(), StateUnavailable> {
+        self.check()?;
+        self.inner.resolve(request_id, incident_id).await
     }
 
     async fn reload(&self) -> Result<Snapshot, StateUnavailable> {

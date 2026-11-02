@@ -16,7 +16,7 @@ use std::fmt;
 
 use async_trait::async_trait;
 
-use crate::domain::{Incident, Plan, ResourceId, Snapshot};
+use crate::domain::{Incident, IncidentId, Plan, ResourceId, Snapshot};
 
 /// The shared state could not be reached well enough to give a trustworthy answer.
 ///
@@ -117,5 +117,17 @@ pub trait SharedState: Send + Sync {
     /// is current as of this call; `Err` means the node is not ready yet and must not bid.
     async fn reload(&self) -> Result<Snapshot, StateUnavailable> {
         self.snapshot().await
+    }
+
+    /// Step D, issue #36: incident `incident_id` is over, so free its resources. `request_id`
+    /// is the resolve's own request, the dedup key, so a repeat (a retry, or every node of a
+    /// multicast) frees nothing twice.
+    ///
+    /// PLACEHOLDER (P1): only the signature, so P1's handler can call it before P2's work lands.
+    /// P2 implements it in every store (`InMemoryStore`, `S3Store`, and `MuteGatedStore`, which
+    /// already forwards it); until then every call fails, and the client retries.
+    async fn resolve(&self, request_id: &str, incident_id: IncidentId) -> Result<(), StateUnavailable> {
+        let _ = (request_id, incident_id);
+        Err(StateUnavailable { reason: "resolve is not built yet (P2, issue #36)".into() })
     }
 }
