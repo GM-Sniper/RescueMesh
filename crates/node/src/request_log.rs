@@ -7,9 +7,9 @@
 //!
 //! | column        | meaning                                                                 |
 //! |---------------|-------------------------------------------------------------------------|
-//! | `event`       | `START` (the work began) or `END` (it stopped)                          |
-//! | `detail`      | END only: `committed` (we planned and saved it), `duplicate` (the stored plan was returned), `lost` (another node won the election), or `error:<code>` (e.g. `error:unavailable` when muted) |
-//! | `duration_us` | END only: START to END                                                  |
+//! | `event`       | `START` (the work began), `END` (it stopped), or `SNAPSHOT` / `COMMIT` (one shared-state call, see below) |
+//! | `detail`      | END: `committed` (we planned and saved it), `duplicate` (the stored plan was returned), `lost` (another node won the election), or `error:<code>` (e.g. `error:unavailable` when muted). SNAPSHOT / COMMIT: how the call ended (`ok`, `committed`, `resource_taken`, ...) |
+//! | `duration_us` | END: START to END. SNAPSHOT / COMMIT: how long that one call took       |
 //! | `wall_ts_us`  | wall clock, like P5's fault log, so rows join by time with the other files |
 //!
 //! How P6 reads it, for a request the client had to retry:
@@ -20,6 +20,10 @@
 //!
 //! The rows come from the Submit task in `service.rs` (`start_or_join`), so a retry or a
 //! peer's bid that joins work already running writes no second START.
+//!
+//! SNAPSHOT and COMMIT rows (P1, Step D: "state cost under load") come from `handle_submit`,
+//! one per call, only on the node that won the election. A request planned again after
+//! `resource_taken` has several of each. Their `wall_ts_us` places them in a ramp stage.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -65,6 +69,11 @@ impl RequestLog {
 
     pub fn end(&self, request_id: &str, outcome: &SubmitResult, took: Duration) {
         self.write(request_id, "END", &end_detail(outcome, self.node_id), Some(took));
+    }
+
+    /// One shared-state call inside the work: `event` is `SNAPSHOT` or `COMMIT`.
+    pub fn step(&self, request_id: &str, event: &str, detail: &str, took: Duration) {
+        self.write(request_id, event, detail, Some(took));
     }
 
     fn write(&self, request_id: &str, event: &str, detail: &str, took: Option<Duration>) {
@@ -192,6 +201,19 @@ mod tests {
         assert!(lines[1].starts_with("run7,2,r1,START,,,"));
         assert!(lines[2].starts_with("run7,2,r1,END,committed,3000,"));
         assert!(lines[3].starts_with("run7,2,r2,START,,,"));
+    }
+
+    #[test]
+    fn step_rows_carry_the_call_and_its_duration() {
+        let path = temp_path("step");
+        let log = RequestLog::open(&path, 2, "run7").unwrap();
+        log.step("r1", "SNAPSHOT", "ok", Duration::from_micros(4120));
+        log.step("r1", "COMMIT", "committed", Duration::from_micros(9830));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].starts_with("run7,2,r1,SNAPSHOT,ok,4120,"));
+        assert!(lines[2].starts_with("run7,2,r1,COMMIT,committed,9830,"));
     }
 
     #[test]

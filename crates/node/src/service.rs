@@ -279,7 +279,15 @@ async fn handle_submit(
     //    free, so a resource taken by another request in between is caught, and we plan again.
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
         let now = now_unix_ms();
-        let snapshot = state.store.snapshot().await.map_err(unavailable)?;
+        let started = std::time::Instant::now(); // P1, Step D: state cost of each call
+        let snapshot = state.store.snapshot().await;
+        let detail = if snapshot.is_ok() {
+            "ok"
+        } else {
+            "unavailable"
+        };
+        log_step(state, &request_id, "SNAPSHOT", detail, started);
+        let snapshot = snapshot.map_err(unavailable)?;
         let to_plan = incident.clone();
         // The planner is CPU work: run it off the async threads so it can never
         // delay heartbeats (which would cause false PeerDowns).
@@ -289,11 +297,19 @@ async fn handle_submit(
         .await
         .map_err(|e| Status::internal(format!("planner failed: {e}")))?;
 
-        match state
+        let started = std::time::Instant::now();
+        let outcome = state
             .store
             .commit(&request_id, incident.clone(), plan.clone())
-            .await
-        {
+            .await;
+        log_step(
+            state,
+            &request_id,
+            "COMMIT",
+            commit_detail(&outcome),
+            started,
+        );
+        match outcome {
             CommitOutcome::Committed => {
                 tracing::debug!(
                     %request_id,
@@ -324,6 +340,30 @@ async fn handle_submit(
     Err(Status::aborted(format!(
         "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
     )))
+}
+
+/// P1, Step D: one SNAPSHOT or COMMIT row in the request log, timed from `started`.
+fn log_step(
+    state: &NodeState,
+    request_id: &str,
+    event: &str,
+    detail: &str,
+    started: std::time::Instant,
+) {
+    if let Some(log) = &state.request_log {
+        log.step(request_id, event, detail, started.elapsed());
+    }
+}
+
+/// The COMMIT row's `detail`: how the commit ended, one word.
+fn commit_detail(outcome: &CommitOutcome) -> &'static str {
+    match outcome {
+        CommitOutcome::Committed => "committed",
+        CommitOutcome::AlreadyCommitted(_) => "already_committed",
+        CommitOutcome::ResourceTaken { .. } => "resource_taken",
+        CommitOutcome::IncidentResolved => "incident_resolved",
+        CommitOutcome::StateUnavailable(_) => "unavailable",
+    }
 }
 /// Resolves an incident and releases its assigned resources.
 async fn handle_resolve(
@@ -801,8 +841,10 @@ iterations = 20000
             events,
             [
                 "q1 START ",
+                "q1 SNAPSHOT ok", // P1, Step D: the shared-state calls, timed
+                "q1 COMMIT committed",
                 "q1 END committed",
-                "q1 START ",
+                "q1 START ", // found by lookup_request: no snapshot, no commit
                 "q1 END duplicate"
             ]
         );
