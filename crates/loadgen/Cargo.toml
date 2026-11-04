@@ -12,4 +12,3 @@ clap.workspace = true            # reads --clients --requests --seed --rate from
 anyhow.workspace = true          # simple error handling in main
 serde.workspace = true           # experiment runner: reads the experiment config file into a struct
 toml.workspace = true            # experiment runner: the config file is TOML, like config/nodes.toml
-rand = "0.8"

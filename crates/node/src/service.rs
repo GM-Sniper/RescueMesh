@@ -74,6 +74,7 @@ impl Node for NodeService {
         if let Some(submit_request::Kind::Resolve(resolve)) = &req.kind {
             let reply = handle_resolve(&self.state, &req.request_id, resolve.incident_id).await?;
 
+            // If muted during resolution, suppress the reply so the client can retry.
             self.gate().await?;
             return Ok(Response::new(reply));
         }
@@ -311,6 +312,9 @@ async fn handle_submit(
             CommitOutcome::ResourceTaken { resource_id } => {
                 tracing::debug!(%request_id, attempt, resource_id, "resource taken meanwhile; planning again");
             }
+            CommitOutcome::IncidentResolved => {
+                return Err(Status::failed_precondition("incident is already resolved"));
+            }
             CommitOutcome::StateUnavailable(why) => return Err(unavailable(why)),
         }
     }
@@ -456,12 +460,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resolve_bypasses_election_and_returns_no_plan() {
+        let svc = service();
+
+        let reply = svc
+            .submit(Request::new(SubmitRequest {
+                request_id: "resolve-1".into(),
+                kind: Some(submit_request::Kind::Resolve(common::pb::ResolveIncident {
+                    incident_id: 999,
+                })),
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+
+        assert_eq!(reply.request_id, "resolve-1");
+        assert_eq!(reply.executor_node, 1);
+        assert!(reply.plan.is_none(), "resolve must not return a plan");
+        assert!(
+            svc.state
+                .election
+                .lock()
+                .unwrap()
+                .round("resolve-1")
+                .is_none(),
+            "resolve must not start an election"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_resolve_request_id_is_rejected() {
+        let svc = service();
+
+        let err = svc
+            .submit(Request::new(SubmitRequest {
+                request_id: String::new(),
+                kind: Some(submit_request::Kind::Resolve(common::pb::ResolveIncident {
+                    incident_id: 999,
+                })),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn muted_node_does_not_process_resolve() {
+        let svc = service();
+        svc.state.mute_for(Duration::from_secs(5));
+
+        let err = svc
+            .submit(Request::new(SubmitRequest {
+                request_id: "resolve-muted".into(),
+                kind: Some(submit_request::Kind::Resolve(common::pb::ResolveIncident {
+                    incident_id: 999,
+                })),
+            }))
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        assert!(
+            svc.state
+                .election
+                .lock()
+                .unwrap()
+                .round("resolve-muted")
+                .is_none(),
+            "muted resolve must not start an election"
+        );
+    }
+
+    #[tokio::test]
     async fn empty_submit_is_rejected_and_leaves_counter_at_zero() {
         let svc = service();
         let err = svc
             .submit(Request::new(SubmitRequest::default()))
             .await
             .unwrap_err();
+
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
         assert_eq!(svc.state.in_flight(), 0);
     }

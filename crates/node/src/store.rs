@@ -44,6 +44,8 @@ struct Contents {
     plans_by_request: HashMap<String, Plan>,
     /// Resolve request IDs are idempotent and cannot be reused for another incident.
     resolutions_by_request: HashMap<String, IncidentId>,
+    /// Incident IDs that have been resolved, including IDs unknown when resolved.
+    resolved_incidents: HashSet<IncidentId>,
 }
 
 /// Shared state kept in this process's memory. Implements [`SharedState`].
@@ -103,14 +105,8 @@ impl SharedState for InMemoryStore {
         }
 
         // A resolved incident must never receive new resource assignments.
-        if contents
-            .incidents
-            .get(&incident.id)
-            .is_some_and(|existing| existing.status == IncidentStatus::Resolved)
-        {
-            return CommitOutcome::StateUnavailable(StateUnavailable {
-                reason: format!("incident {} is already resolved", incident.id),
-            });
+        if contents.resolved_incidents.contains(&incident.id) {
+            return CommitOutcome::IncidentResolved;
         }
 
         // Every planned resource must exist, be unassigned, and appear only once in the plan.
@@ -168,6 +164,8 @@ impl SharedState for InMemoryStore {
 
         // Mark the incident as resolved if it exists.
         // An unknown incident is a successful no-op.
+        contents.resolved_incidents.insert(incident_id);
+
         if let Some(incident) = contents.incidents.get_mut(&incident_id) {
             incident.status = IncidentStatus::Resolved;
         }
@@ -553,7 +551,7 @@ mod tests {
 
         let result = commit(&store, "r2", 10, &[2]).await;
 
-        assert!(matches!(result, CommitOutcome::StateUnavailable(_)));
+        assert_eq!(result, CommitOutcome::IncidentResolved);
 
         let snapshot = store.snapshot().await.unwrap();
 
@@ -570,6 +568,12 @@ mod tests {
         let result = store.resolve("resolve-unknown", 999).await;
 
         assert!(result.is_ok());
+        // A later commit for this incident must be rejected.
+        let later_commit = store
+            .commit("r2", incident(999), plan_assigning(999, &[2]))
+            .await;
+
+        assert_eq!(later_commit, CommitOutcome::IncidentResolved);
 
         let snapshot = store.snapshot().await.unwrap();
 

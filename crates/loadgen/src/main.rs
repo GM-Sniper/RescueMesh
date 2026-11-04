@@ -32,7 +32,6 @@ use clap::Parser;
 use client::{ClientMiddleware, DEFAULT_TIMEOUT, RetryPolicy, SubmitStatus};
 use common::conversions::incident_to_pb;
 use common::generators::generate_incident;
-use rand::Rng;
 use tokio::time::Instant;
 
 /// Command-line flags. clap reads them, checks them and prints `--help` for free.
@@ -77,6 +76,11 @@ struct Args {
     #[arg(long, default_value_t = 0.0)]
     rate: f64,
 
+    /// Resolve assigned incidents after a deterministic mission delay (milliseconds).
+    /// 0 = resolution disabled. Otherwise, delays range from 1 to this value.
+    #[arg(long, default_value_t = 0)]
+    resolve_after_ms: u64,
+
     /// Ramp mode: number of clients in each stage, e.g. "1,2,4,8". Each stage lasts --stage-secs, and every
     /// client sends its next request as soon as the previous one returns. Replaces --clients, --requests and --rate.
     /// Without --stages, the run is a single stage of --clients clients sending --requests requests (Step A mode).
@@ -97,17 +101,29 @@ struct Args {
 }
 
 /// One finished request, on its way to the CSV writer.
+/// One finished request, on its way to the CSV writer.
 struct Row {
+    /// Wall-clock time when the request was sent, in Unix milliseconds.
     timestamp_ms: u64,
+    /// ID of the simulated client that sent the request.
     client_id: u64,
+    /// Unique request ID, reused across retries.
     request_id: String,
+    /// Time taken by the submit operation, in microseconds.
     latency_us: u64,
+    /// Node that executed the plan, if one was returned.
     executor_node: Option<u32>,
+    /// Final status returned by the client.
     status: SubmitStatus,
+    /// Whether the returned plan assigned a resource.
     assigned: Option<bool>,
+    /// Ramp-test stage number (1 for a fixed run).
     stage: u32,
+    /// Number of attempts used for this request.
     attempts: u32,
+    /// Number of replies that did not contain a plan.
     no_plan_replies: u32,
+    /// Short result label used by the stats script.
     outcome: &'static str,
 }
 
@@ -119,6 +135,7 @@ struct ClientJob {
     next: Arc<AtomicU64>,
     tx: mpsc::Sender<Row>,
     seed: u64,
+    resolve_after_ms: u64,
     max_requests: Option<u64>,
     stage_end: Option<Instant>,
     interval: Option<Duration>,
@@ -127,7 +144,7 @@ struct ClientJob {
 
 impl ClientJob {
     /// Sends requests until the job's limit (request count or stage end) is reached.
-    async fn run(self) {
+    async fn run(self) -> Vec<tokio::task::JoinHandle<bool>> {
         // Keep handles to missions that are still waiting to be resolved.
         let mut resolution_tasks = Vec::new();
 
@@ -158,14 +175,14 @@ impl ClientJob {
             let assigned = outcome.assigned();
             let result = outcome.outcome();
 
-            // Start a separate mission timer so this client can continue
-            // submitting other incidents without waiting 1–5 seconds.
-            if assigned == Some(true) {
-                let mission_secs = rand::thread_rng().gen_range(1..=5);
+            // Start a resolution task only when resolution is enabled.
+            if assigned == Some(true) && self.resolve_after_ms > 0 {
+                let delay_ms = mission_delay_ms(self.seed, n, self.resolve_after_ms);
+
                 let resolve_client = self.client.clone();
 
                 let task = tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_secs(mission_secs)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
 
                     let resolve_outcome = resolve_client.resolve(incident_id).await;
 
@@ -175,6 +192,8 @@ impl ClientJob {
                             incident_id, resolve_outcome.error
                         );
                     }
+
+                    resolve_outcome.ok
                 });
 
                 resolution_tasks.push(task);
@@ -202,11 +221,7 @@ impl ClientJob {
         // Step 4: wait for every mission started by this client to finish resolving.
         // This prevents the client job from ending while its resolution tasks are
         // still running.
-        for task in resolution_tasks {
-            if let Err(error) = task.await {
-                eprintln!("Mission resolution task failed: {}", error);
-            }
-        }
+        resolution_tasks
     }
 }
 
@@ -218,6 +233,9 @@ struct Counts {
     error: u64,
     unassigned: u64,
     retried: u64,
+    resolve_sent: u64,
+    resolve_ok: u64,
+    resolve_failed: u64,
 }
 
 #[tokio::main]
@@ -314,7 +332,7 @@ async fn main() -> anyhow::Result<()> {
 
     let started_at_ms = unix_ms();
     let start = Instant::now();
-
+    let mut resolution_tasks: Vec<tokio::task::JoinHandle<bool>> = Vec::new();
     // Run the stages one after another. Within a stage, one tokio task per client, all at the same time.
     for (s, &stage_clients) in stages.iter().enumerate() {
         let stage = s as u32 + 1;
@@ -338,6 +356,7 @@ async fn main() -> anyhow::Result<()> {
                 next: next.clone(),
                 tx: tx.clone(),
                 seed: args.seed,
+                resolve_after_ms: args.resolve_after_ms,
                 max_requests: (!ramp).then_some(args.requests),
                 stage_end,
                 interval,
@@ -348,14 +367,30 @@ async fn main() -> anyhow::Result<()> {
         }
 
         for task in tasks {
-            task.await?;
+            resolution_tasks.extend(task.await?);
         }
     }
 
     drop(tx);
 
     let elapsed = start.elapsed();
-    let counts = writer.join().expect("CSV writer thread panicked")?;
+
+    let resolve_sent = resolution_tasks.len() as u64;
+    let mut resolve_ok = 0u64;
+
+    for task in resolution_tasks {
+        match task.await {
+            Ok(true) => resolve_ok += 1,
+            Ok(false) | Err(_) => {}
+        }
+    }
+
+    let resolve_failed = resolve_sent - resolve_ok;
+
+    let mut counts = writer.join().expect("CSV writer thread panicked")?;
+    counts.resolve_sent = resolve_sent;
+    counts.resolve_ok = resolve_ok;
+    counts.resolve_failed = resolve_failed;
 
     // Late plans: a second plan for a request that already had one (a split decision, or a slow winner).
     // P1's client counts them in the background until each attempt's deadline, so wait that long first.
@@ -371,8 +406,15 @@ async fn main() -> anyhow::Result<()> {
     let throughput = counts.ok as f64 / secs;
 
     println!(
-        "done in {secs:.2} s: {} ok ({} with nothing assigned, {} retried), {} timeout, {} error, {late_plans} late plans, {throughput:.1} ok/s",
-        counts.ok, counts.unassigned, counts.retried, counts.timeout, counts.error
+        "done in {secs:.2} s: {} ok ({} with nothing assigned, {} retried), {} timeout, {} error, {late_plans} late plans, {} resolves sent ({} successful, {} failed), {throughput:.1} ok/s",
+        counts.ok,
+        counts.unassigned,
+        counts.retried,
+        counts.timeout,
+        counts.error,
+        counts.resolve_sent,
+        counts.resolve_ok,
+        counts.resolve_failed
     );
 
     // The metadata file records how to repeat this exact run.
@@ -381,11 +423,12 @@ async fn main() -> anyhow::Result<()> {
          started_at_ms: {started_at_ms}\n\
          command: {}\n\
          mode: {}\nsend: {}\nnode: {}\nattempts: {}\nattempt_timeout_ms: {}\n\
-         stages: {}\nstage_secs: {}\nclients: {}\nrequests: {}\nseed: {}\nrate: {}\n\
-         git_commit: {}\n\
-         duration_s: {secs:.3}\n\
-         ok: {}\nunassigned: {}\nretried: {}\ntimeout: {}\nerror: {}\nlate_plans: {late_plans}\n\
-         throughput_ok_per_s: {throughput:.1}\n",
+         stages: {}\nstage_secs: {}\nclients: {}\nrequests: {}\nseed: {}\nrate: {}\nresolve_after_ms: {}\n\
+git_commit: {}\n\
+duration_s: {secs:.3}\n\
+ok: {}\nunassigned: {}\nretried: {}\ntimeout: {}\nerror: {}\nlate_plans: {late_plans}\n\
+resolve_sent: {}\nresolve_ok: {}\nresolve_failed: {}\n\
+throughput_ok_per_s: {throughput:.1}\n",
         std::env::args().collect::<Vec<_>>().join(" "),
         if ramp { "ramp" } else { "fixed" },
         if single { "single" } else { "multicast" },
@@ -418,12 +461,16 @@ async fn main() -> anyhow::Result<()> {
         },
         args.seed,
         args.rate,
+        args.resolve_after_ms,
         git_commit(),
         counts.ok,
         counts.unassigned,
         counts.retried,
         counts.timeout,
         counts.error,
+        counts.resolve_sent,
+        counts.resolve_ok,
+        counts.resolve_failed,
     );
 
     fs::write(&meta_path, meta)?;
@@ -480,6 +527,21 @@ fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Res
     Ok(counts)
 }
 
+/// Returns a deterministic mission delay between 1 and max_ms.
+fn mission_delay_ms(seed: u64, request_number: u64, max_ms: u64) -> u64 {
+    if max_ms == 0 {
+        return 0;
+    }
+
+    let mut value = seed.wrapping_add(request_number);
+    value = value.wrapping_add(0x9E3779B97F4A7C15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xBF58476D1CE4E5B9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94D049BB133111EB);
+    value ^= value >> 31;
+
+    (value % max_ms) + 1
+}
+
 /// Current wall-clock time in unix milliseconds. Used for timestamps only, never to measure latency.
 fn unix_ms() -> u64 {
     SystemTime::now()
@@ -497,4 +559,30 @@ fn git_commit() -> String {
         .filter(|out| out.status.success())
         .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+#[cfg(test)]
+mod tests {
+    use super::mission_delay_ms;
+
+    #[test]
+    fn mission_delay_is_deterministic() {
+        let first = mission_delay_ms(42, 10, 5000);
+        let second = mission_delay_ms(42, 10, 5000);
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn mission_delay_stays_within_range() {
+        for request_number in 0..100 {
+            let delay = mission_delay_ms(42, request_number, 5000);
+
+            assert!((1..=5000).contains(&delay));
+        }
+    }
+
+    #[test]
+    fn zero_max_delay_disables_resolution_delay() {
+        assert_eq!(mission_delay_ms(42, 10, 0), 0);
+    }
 }

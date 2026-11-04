@@ -402,11 +402,7 @@ impl SharedState for S3Store {
         }
 
         match self.incident_is_resolved(incident.id).await {
-            Ok(true) => {
-                return CommitOutcome::StateUnavailable(unavailable(
-                    "cannot commit an already resolved incident",
-                ));
-            }
+            Ok(true) => return CommitOutcome::IncidentResolved,
             Ok(false) => {}
             Err(e) => return CommitOutcome::StateUnavailable(e),
         }
@@ -456,9 +452,7 @@ impl SharedState for S3Store {
         match self.incident_is_resolved(incident.id).await {
             Ok(true) => {
                 self.release(&held).await;
-                return CommitOutcome::StateUnavailable(unavailable(
-                    "incident was resolved while committing",
-                ));
+                return CommitOutcome::IncidentResolved;
             }
             Ok(false) => {}
             Err(e) => {
@@ -796,7 +790,86 @@ mod tests {
         }
         v
     }
+    #[tokio::test]
+    #[ignore]
+    async fn resolve_releases_resource_for_another_incident() {
+        let n = three("resolve-reuse", 10_000).await;
 
+        assert_eq!(
+            n[0].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        n[0].resolve("resolve-1", 1).await.unwrap();
+
+        // The resource released by incident 1 can now be assigned to incident 2.
+        assert_eq!(
+            n[1].commit("r2", incident(2), plan(2, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        let snap = n[2].snapshot().await.unwrap();
+        assert_eq!(snap.assignments.len(), 1);
+        assert_eq!(snap.assignments[0].incident_id, 2);
+        assert_eq!(snap.assignments[0].resource_id, 1);
+
+        drop_bucket(&n[0]).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn repeated_resolve_does_not_release_another_incidents_resource() {
+        let n = three("resolve-repeat", 10_000).await;
+
+        assert_eq!(
+            n[0].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        n[0].resolve("resolve-1", 1).await.unwrap();
+
+        assert_eq!(
+            n[1].commit("r2", incident(2), plan(2, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        // Repeating the original resolve must not release incident 2's claim.
+        n[2].resolve("resolve-1", 1).await.unwrap();
+
+        let snap = n[0].snapshot().await.unwrap();
+        assert_eq!(snap.assignments.len(), 1);
+        assert_eq!(snap.assignments[0].incident_id, 2);
+        assert_eq!(snap.assignments[0].resource_id, 1);
+
+        drop_bucket(&n[0]).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn three_nodes_can_resolve_the_same_incident_concurrently() {
+        let n = three("resolve-concurrent", 10_000).await;
+
+        assert_eq!(
+            n[0].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        // All three nodes receive the same resolve request, as in a real client call.
+        let (a, b, c) = tokio::join!(
+            n[0].resolve("resolve-1", 1),
+            n[1].resolve("resolve-1", 1),
+            n[2].resolve("resolve-1", 1),
+        );
+
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+
+        let snap = n[0].snapshot().await.unwrap();
+        assert!(snap.assignments.is_empty());
+
+        drop_bucket(&n[0]).await;
+    }
     #[tokio::test]
     #[ignore]
     async fn same_request_committed_twice_leaves_one_record() {
@@ -989,6 +1062,25 @@ mod tests {
         ));
         // And it wrote nothing that the real cluster can see.
         assert!(n[0].lookup_request("r1").await.unwrap().is_none());
+        drop_bucket(&n[0]).await;
+    }
+    #[tokio::test]
+    #[ignore]
+    async fn resolving_unknown_incident_prevents_later_commit() {
+        let n = three("resolve-unknown", 10_000).await;
+
+        // Resolving an incident that does not exist yet should succeed.
+        n[0].resolve("resolve-unknown-1", 999).await.unwrap();
+
+        // A later commit for that incident must be rejected.
+        assert_eq!(
+            n[1].commit("r1", incident(999), plan(999, &[1])).await,
+            CommitOutcome::IncidentResolved
+        );
+
+        let snap = n[2].snapshot().await.unwrap();
+        assert!(snap.assignments.is_empty());
+
         drop_bucket(&n[0]).await;
     }
 }

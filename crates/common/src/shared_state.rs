@@ -57,12 +57,17 @@ pub enum CommitOutcome {
     /// after the snapshot was copied; or not a known resource; or named twice in one plan).
     /// Nothing was written. The caller should take a fresh snapshot, plan again and retry.
     /// Carries the first offending resource so the log can say which one collided.
-    ResourceTaken { resource_id: ResourceId },
+    ResourceTaken {
+        resource_id: ResourceId,
+    },
 
     /// Not enough of the shared state could be reached to decide. Nothing is known to have
     /// been written. Why not simply "Committed" or an error: the write may or may not have
     /// landed, so the caller must retry with the SAME `request_id`; the create-if-absent rule
     /// makes that safe, and the retry will come back `AlreadyCommitted` if the first one landed.
+    /// The incident was already resolved, so this submission cannot be committed.
+    /// This is a final outcome, not a temporary shared-state failure.
+    IncidentResolved,
     StateUnavailable(StateUnavailable),
 }
 
@@ -113,7 +118,11 @@ pub trait SharedState: Send + Sync {
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable>;
     /// Resolve an incident and release every resource assigned to it.
     ///
-    /// Repeating the same resolve request is safe. Reusing its ID
+    /// The incident ID is recorded as resolved even if the incident is
+    /// unknown when this method is called. This prevents a later commit
+    /// from creating an assignment for an incident that was already resolved.
+    ///
+    /// Repeating the same resolve request is safe. Reusing its request ID
     /// for a different incident returns an error.
     async fn resolve(
         &self,
