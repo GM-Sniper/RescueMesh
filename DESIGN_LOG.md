@@ -289,6 +289,24 @@ Not yet tested: two gateways on different machines under load (P4's spike tested
 - **Reset between runs = DELETE the bucket** (`curl -X DELETE http://127.0.0.1:8333/rescuemesh`), not a new bucket name. Each bucket gets its own volumes, and after a handful of buckets the volume server returned HTTP 500 "No writable volumes".
 - Start `weed` with `-volume.max` raised (or `-master.volumeSizeLimitMB` lowered) on machines with small disks.
 
+## P3: Clean reset between runs (Step D)
+
+Code: `scripts/reset-node.sh`. Run it on each node machine before every lab run, node 1 first. Local runs do not need it: the experiment runner already starts fresh nodes.
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| One command per machine, typed on that machine | One command that reaches all 3 machines over ssh | Whether the lab allows ssh between the PCs is unknown until we are there (`docs/lab-setup.md`). A per-machine command works either way |
+| Node 1's reset clears the shared state, by deleting the bucket. The other nodes do not touch it | A separate clear command; a new bucket per run | Clearing is needed once per run, so tying it to node 1 means nobody can forget it. Node 1 goes first, so the later nodes start on the emptied bucket. A new bucket per run uses up the volume server's volumes (P5, Oct 31). With the `memory` backend the restart alone clears the state |
+| Stops if the bucket cannot be deleted, without starting a node | Warn and carry on | A run on top of old records would give wrong numbers that look fine |
+| The last run's logs move to `logs/archive/<run>/`; the new run's stay in `logs/` | Delete them; add to the same files | Nothing is lost, and each run has its own folder (Step D rule). `logs/` stays where the lab checklist and P6's runner expect it |
+| A run name already used on this machine is refused, before anything is stopped. A run whose node never started frees its name | Overwrite | Reusing a name would mix two runs under one `run_id`. Retrying after fixing a failed start should not need a new name |
+| Each run saves the config, the git commit, the count of uncommitted changes and the node's flags (`run-info-node<N>.txt`) | Rely on notes | Every number in the report must be traceable to how it was produced |
+
+Tested Nov 1 on one laptop: 3 real nodes on SeaweedFS 4.48 with one S3 gateway, 30 requests per run. Fresh run: 10 assigned, 20 empty (10 resources). Second load without a reset: 0 assigned, 30 empty. Load after a reset: 10 assigned, 20 empty again, and the bucket's request records went from 60 to 0 and then 30.
+
+Then one laptop with 3 masters, 3 volume servers, 3 filers and 3 gateways, each node on its own gateway: 5 reset-and-load cycles gave the same result every time, and all 3 gateways listed the same counts right after node 1's delete and after each load. Resetting in the wrong order (3, 2, 1) still gave a clean run. One filer down: the gateway fails over and the delete works (HTTP 204). All filers down: HTTP 500, and the script stops. Gateway off: no answer, and the script stops. A non-clearing node whose gateway is off fails after about 10 s, with the node's error. Not tested: real machines, so on the first lab run check that the delete through node 1's gateway reaches the other two machines over the network.
+
+
 ## P3: Rejoin readiness rule (Step C)
 
 Code: `crates/node/src/rejoin.rs`, called by the mute hook in `service.rs` when a mute ends, and by `main.rs` when the node starts.
