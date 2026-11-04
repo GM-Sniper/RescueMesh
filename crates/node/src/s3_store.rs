@@ -43,12 +43,14 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use common::config::SharedStateConfig;
-use common::domain::{Assignment, Incident, IncidentStatus, Plan, Resource, ResourceId, Snapshot};
+use common::domain::{
+    Assignment, Incident, IncidentId, IncidentStatus, Plan, Resource, ResourceId, Snapshot,
+};
 use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
 use futures_util::future::join_all;
 use reqwest::{Client, StatusCode};
-use serde::{Deserialize, Serialize};
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::sync::RwLock;
 use tokio::time::Instant;
 
@@ -69,7 +71,12 @@ pub struct RequestRecord {
     pub incident: Incident,
     pub plan: Plan,
 }
-
+/// Persistent record of a successful resolve operation.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ResolutionRecord {
+    pub request_id: String,
+    pub incident_id: IncidentId,
+}
 /// What a claim already in the bucket means for a request that wants the same resource.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimView {
@@ -114,7 +121,10 @@ impl S3Store {
     /// Connects, creates the bucket if needed, writes the starting resources if nobody has
     /// yet (create-if-absent, so all three nodes can do it at once), and reads them back.
     /// Retries for about 10 s so a node may start a little before its gateway.
-    pub async fn connect(cfg: &SharedStateConfig, starting: Vec<Resource>) -> Result<Self, StateUnavailable> {
+    pub async fn connect(
+        cfg: &SharedStateConfig,
+        starting: Vec<Resource>,
+    ) -> Result<Self, StateUnavailable> {
         let http = Client::builder()
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
             // The gateway is on the lab LAN. A system HTTP proxy (HTTP_PROXY) would send these
@@ -146,7 +156,10 @@ impl S3Store {
         let resp = self.http.put(&self.base).send().await.map_err(transport)?;
         // 409 = BucketAlreadyOwnedByYou: another node (or an earlier start) made it.
         if !(resp.status().is_success() || resp.status() == StatusCode::CONFLICT) {
-            return Err(unavailable(format!("create bucket: HTTP {}", resp.status())));
+            return Err(unavailable(format!(
+                "create bucket: HTTP {}",
+                resp.status()
+            )));
         }
         for r in starting {
             // Lost = already written by another node: fine, same constants everywhere.
@@ -156,7 +169,10 @@ impl S3Store {
     }
 
     /// Re-reads the resource definitions into the cache.
-    async fn load_resources(&self, ids: impl Iterator<Item = ResourceId>) -> Result<(), StateUnavailable> {
+    async fn load_resources(
+        &self,
+        ids: impl Iterator<Item = ResourceId>,
+    ) -> Result<(), StateUnavailable> {
         let reads = ids.map(|id| async move { self.get::<Resource>(&resource_key(id)).await });
         let mut fresh = Vec::new();
         for r in join_all(reads).await {
@@ -173,6 +189,16 @@ impl S3Store {
         self.resources.read().unwrap().clone()
     }
 
+    async fn incident_is_resolved(
+        &self,
+        incident_id: IncidentId,
+    ) -> Result<bool, StateUnavailable> {
+        Ok(self
+            .get::<ResolutionRecord>(&resolved_incident_key(incident_id))
+            .await?
+            .is_some())
+    }
+
     // ---- HTTP helpers ---------------------------------------------------------------------
 
     fn url(&self, key: &str) -> String {
@@ -180,8 +206,16 @@ impl S3Store {
     }
 
     /// GET a JSON object. `Ok(None)` = 404. Returns the ETag too.
-    async fn get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<(T, String)>, StateUnavailable> {
-        let resp = self.http.get(self.url(key)).send().await.map_err(transport)?;
+    async fn get<T: DeserializeOwned>(
+        &self,
+        key: &str,
+    ) -> Result<Option<(T, String)>, StateUnavailable> {
+        let resp = self
+            .http
+            .get(self.url(key))
+            .send()
+            .await
+            .map_err(transport)?;
         match resp.status() {
             StatusCode::NOT_FOUND => Ok(None),
             s if s.is_success() => {
@@ -195,8 +229,14 @@ impl S3Store {
         }
     }
 
-    async fn put<T: Serialize>(&self, key: &str, body: &T, cond: Cond<'_>) -> Result<Put, StateUnavailable> {
-        let body = serde_json::to_vec(body).map_err(|e| unavailable(format!("encode {key}: {e}")))?;
+    async fn put<T: Serialize>(
+        &self,
+        key: &str,
+        body: &T,
+        cond: Cond<'_>,
+    ) -> Result<Put, StateUnavailable> {
+        let body =
+            serde_json::to_vec(body).map_err(|e| unavailable(format!("encode {key}: {e}")))?;
         let req = self.http.put(self.url(key)).body(body);
         let req = match cond {
             Cond::IfAbsent => req.header("If-None-Match", "*"),
@@ -212,10 +252,20 @@ impl S3Store {
 
     /// DELETE only if the object is still the version we wrote. Best effort: a failure just
     /// leaves the claim to expire.
-    async fn delete_if_match(&self, key: &str, etag: &str) {
-        let r = self.http.delete(self.url(key)).header("If-Match", etag).send().await;
-        if let Err(e) = r {
-            tracing::debug!(key, %e, "release failed; the lease will expire instead");
+    async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), StateUnavailable> {
+        let resp = self
+            .http
+            .delete(self.url(key))
+            .header("If-Match", etag)
+            .send()
+            .await
+            .map_err(transport)?;
+
+        match resp.status() {
+            StatusCode::NOT_FOUND => Ok(()),
+            s if s.is_success() => Ok(()),
+            StatusCode::PRECONDITION_FAILED => Ok(()),
+            s => Err(unavailable(format!("DELETE {key}: HTTP {s}"))),
         }
     }
 
@@ -232,16 +282,29 @@ impl S3Store {
 
     /// Does `request_id`'s committed plan use `resource`? (Decides whether an expired claim
     /// is really free.)
-    async fn committed_with(&self, request_id: &str, resource: ResourceId) -> Result<bool, StateUnavailable> {
+    async fn committed_with(
+        &self,
+        request_id: &str,
+        resource: ResourceId,
+    ) -> Result<bool, StateUnavailable> {
         Ok(self
             .get::<RequestRecord>(&request_key(request_id))
             .await?
-            .is_some_and(|(rec, _)| rec.plan.assignments.iter().any(|a| a.resource_id == resource)))
+            .is_some_and(|(rec, _)| {
+                rec.plan
+                    .assignments
+                    .iter()
+                    .any(|a| a.resource_id == resource)
+            }))
     }
 
     /// Claims one resource for `request_id`. `Ok(Some(etag))` = held by us now;
     /// `Ok(None)` = another request holds it.
-    async fn claim(&self, request_id: &str, a: &Assignment) -> Result<Option<String>, StateUnavailable> {
+    async fn claim(
+        &self,
+        request_id: &str,
+        a: &Assignment,
+    ) -> Result<Option<String>, StateUnavailable> {
         let key = claim_key(a.resource_id);
         // A few rounds: the claim can change between our GET and our swap.
         for _ in 0..4 {
@@ -254,9 +317,16 @@ impl S3Store {
             };
             match classify_claim(&existing, request_id, now_ms()) {
                 ClaimView::Held => return Ok(None),
-                ClaimView::Expired if self.committed_with(&existing.request_id, a.resource_id).await? => {
+                ClaimView::Expired
+                    if self
+                        .committed_with(&existing.request_id, a.resource_id)
+                        .await? =>
+                {
                     // Its request did commit with it; the confirm step was lost. Repair it.
-                    let fixed = Claim { confirmed: true, ..existing };
+                    let fixed = Claim {
+                        confirmed: true,
+                        ..existing
+                    };
                     let _ = self.put(&key, &fixed, Cond::IfMatch(&etag)).await;
                     return Ok(None);
                 }
@@ -273,7 +343,9 @@ impl S3Store {
 
     async fn release(&self, held: &[(ResourceId, String)]) {
         join_all(held.iter().map(|(id, etag)| async move {
-            self.delete_if_match(&claim_key(*id), etag).await
+            if let Err(e) = self.delete_if_match(&claim_key(*id), etag).await {
+                tracing::debug!(%e, "release failed; the lease will expire instead");
+            }
         }))
         .await;
     }
@@ -329,12 +401,20 @@ impl SharedState for S3Store {
             Ok(None) => {}
         }
 
+        match self.incident_is_resolved(incident.id).await {
+            Ok(true) => return CommitOutcome::IncidentResolved,
+            Ok(false) => {}
+            Err(e) => return CommitOutcome::StateUnavailable(e),
+        }
+
         // Same rule as the in-memory store: unknown or repeated resource = taken.
         let known: HashSet<ResourceId> = self.known_resources().iter().map(|r| r.id).collect();
         let mut seen = HashSet::new();
         for a in &plan.assignments {
             if !known.contains(&a.resource_id) || !seen.insert(a.resource_id) {
-                return CommitOutcome::ResourceTaken { resource_id: a.resource_id };
+                return CommitOutcome::ResourceTaken {
+                    resource_id: a.resource_id,
+                };
             }
         }
 
@@ -349,7 +429,9 @@ impl SharedState for S3Store {
                 Ok(Some(etag)) => held.push((a.resource_id, etag)),
                 Ok(None) => {
                     self.release(&held).await;
-                    return CommitOutcome::ResourceTaken { resource_id: a.resource_id };
+                    return CommitOutcome::ResourceTaken {
+                        resource_id: a.resource_id,
+                    };
                 }
                 Err(e) => {
                     self.release(&held).await;
@@ -360,7 +442,23 @@ impl SharedState for S3Store {
         if started.elapsed() > self.lease / 2 {
             // Our claims could expire before the record lands; do not risk a double booking.
             self.release(&held).await;
-            return CommitOutcome::StateUnavailable(unavailable("claims took over half the lease; retry"));
+            return CommitOutcome::StateUnavailable(unavailable(
+                "claims took over half the lease; retry",
+            ));
+        }
+
+        // Check again because the incident may have been resolved
+        // while we were acquiring resource claims.
+        match self.incident_is_resolved(incident.id).await {
+            Ok(true) => {
+                self.release(&held).await;
+                return CommitOutcome::IncidentResolved;
+            }
+            Ok(false) => {}
+            Err(e) => {
+                self.release(&held).await;
+                return CommitOutcome::StateUnavailable(e);
+            }
         }
 
         // Step 3: the commit point.
@@ -369,16 +467,24 @@ impl SharedState for S3Store {
         } else {
             IncidentStatus::Assigned
         };
-        let record = RequestRecord { incident, plan: plan.clone() };
-        match self.put(&request_key(request_id), &record, Cond::IfAbsent).await {
+        let record = RequestRecord {
+            incident,
+            plan: plan.clone(),
+        };
+        match self
+            .put(&request_key(request_id), &record, Cond::IfAbsent)
+            .await
+        {
             Ok(Put::Done(_)) => {
                 self.confirm(request_id, &plan, &held).await;
                 CommitOutcome::Committed
             }
             Ok(Put::Lost) => match self.lookup_request(request_id).await {
                 Ok(Some(stored)) => {
-                    let used: HashSet<ResourceId> = stored.assignments.iter().map(|a| a.resource_id).collect();
-                    let (kept, spare): (Vec<_>, Vec<_>) = held.into_iter().partition(|(id, _)| used.contains(id));
+                    let used: HashSet<ResourceId> =
+                        stored.assignments.iter().map(|a| a.resource_id).collect();
+                    let (kept, spare): (Vec<_>, Vec<_>) =
+                        held.into_iter().partition(|(id, _)| used.contains(id));
                     self.release(&spare).await;
                     // Two nodes that both thought they won share the same claims ("Ours"), and
                     // our swap changed their ETag, so the winner's confirm failed. We hold the
@@ -396,7 +502,78 @@ impl SharedState for S3Store {
     }
 
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable> {
-        Ok(self.get::<RequestRecord>(&request_key(request_id)).await?.map(|(rec, _)| rec.plan))
+        Ok(self
+            .get::<RequestRecord>(&request_key(request_id))
+            .await?
+            .map(|(rec, _)| rec.plan))
+    }
+
+    async fn resolve(
+        &self,
+        request_id: &str,
+        incident_id: IncidentId,
+    ) -> Result<(), StateUnavailable> {
+        let record = ResolutionRecord {
+            request_id: request_id.to_string(),
+            incident_id,
+        };
+
+        // First reserve this resolve request ID.
+        // Reusing it for another incident must fail.
+        match self
+            .put(&resolution_key(request_id), &record, Cond::IfAbsent)
+            .await?
+        {
+            Put::Done(_) => {}
+            Put::Lost => {
+                let Some((existing, _)) = self
+                    .get::<ResolutionRecord>(&resolution_key(request_id))
+                    .await?
+                else {
+                    return Err(unavailable("resolve request record disappeared"));
+                };
+
+                if existing.incident_id != incident_id {
+                    return Err(unavailable(
+                        "resolve request_id was already used for another incident",
+                    ));
+                }
+            }
+        }
+
+        // Persist the resolved marker before deleting claims.
+        // This prevents new commits from assigning resources to this incident.
+        match self
+            .put(&resolved_incident_key(incident_id), &record, Cond::IfAbsent)
+            .await?
+        {
+            Put::Done(_) => {}
+            Put::Lost => {
+                let Some((existing, _)) = self
+                    .get::<ResolutionRecord>(&resolved_incident_key(incident_id))
+                    .await?
+                else {
+                    return Err(unavailable("resolved incident marker disappeared"));
+                };
+
+                if existing.incident_id != incident_id {
+                    return Err(unavailable("invalid resolved incident marker"));
+                }
+            }
+        }
+
+        // Release only claims belonging to this incident.
+        for resource in self.known_resources() {
+            let key = claim_key(resource.id);
+
+            if let Some((claim, etag)) = self.get::<Claim>(&key).await? {
+                if claim.assignment.incident_id == incident_id {
+                    self.delete_if_match(&key, &etag).await?;
+                }
+            }
+        }
+
+        Ok(())
     }
 
     /// Rejoin: re-read the resource definitions from the bucket (not the cache), then
@@ -433,6 +610,21 @@ fn request_key(request_id: &str) -> String {
     }
     key
 }
+fn resolution_key(request_id: &str) -> String {
+    let mut key = String::from("resolutions/");
+    for b in request_id.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
+            key.push(b as char);
+        } else {
+            key.push_str(&format!("%{b:02X}"));
+        }
+    }
+    key
+}
+
+fn resolved_incident_key(incident_id: IncidentId) -> String {
+    format!("resolved/{incident_id}")
+}
 
 fn etag_of(resp: &reqwest::Response) -> String {
     resp.headers()
@@ -443,11 +635,16 @@ fn etag_of(resp: &reqwest::Response) -> String {
 }
 
 fn now_ms() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn unavailable(reason: impl Into<String>) -> StateUnavailable {
-    StateUnavailable { reason: reason.into() }
+    StateUnavailable {
+        reason: reason.into(),
+    }
 }
 
 fn transport(e: reqwest::Error) -> StateUnavailable {
@@ -472,7 +669,11 @@ mod tests {
     fn claim(request_id: &str, expires_at_ms: u64, confirmed: bool) -> Claim {
         Claim {
             request_id: request_id.into(),
-            assignment: Assignment { incident_id: 1, resource_id: 1, score: 0.5 },
+            assignment: Assignment {
+                incident_id: 1,
+                resource_id: 1,
+                score: 0.5,
+            },
             expires_at_ms,
             confirmed,
         }
@@ -480,11 +681,26 @@ mod tests {
 
     #[test]
     fn classify_claim_cases() {
-        assert_eq!(classify_claim(&claim("r1", 100, false), "r1", 500), ClaimView::Ours);
-        assert_eq!(classify_claim(&claim("r1", 1000, false), "r2", 500), ClaimView::Held);
-        assert_eq!(classify_claim(&claim("r1", 100, true), "r2", 500), ClaimView::Held);
-        assert_eq!(classify_claim(&claim("r1", 100, false), "r2", 500), ClaimView::Expired);
-        assert_eq!(classify_claim(&claim("r1", 500, false), "r2", 500), ClaimView::Expired);
+        assert_eq!(
+            classify_claim(&claim("r1", 100, false), "r1", 500),
+            ClaimView::Ours
+        );
+        assert_eq!(
+            classify_claim(&claim("r1", 1000, false), "r2", 500),
+            ClaimView::Held
+        );
+        assert_eq!(
+            classify_claim(&claim("r1", 100, true), "r2", 500),
+            ClaimView::Held
+        );
+        assert_eq!(
+            classify_claim(&claim("r1", 100, false), "r2", 500),
+            ClaimView::Expired
+        );
+        assert_eq!(
+            classify_claim(&claim("r1", 500, false), "r2", 500),
+            ClaimView::Expired
+        );
     }
 
     #[test]
@@ -517,7 +733,11 @@ mod tests {
             priority: 1.0,
             assignments: resources
                 .iter()
-                .map(|&resource_id| Assignment { incident_id, resource_id, score: 0.5 })
+                .map(|&resource_id| Assignment {
+                    incident_id,
+                    resource_id,
+                    score: 0.5,
+                })
                 .collect(),
         }
     }
@@ -538,7 +758,8 @@ mod tests {
     fn cfg(bucket: &str, lease_ms: u64) -> SharedStateConfig {
         SharedStateConfig {
             backend: common::config::StateBackend::S3,
-            endpoint: std::env::var("RESCUEMESH_S3").unwrap_or_else(|_| "http://127.0.0.1:8333".into()),
+            endpoint: std::env::var("RESCUEMESH_S3")
+                .unwrap_or_else(|_| "http://127.0.0.1:8333".into()),
             bucket: bucket.into(),
             lease_ms,
             // A quarter of the lease (the config's minimum ratio), at most the 2.5 s default.
@@ -561,25 +782,120 @@ mod tests {
         let c = cfg(&fresh_bucket(tag), lease_ms);
         let mut v = Vec::new();
         for _ in 0..3 {
-            v.push(Arc::new(S3Store::connect(&c, resources(5)).await.expect("is the gateway running?")));
+            v.push(Arc::new(
+                S3Store::connect(&c, resources(5))
+                    .await
+                    .expect("is the gateway running?"),
+            ));
         }
         v
+    }
+    #[tokio::test]
+    #[ignore]
+    async fn resolve_releases_resource_for_another_incident() {
+        let n = three("resolve-reuse", 10_000).await;
+
+        assert_eq!(
+            n[0].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        n[0].resolve("resolve-1", 1).await.unwrap();
+
+        // The resource released by incident 1 can now be assigned to incident 2.
+        assert_eq!(
+            n[1].commit("r2", incident(2), plan(2, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        let snap = n[2].snapshot().await.unwrap();
+        assert_eq!(snap.assignments.len(), 1);
+        assert_eq!(snap.assignments[0].incident_id, 2);
+        assert_eq!(snap.assignments[0].resource_id, 1);
+
+        drop_bucket(&n[0]).await;
     }
 
     #[tokio::test]
     #[ignore]
+    async fn repeated_resolve_does_not_release_another_incidents_resource() {
+        let n = three("resolve-repeat", 10_000).await;
+
+        assert_eq!(
+            n[0].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        n[0].resolve("resolve-1", 1).await.unwrap();
+
+        assert_eq!(
+            n[1].commit("r2", incident(2), plan(2, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        // Repeating the original resolve must not release incident 2's claim.
+        n[2].resolve("resolve-1", 1).await.unwrap();
+
+        let snap = n[0].snapshot().await.unwrap();
+        assert_eq!(snap.assignments.len(), 1);
+        assert_eq!(snap.assignments[0].incident_id, 2);
+        assert_eq!(snap.assignments[0].resource_id, 1);
+
+        drop_bucket(&n[0]).await;
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn three_nodes_can_resolve_the_same_incident_concurrently() {
+        let n = three("resolve-concurrent", 10_000).await;
+
+        assert_eq!(
+            n[0].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
+
+        // All three nodes receive the same resolve request, as in a real client call.
+        let (a, b, c) = tokio::join!(
+            n[0].resolve("resolve-1", 1),
+            n[1].resolve("resolve-1", 1),
+            n[2].resolve("resolve-1", 1),
+        );
+
+        a.unwrap();
+        b.unwrap();
+        c.unwrap();
+
+        let snap = n[0].snapshot().await.unwrap();
+        assert!(snap.assignments.is_empty());
+
+        drop_bucket(&n[0]).await;
+    }
+    #[tokio::test]
+    #[ignore]
     async fn same_request_committed_twice_leaves_one_record() {
         let n = three("dup", 10_000).await;
-        assert_eq!(n[0].commit("r1", incident(1), plan(1, &[1])).await, CommitOutcome::Committed);
+        assert_eq!(
+            n[0].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
         // A retry on another node with a different plan gets the first plan back.
         assert_eq!(
             n[1].commit("r1", incident(1), plan(1, &[2])).await,
             CommitOutcome::AlreadyCommitted(plan(1, &[1]))
         );
-        assert_eq!(n[2].lookup_request("r1").await.unwrap(), Some(plan(1, &[1])));
+        assert_eq!(
+            n[2].lookup_request("r1").await.unwrap(),
+            Some(plan(1, &[1]))
+        );
         // Resource 2 was never held.
         let snap = n[2].snapshot().await.unwrap();
-        assert_eq!(snap.assignments.iter().map(|a| a.resource_id).collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            snap.assignments
+                .iter()
+                .map(|a| a.resource_id)
+                .collect::<Vec<_>>(),
+            vec![1]
+        );
         drop_bucket(&n[0]).await;
     }
 
@@ -594,13 +910,25 @@ mod tests {
                 .map(|i| {
                     let s = n[i].clone();
                     let id = id.clone();
-                    tokio::spawn(async move { s.commit(&id, incident(round), plan(round, &[])).await })
+                    tokio::spawn(
+                        async move { s.commit(&id, incident(round), plan(round, &[])).await },
+                    )
                 })
                 .collect();
-            let outcomes: Vec<_> = join_all(tasks).await.into_iter().map(|r| r.unwrap()).collect();
-            let won = outcomes.iter().filter(|o| **o == CommitOutcome::Committed).count();
+            let outcomes: Vec<_> = join_all(tasks)
+                .await
+                .into_iter()
+                .map(|r| r.unwrap())
+                .collect();
+            let won = outcomes
+                .iter()
+                .filter(|o| **o == CommitOutcome::Committed)
+                .count();
             assert_eq!(won, 1, "round {round}: {outcomes:?}");
-            assert!(outcomes.iter().all(|o| matches!(o, CommitOutcome::Committed | CommitOutcome::AlreadyCommitted(_))));
+            assert!(outcomes.iter().all(|o| matches!(
+                o,
+                CommitOutcome::Committed | CommitOutcome::AlreadyCommitted(_)
+            )));
         }
         drop_bucket(&n[0]).await;
     }
@@ -614,13 +942,28 @@ mod tests {
                 .map(|i| {
                     let s = n[i].clone();
                     tokio::spawn(async move {
-                        s.commit(&format!("res{r}-node{i}"), incident(r * 10 + i as u64), plan(r * 10 + i as u64, &[r])).await
+                        s.commit(
+                            &format!("res{r}-node{i}"),
+                            incident(r * 10 + i as u64),
+                            plan(r * 10 + i as u64, &[r]),
+                        )
+                        .await
                     })
                 })
                 .collect();
-            let outcomes: Vec<_> = join_all(tasks).await.into_iter().map(|x| x.unwrap()).collect();
-            let won = outcomes.iter().filter(|o| **o == CommitOutcome::Committed).count();
-            let taken = outcomes.iter().filter(|o| matches!(o, CommitOutcome::ResourceTaken { .. })).count();
+            let outcomes: Vec<_> = join_all(tasks)
+                .await
+                .into_iter()
+                .map(|x| x.unwrap())
+                .collect();
+            let won = outcomes
+                .iter()
+                .filter(|o| **o == CommitOutcome::Committed)
+                .count();
+            let taken = outcomes
+                .iter()
+                .filter(|o| matches!(o, CommitOutcome::ResourceTaken { .. }))
+                .count();
             assert_eq!((won, taken), (1, 2), "resource {r}: {outcomes:?}");
         }
         assert_eq!(n[0].snapshot().await.unwrap().assignments.len(), 5);
@@ -633,18 +976,32 @@ mod tests {
         // Short lease so the test is quick: 4 x the 1 s timeout is the minimum the config allows.
         let n = three("lease", 4_000).await;
         // A "node that died between claim and commit": claim resource 1, never write the record.
-        let a = Assignment { incident_id: 9, resource_id: 1, score: 0.5 };
+        let a = Assignment {
+            incident_id: 9,
+            resource_id: 1,
+            score: 0.5,
+        };
         assert!(n[0].claim("dead-request", &a).await.unwrap().is_some());
 
         assert_eq!(
             n[1].commit("r-live", incident(1), plan(1, &[1])).await,
             CommitOutcome::ResourceTaken { resource_id: 1 }
         );
-        assert_eq!(n[1].snapshot().await.unwrap().assignments.len(), 1, "held while the lease runs");
+        assert_eq!(
+            n[1].snapshot().await.unwrap().assignments.len(),
+            1,
+            "held while the lease runs"
+        );
 
         tokio::time::sleep(Duration::from_millis(4_200)).await;
-        assert!(n[1].snapshot().await.unwrap().assignments.is_empty(), "expired and never committed: free");
-        assert_eq!(n[1].commit("r-live", incident(1), plan(1, &[1])).await, CommitOutcome::Committed);
+        assert!(
+            n[1].snapshot().await.unwrap().assignments.is_empty(),
+            "expired and never committed: free"
+        );
+        assert_eq!(
+            n[1].commit("r-live", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
         drop_bucket(&n[0]).await;
     }
 
@@ -652,11 +1009,18 @@ mod tests {
     #[ignore]
     async fn retry_of_the_same_request_reuses_its_own_claim_at_once() {
         let n = three("retry", 10_000).await;
-        let a = Assignment { incident_id: 1, resource_id: 1, score: 0.5 };
+        let a = Assignment {
+            incident_id: 1,
+            resource_id: 1,
+            score: 0.5,
+        };
         // Node 0 claimed for r1, then was muted before writing the record.
         assert!(n[0].claim("r1", &a).await.unwrap().is_some());
         // The client's retry lands on node 1, which plans the same resource: no waiting.
-        assert_eq!(n[1].commit("r1", incident(1), plan(1, &[1])).await, CommitOutcome::Committed);
+        assert_eq!(
+            n[1].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
         drop_bucket(&n[0]).await;
     }
 
@@ -664,7 +1028,10 @@ mod tests {
     #[ignore]
     async fn confirmed_claims_never_expire() {
         let n = three("confirm", 4_000).await;
-        assert_eq!(n[0].commit("r1", incident(1), plan(1, &[1])).await, CommitOutcome::Committed);
+        assert_eq!(
+            n[0].commit("r1", incident(1), plan(1, &[1])).await,
+            CommitOutcome::Committed
+        );
         tokio::time::sleep(Duration::from_millis(4_200)).await;
         assert_eq!(
             n[1].commit("r2", incident(2), plan(2, &[1])).await,
@@ -679,7 +1046,10 @@ mod tests {
     async fn unreachable_gateway_is_state_unavailable_not_a_panic() {
         let n = three("down", 10_000).await;
         let broken = S3Store {
-            http: Client::builder().timeout(Duration::from_millis(300)).build().unwrap(),
+            http: Client::builder()
+                .timeout(Duration::from_millis(300))
+                .build()
+                .unwrap(),
             base: "http://127.0.0.1:1/nothing".into(),
             lease: Duration::from_secs(10),
             resources: RwLock::new(resources(5)),
@@ -692,6 +1062,25 @@ mod tests {
         ));
         // And it wrote nothing that the real cluster can see.
         assert!(n[0].lookup_request("r1").await.unwrap().is_none());
+        drop_bucket(&n[0]).await;
+    }
+    #[tokio::test]
+    #[ignore]
+    async fn resolving_unknown_incident_prevents_later_commit() {
+        let n = three("resolve-unknown", 10_000).await;
+
+        // Resolving an incident that does not exist yet should succeed.
+        n[0].resolve("resolve-unknown-1", 999).await.unwrap();
+
+        // A later commit for that incident must be rejected.
+        assert_eq!(
+            n[1].commit("r1", incident(999), plan(999, &[1])).await,
+            CommitOutcome::IncidentResolved
+        );
+
+        let snap = n[2].snapshot().await.unwrap();
+        assert!(snap.assignments.is_empty());
+
         drop_bucket(&n[0]).await;
     }
 }

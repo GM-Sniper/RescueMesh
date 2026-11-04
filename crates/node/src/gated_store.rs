@@ -20,6 +20,7 @@
 //! - **One wrapper for every backend.** It sits in front of `Arc<dyn SharedState>`, so the
 //!   in-memory store and the DFS-backed store get exactly the same rule.
 
+use common::domain::IncidentId;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -68,6 +69,14 @@ impl SharedState for MuteGatedStore {
         self.inner.lookup_request(request_id).await
     }
 
+    async fn resolve(
+        &self,
+        request_id: &str,
+        incident_id: IncidentId,
+    ) -> Result<(), StateUnavailable> {
+        self.check()?;
+        self.inner.resolve(request_id, incident_id).await
+    }
     async fn reload(&self) -> Result<Snapshot, StateUnavailable> {
         self.check()?;
         self.inner.reload().await
@@ -107,7 +116,11 @@ mod tests {
     fn gated() -> (MuteGatedStore, Arc<InMemoryStore>, Arc<MuteSwitch>) {
         let inner = Arc::new(InMemoryStore::with_default_resources());
         let mute = Arc::new(MuteSwitch::default());
-        (MuteGatedStore::new(inner.clone(), mute.clone()), inner, mute)
+        (
+            MuteGatedStore::new(inner.clone(), mute.clone()),
+            inner,
+            mute,
+        )
     }
 
     #[tokio::test]
@@ -134,7 +147,10 @@ mod tests {
         ));
         assert!(store.snapshot().await.is_err());
         assert!(store.lookup_request("r1").await.is_err());
-        assert!(store.reload().await.is_err(), "rejoin must not pass while muted");
+        assert!(
+            store.reload().await.is_err(),
+            "rejoin must not pass while muted"
+        );
         // Nothing reached the backend.
         assert!(inner.lookup_request("r1").await.unwrap().is_none());
     }

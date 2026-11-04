@@ -63,8 +63,8 @@ mod tests {
 
     use async_trait::async_trait;
     use common::config::ClusterConfig;
+    use common::domain::{Incident, IncidentId, Plan, Snapshot};
     use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
-    use common::domain::{Incident, Plan, Snapshot};
 
     use super::*;
     use crate::peers::Peers;
@@ -173,6 +173,13 @@ mod tests {
         }
         async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable> {
             self.inner.lookup_request(request_id).await
+        }
+        async fn resolve(
+            &self,
+            request_id: &str,
+            incident_id: IncidentId,
+        ) -> Result<(), StateUnavailable> {
+            self.inner.resolve(request_id, incident_id).await
         }
     }
 
