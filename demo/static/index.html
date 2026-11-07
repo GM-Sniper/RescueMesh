@@ -15,15 +15,15 @@
     </svg>
     <div>
       <div class="brand-name">RescueMesh <span>Mission Control</span></div>
-      <div class="brand-sub">Cloud-P2P emergency response &middot; CSCE 4411 &middot; Phase 1</div>
+      <div class="brand-sub">CSCE 4411 &middot; Phase 1</div>
     </div>
   </div>
   <nav class="tabs" id="tabs">
     <button data-view="live" class="active">Mission Control</button>
+    <button data-view="run">Demo Run <span class="tab-badge" id="run-badge"></span></button>
     <button data-view="script">Demo Script</button>
     <button data-view="setup">Setup</button>
     <button data-view="console">Consoles</button>
-    <button data-view="results">Lab Results</button>
   </nav>
   <div class="status-area">
     <div class="pill" id="cluster-pill"><span class="dot"></span><span id="cluster-text">connecting</span></div>
@@ -34,47 +34,48 @@
 <main>
 <!-- ===================================================== MISSION CONTROL -->
 <section class="view active" id="v-live">
+  <div class="run-banner hidden" id="run-banner"></div>
   <div class="kpis" id="kpis">
-    <div class="kpi accent-ok"><div class="k-label">Requests answered</div><div class="k-val" id="k-ok">0</div><div class="k-sub" id="k-ok-sub">of 0 sent</div></div>
-    <div class="kpi"><div class="k-label">Throughput</div><div class="k-val"><span id="k-okps">0</span><small> ok/s</small></div><div class="k-sub" id="k-okps-sub">last 5 s</div></div>
-    <div class="kpi"><div class="k-label">Latency p50</div><div class="k-val"><span id="k-p50">-</span><small> ms</small></div><div class="k-sub" id="k-p50-sub">p95 - ms</div></div>
-    <div class="kpi"><div class="k-label">Latency p99</div><div class="k-val"><span id="k-p99">-</span><small> ms</small></div><div class="k-sub" id="k-p99-sub">last 10 s</div></div>
-    <div class="kpi" id="kpi-lost"><div class="k-label">Lost requests</div><div class="k-val" id="k-lost">0</div><div class="k-sub" id="k-rel">reliability -</div></div>
-    <div class="kpi"><div class="k-label">Saved by a retry</div><div class="k-val" id="k-retried">0</div><div class="k-sub" id="k-dup">0 duplicates answered from store</div></div>
-    <div class="kpi"><div class="k-label">Elections</div><div class="k-val" id="k-el">0</div><div class="k-sub" id="k-el-sub">- /s</div></div>
-    <div class="kpi accent-warn"><div class="k-label">Failures survived</div><div class="k-val" id="k-fail">0</div><div class="k-sub" id="k-fail-sub">no failure yet</div></div>
+    <div class="kpi accent-ok"><div class="k-label">Answered</div><div class="k-val" id="k-ok">0</div><div class="k-sub" id="k-ok-sub">of 0 sent</div></div>
+    <div class="kpi"><div class="k-label">Throughput</div><div class="k-val"><span id="k-okps">0</span><small> ok/s</small></div><div class="k-sub" id="k-okps-sub"></div></div>
+    <div class="kpi"><div class="k-label">Latency p50</div><div class="k-val"><span id="k-p50">-</span><small> ms</small></div><div class="k-sub" id="k-p50-sub"></div></div>
+    <div class="kpi"><div class="k-label">Latency p99</div><div class="k-val"><span id="k-p99">-</span><small> ms</small></div><div class="k-sub" id="k-p99-sub"></div></div>
+    <div class="kpi" id="kpi-lost"><div class="k-label">Lost requests</div><div class="k-val" id="k-lost">0</div><div class="k-sub" id="k-rel"></div></div>
+    <div class="kpi"><div class="k-label">Retried</div><div class="k-val" id="k-retried">0</div><div class="k-sub" id="k-dup"></div></div>
+    <div class="kpi"><div class="k-label">Elections</div><div class="k-val" id="k-el">0</div><div class="k-sub" id="k-el-sub"></div></div>
+    <div class="kpi accent-warn"><div class="k-label">Failures</div><div class="k-val" id="k-fail">0</div><div class="k-sub" id="k-fail-sub"></div></div>
   </div>
 
   <div class="grid-live">
     <div class="card topo-card">
       <div class="card-head"><h2>Live mesh</h2><div class="legend">
-        <span><i class="lg req"></i>multicast request</span><span><i class="lg bid"></i>election bids</span>
-        <span><i class="lg plan"></i>plan back to client</span><span><i class="lg hb"></i>heartbeat</span></div></div>
+        <span><i class="lg req"></i>request</span><span><i class="lg bid"></i>bids</span>
+        <span><i class="lg plan"></i>plan</span><span><i class="lg hb"></i>heartbeat</span></div></div>
       <canvas id="topo"></canvas>
     </div>
 
     <div class="card election-card">
       <div class="card-head"><h2>Latest election</h2><span class="muted" id="el-meta"></span></div>
       <div id="el-bids" class="bids"></div>
-      <div class="el-why" id="el-why">Waiting for the first election&hellip;</div>
-      <div class="card-head sub"><h3>Who does the work</h3><span class="muted">share of elections won</span></div>
+      <div class="el-why" id="el-why">No election yet</div>
+      <div class="card-head sub"><h3>Win share</h3></div>
       <div class="share-rows">
-        <div class="share-row"><span>last 30 s</span><div class="sharebar" id="share30"></div></div>
-        <div class="share-row"><span>since reset</span><div class="sharebar" id="shareall"></div></div>
+        <div class="share-row"><span>30 s</span><div class="sharebar" id="share30"></div></div>
+        <div class="share-row"><span>total</span><div class="sharebar" id="shareall"></div></div>
       </div>
       <div class="mini-stats" id="el-stats"></div>
     </div>
 
     <div class="card dock">
-      <div class="card-head"><h2>Controls</h2><button class="btn ghost xs" data-action="reset_stats">Reset counters</button></div>
+      <div class="card-head"><h2>Controls</h2><button class="btn ghost xs" data-action="reset_stats">Reset</button></div>
 
       <div class="dock-sec">
-        <div class="dock-title"><span class="num">1</span>Client load</div>
+        <div class="dock-title"><span class="num">1</span>Load</div>
         <div class="row wrap">
           <label class="chk"><input type="checkbox" class="cl-pick" value="A" checked>A</label>
           <label class="chk"><input type="checkbox" class="cl-pick" value="B" checked>B</label>
           <label class="chk"><input type="checkbox" class="cl-pick" value="C" checked>C</label>
-          <select id="ld-mode"><option value="fixed">steady rate</option><option value="ramp">ramp (stages)</option></select>
+          <select id="ld-mode"><option value="fixed">steady</option><option value="ramp">ramp</option></select>
         </div>
         <div class="row wrap" id="ld-fixed">
           <label class="fld">rate/PC<input id="ld-rate" type="number" min="1" step="1"></label>
@@ -82,7 +83,7 @@
           <label class="fld">requests/PC<input id="ld-req" type="number" min="1" step="1000"></label>
         </div>
         <div class="row wrap hidden" id="ld-ramp">
-          <label class="fld grow">stages (clients/PC)<input id="ld-stages" type="text"></label>
+          <label class="fld grow">stages<input id="ld-stages" type="text"></label>
           <label class="fld">s/stage<input id="ld-ss" type="number" min="5" step="5"></label>
         </div>
         <div class="row">
@@ -93,33 +94,51 @@
       </div>
 
       <div class="dock-sec">
-        <div class="dock-title"><span class="num">2</span>Server failure</div>
-        <div class="row"><label class="fld grow"><span>silent for <b id="mute-secs-v">12</b> s</span><input id="mute-secs" type="range" min="2" max="20" value="12"></label></div>
+        <div class="dock-title"><span class="num">2</span>Failures</div>
+        <div class="row"><label class="fld grow"><span>mute <b id="mute-secs-v">12</b> s</span><input id="mute-secs" type="range" min="2" max="20" value="12"></label></div>
         <div class="row">
           <button class="btn danger node-btn n1" data-action="mute" data-node="1">Mute N1</button>
           <button class="btn danger node-btn n2" data-action="mute" data-node="2">Mute N2</button>
           <button class="btn danger node-btn n3" data-action="mute" data-node="3">Mute N3</button>
         </div>
-        <div class="row"><button class="btn danger wide" data-action="mute_leader">&#9889; Mute the busiest node</button></div>
-        <div class="row auto-row"><span>Automatic injector</span><span class="chip" id="auto-chip">off</span>
+        <div class="row"><button class="btn danger wide" data-action="mute_leader">&#9889; Mute the busiest</button></div>
+        <div class="row">
+          <button class="btn danger node-btn n1" data-action="power_cut" data-node="1">&#128268; Cut N1</button>
+          <button class="btn danger node-btn n2" data-action="power_cut" data-node="2">&#128268; Cut N2</button>
+          <button class="btn danger node-btn n3" data-action="power_cut" data-node="3">&#128268; Cut N3</button>
+        </div>
+        <div class="row">
+          <button class="btn go node-btn n1" data-action="power_on" data-node="1" title="Power on N1">&#9211; N1</button>
+          <button class="btn go node-btn n2" data-action="power_on" data-node="2" title="Power on N2">&#9211; N2</button>
+          <button class="btn go node-btn n3" data-action="power_on" data-node="3" title="Power on N3">&#9211; N3</button>
+        </div>
+        <div class="row auto-row"><span>Auto faults</span><span class="chip" id="auto-chip">off</span>
           <button class="btn ghost xs" id="auto-toggle">turn on</button></div>
       </div>
 
       <div class="dock-sec">
-        <div class="dock-title"><span class="num">3</span>Load imbalance</div>
+        <div class="dock-title"><span class="num">&#9881;</span>Resources</div>
+        <div class="row"><label class="fld grow"><span>count</span><input id="res-count" type="number" min="1" max="100000" value="100"></label></div>
+        <div class="row"><button class="btn warn wide" id="res-apply">Apply (wipes storage)</button></div>
+      </div>
+
+      <div class="dock-sec">
+        <div class="dock-title"><span class="num">3</span>CPU stress</div>
         <div class="row">
           <button class="btn warn node-btn n1 hog" data-node="1">Stress N1</button>
           <button class="btn warn node-btn n2 hog" data-node="2">Stress N2</button>
           <button class="btn warn node-btn n3 hog" data-node="3">Stress N3</button>
         </div>
-        <div class="row"><button class="btn ghost wide" data-action="hog_off">Remove all CPU stress</button></div>
+        <div class="row"><label class="fld grow"><span>cores (0 = all)</span><input id="hog-cores" type="number" min="0" max="64" value="0"></label></div>
+        <div class="row"><button class="btn ghost wide" data-action="hog_off">Remove stress</button></div>
       </div>
 
       <div class="dock-sec">
-        <div class="dock-title"><span class="num">4</span>Correctness</div>
+        <div class="dock-title"><span class="num">4</span>Checks</div>
         <div class="row">
-          <button class="btn info" data-action="dup_test">Duplicate test</button>
-          <button class="btn info" data-action="state_check">State check (3 gateways)</button>
+          <button class="btn info" data-action="dup_test">Duplicate</button>
+          <button class="btn info" data-action="state_check">State</button>
+          <button class="btn ghost" data-action="repair_storage" title="Copy entries a filer missed after a power cut">Repair</button>
         </div>
       </div>
       <div class="last-action" id="last-action"></div>
@@ -127,25 +146,25 @@
   </div>
 
   <div class="grid-charts">
-    <div class="card chart-card wide2"><div class="card-head"><h3>Throughput: answered requests per second, by the node that did the work</h3><div class="legend nodes"></div></div><canvas class="chart" id="c-thr"></canvas></div>
-    <div class="card chart-card wide2"><div class="card-head"><h3>Latency seen by the clients (5 s rolling)</h3><div class="legend"><span><i class="lg" style="background:var(--ok)"></i>p50</span><span><i class="lg" style="background:var(--warn)"></i>p95</span><span><i class="lg" style="background:var(--bad)"></i>p99</span></div></div><canvas class="chart" id="c-lat"></canvas></div>
-    <div class="card chart-card"><div class="card-head"><h3>Election win share (%)</h3></div><canvas class="chart" id="c-share"></canvas></div>
-    <div class="card chart-card"><div class="card-head"><h3>Load score per node (lower wins)</h3></div><canvas class="chart" id="c-load"></canvas></div>
-    <div class="card chart-card"><div class="card-head"><h3>CPU per node PC (%)</h3></div><canvas class="chart" id="c-cpu"></canvas></div>
-    <div class="card chart-card"><div class="card-head"><h3>Elections per second &middot; retries</h3></div><canvas class="chart" id="c-el"></canvas></div>
+    <div class="card chart-card wide2"><div class="card-head"><h3>Throughput by node (ok/s)</h3><div class="legend nodes"></div></div><canvas class="chart" id="c-thr"></canvas></div>
+    <div class="card chart-card wide2"><div class="card-head"><h3>Client latency</h3><div class="legend"><span><i class="lg" style="background:var(--ok)"></i>p50</span><span><i class="lg" style="background:var(--warn)"></i>p95</span><span><i class="lg" style="background:var(--bad)"></i>p99</span></div></div><canvas class="chart" id="c-lat"></canvas></div>
+    <div class="card chart-card"><div class="card-head"><h3>Win share (%)</h3></div><canvas class="chart" id="c-share"></canvas></div>
+    <div class="card chart-card"><div class="card-head"><h3>Load score</h3></div><canvas class="chart" id="c-load"></canvas></div>
+    <div class="card chart-card"><div class="card-head"><h3>CPU (%)</h3></div><canvas class="chart" id="c-cpu"></canvas></div>
+    <div class="card chart-card"><div class="card-head"><h3>Elections/s</h3></div><canvas class="chart" id="c-el"></canvas></div>
   </div>
 
   <div class="grid-bottom">
-    <div class="card"><div class="card-head"><h2>Failures and recovery</h2><span class="muted">detection &middot; silence &middot; recovery &middot; what the clients saw</span></div><div class="fail-list" id="fail-list"><div class="empty">No failure yet. Mute a node to see detection, failover and recovery measured live.</div></div></div>
-    <div class="card"><div class="card-head"><h2>Event timeline</h2></div><div class="timeline" id="timeline"></div></div>
+    <div class="card"><div class="card-head"><h2>Failures</h2></div><div class="fail-list" id="fail-list"><div class="empty">None yet</div></div></div>
+    <div class="card"><div class="card-head"><h2>Timeline</h2></div><div class="timeline" id="timeline"></div></div>
   </div>
 </section>
 
 <!-- ===================================================== DEMO SCRIPT -->
 <section class="view" id="v-script">
   <div class="script-head">
-    <div><h1>Demo script</h1><p class="muted">The Phase 1 demonstration scenarios from the project description, in order. Each act has its buttons, what to say, and checks that tick themselves from the live data.</p></div>
-    <div class="script-progress"><div class="ring" id="script-ring"></div><div><b id="script-done">0</b> of <b id="script-total">0</b> checks passed</div></div>
+    <div><h1>Demo script</h1></div>
+    <div class="script-progress"><div class="ring" id="script-ring"></div><div><b id="script-done">0</b>/<b id="script-total">0</b> checks</div></div>
   </div>
   <div class="acts" id="acts"></div>
 </section>
@@ -154,79 +173,80 @@
 <section class="view" id="v-setup">
   <div class="setup-grid">
     <div class="card">
-      <div class="card-head"><h2>Lab machines</h2><span class="muted">LAN IP is what the nodes use to reach each other; SSH host only if different</span></div>
+      <div class="card-head"><h2>Lab machines</h2></div>
       <table class="mtable" id="mtable">
         <thead><tr><th>Machine</th><th>LAN IP</th><th>SSH host</th><th>SSH user</th><th>Port</th><th>Live link</th></tr></thead>
         <tbody></tbody>
       </table>
-      <div class="hint">This PC must log in to each lab PC <b>without a password</b>: run <code>ssh-keygen</code> once, then <code>ssh-copy-id user@IP</code> for each of the 6 PCs. (A password works only if <code>sshpass</code> is installed.)</div>
+      <div class="hint">Needs passwordless SSH: <code>ssh-copy-id user@IP</code> per PC.</div>
     </div>
 
     <div class="card">
       <div class="card-head"><h2>Settings</h2></div>
       <div class="form-grid">
-        <label class="fld">Default SSH user<input data-s="ssh.user" placeholder="same as this PC"></label>
-        <label class="fld">SSH key file<input data-s="ssh.key" placeholder="~/.ssh/id_ed25519 (optional)"></label>
-        <label class="fld">SSH password (needs sshpass)<input data-s="ssh.password" type="password" placeholder="leave empty with keys"></label>
-        <label class="fld">Project folder on the lab PCs<input data-s="paths.repo"></label>
-        <label class="fld">weed binary (relative to the folder)<input data-s="paths.weed"></label>
-        <label class="fld">SeaweedFS data folder<input data-s="paths.seaweed_dir" placeholder="default ~/rescuemesh-seaweed"></label>
-        <label class="fld">Python on the lab PCs<input data-s="paths.python"></label>
-        <label class="fld">Config file to write<input data-s="paths.config"></label>
+        <label class="fld">SSH user<input data-s="ssh.user" placeholder="default"></label>
+        <label class="fld">SSH key<input data-s="ssh.key" placeholder="optional"></label>
+        <label class="fld">SSH password<input data-s="ssh.password" type="password" placeholder="optional"></label>
+        <label class="fld">Repo folder<input data-s="paths.repo"></label>
+        <label class="fld">weed binary<input data-s="paths.weed"></label>
+        <label class="fld">SeaweedFS data<input data-s="paths.seaweed_dir" placeholder="default"></label>
+        <label class="fld">Python<input data-s="paths.python"></label>
+        <label class="fld">Config file<input data-s="paths.config"></label>
+        <label class="fld">Resources<input data-s="cluster.resource_count" type="number"></label>
         <label class="fld">Node port<input data-s="cluster.node_port" type="number"></label>
         <label class="fld">Run id<input data-s="cluster.run_id"></label>
         <label class="fld">Lease (ms)<input data-s="cluster.lease_ms" type="number"></label>
-        <label class="fld">Gateway timeout (ms)<input data-s="cluster.request_timeout_ms" type="number"></label>
+        <label class="fld">Timeout (ms)<input data-s="cluster.request_timeout_ms" type="number"></label>
       </div>
-      <div class="card-head sub"><h3>Automatic fault injection (P5)</h3></div>
+      <div class="card-head sub"><h3>Auto faults</h3></div>
       <div class="form-grid">
-        <label class="chk big"><input type="checkbox" data-s="cluster.faults_enabled"> enabled at node start</label>
+        <label class="chk big"><input type="checkbox" data-s="cluster.faults_enabled"> enabled</label>
         <label class="fld">seed<input data-s="cluster.faults_seed" type="number"></label>
         <label class="fld">min silence (ms)<input data-s="cluster.faults_min_ms" type="number"></label>
         <label class="fld">max silence (ms)<input data-s="cluster.faults_max_ms" type="number"></label>
         <label class="fld">min gap (ms)<input data-s="cluster.faults_gap_min_ms" type="number"></label>
         <label class="fld">max gap (ms)<input data-s="cluster.faults_gap_max_ms" type="number"></label>
       </div>
-      <div class="card-head sub"><h3>Default load and demo values</h3></div>
+      <div class="card-head sub"><h3>Defaults</h3></div>
       <div class="form-grid">
-        <label class="fld">rate per PC (req/s)<input data-s="load.rate" type="number"></label>
-        <label class="fld">clients per PC<input data-s="load.clients" type="number"></label>
-        <label class="fld">requests per PC<input data-s="load.requests" type="number"></label>
-        <label class="fld">resolve after (ms)<input data-s="load.resolve_after_ms" type="number"></label>
+        <label class="fld">rate/PC<input data-s="load.rate" type="number"></label>
+        <label class="fld">clients/PC<input data-s="load.clients" type="number"></label>
+        <label class="fld">requests/PC<input data-s="load.requests" type="number"></label>
+        <label class="fld">resolve (ms)<input data-s="load.resolve_after_ms" type="number"></label>
         <label class="fld">ramp stages<input data-s="load.stages"></label>
-        <label class="fld">seconds per stage<input data-s="load.stage_secs" type="number"></label>
-        <label class="fld">mute length (s)<input data-s="demo.mute_secs" type="number"></label>
-        <label class="fld">CPU stress length (s)<input data-s="demo.hog_secs" type="number"></label>
+        <label class="fld">s/stage<input data-s="load.stage_secs" type="number"></label>
+        <label class="fld">mute (s)<input data-s="demo.mute_secs" type="number"></label>
+        <label class="fld">stress (s)<input data-s="demo.hog_secs" type="number"></label>
       </div>
       <div class="row end"><span class="muted" id="save-msg"></span><button class="btn go" id="save-settings">Save settings</button></div>
     </div>
 
     <div class="card span2">
-      <div class="card-head"><h2>Bring the system up</h2><span class="muted">in this order, or all at once</span></div>
+      <div class="card-head"><h2>Bring-up</h2></div>
       <div class="pipeline">
-        <div class="pstep"><div class="pnum">1</div><div><b>Check all PCs</b><p>SSH, binaries, Python, weed</p></div><button class="btn ghost" data-action="test">Run</button></div>
-        <div class="pstep"><div class="pnum">2</div><div><b>Push config</b><p>same node list on all 6 PCs</p></div><button class="btn ghost" data-action="push_config">Run</button></div>
-        <div class="pstep"><div class="pnum">3</div><div><b>Start SeaweedFS</b><p>shared state on N1&ndash;N3, ~25 s</p></div><button class="btn ghost" data-action="weed_start">Run</button></div>
-        <div class="pstep"><div class="pnum">4</div><div><b>Start nodes</b><p>3 cloud peers, fresh logs</p></div><button class="btn ghost" data-action="nodes_start">Run</button></div>
+        <div class="pstep"><div class="pnum">1</div><div><b>Check PCs</b></div><button class="btn ghost" data-action="test">Run</button></div>
+        <div class="pstep"><div class="pnum">2</div><div><b>Push config</b></div><button class="btn ghost" data-action="push_config">Run</button></div>
+        <div class="pstep"><div class="pnum">3</div><div><b>Start SeaweedFS</b></div><button class="btn ghost" data-action="weed_start">Run</button></div>
+        <div class="pstep"><div class="pnum">4</div><div><b>Start nodes</b></div><button class="btn ghost" data-action="nodes_start">Run</button></div>
       </div>
       <div class="row wrap big-actions">
-        <label class="chk"><input type="checkbox" id="bring-wipe" checked> wipe the shared storage first</label>
-        <button class="btn go big" data-action="bringup">&#9889; One-click bring-up</button>
-        <button class="btn warn" data-action="full_reset">Full reset (wipe + restart)</button>
+        <label class="chk"><input type="checkbox" id="bring-wipe" checked> wipe storage</label>
+        <button class="btn go big" data-action="bringup">&#9889; Bring-up</button>
+        <button class="btn warn" data-action="full_reset">Full reset</button>
         <button class="btn ghost" data-action="weed_status">SeaweedFS status</button>
         <button class="btn ghost" data-action="nodes_stop">Stop nodes</button>
-        <label class="chk"><input type="checkbox" id="stop-weed"> also stop SeaweedFS</label>
+        <label class="chk"><input type="checkbox" id="stop-weed"> + SeaweedFS</label>
         <button class="btn stop" data-action="stop_all">Stop everything</button>
-        <button class="btn ghost" data-action="collect">Collect logs to this PC</button>
+        <button class="btn ghost" data-action="collect">Collect logs</button>
       </div>
       <div class="row wrap slow">
-        <span class="muted">Slow machine test (restarts one node with extra planner work):</span>
+        <span class="muted">Slow node:</span>
         <select id="slow-node"><option value="1">node 1</option><option value="2" selected>node 2</option><option value="3">node 3</option></select>
         <select id="slow-it"><option value="30000">+10 ms per plan</option><option value="300000">+0.1 s per plan</option><option value="900000" selected>+0.3 s per plan</option></select>
         <button class="btn warn" id="slow-go">Restart slowed</button>
         <button class="btn ghost" id="slow-undo">Restart normal</button>
       </div>
-      <details class="cfg"><summary>Preview the config file that will be pushed</summary><pre id="cfg-preview"></pre></details>
+      <details class="cfg"><summary>Config preview</summary><pre id="cfg-preview"></pre></details>
     </div>
   </div>
 </section>
@@ -234,14 +254,31 @@
 <!-- ===================================================== CONSOLES -->
 <section class="view" id="v-console">
   <div class="console-grid">
-    <div class="card"><div class="card-head"><h2>Actions</h2><span class="muted">every command the panel ran, per PC</span></div><div id="action-list" class="action-list"></div></div>
+    <div class="card"><div class="card-head"><h2>Actions</h2></div><div id="action-list" class="action-list"></div></div>
     <div class="card"><div class="card-head"><h2>Live logs</h2><div class="seg" id="log-pick"></div></div><pre class="term" id="term"></pre></div>
   </div>
 </section>
 
-<!-- ===================================================== RESULTS -->
-<section class="view" id="v-results">
-  <div class="results" id="results"></div>
+<!-- ===================================================== DEMO RUN -->
+<section class="view" id="v-run">
+  <div class="script-head">
+    <div><h1>Demo run</h1></div>
+    <div class="script-progress"><div class="ring" id="run-ring"></div><div><b id="run-passed">0</b>/<b id="run-total">0</b> passed<div class="muted" id="run-status">not run yet</div></div></div>
+  </div>
+  <div class="card run-controls">
+    <div class="row wrap">
+      <label class="fld">rate/PC<input id="run-rate" type="number" min="1" step="1" value="20"></label>
+      <label class="fld">clients/PC<input id="run-clients" type="number" min="1" step="1" value="4"></label>
+      <button class="btn ghost xs" id="run-all">all</button>
+      <button class="btn ghost xs" id="run-none">none</button>
+      <span class="muted" id="run-est"></span>
+      <span class="grow"></span>
+      <button class="btn go big" id="run-go">&#9654; Run</button>
+      <button class="btn stop" id="run-stop">&#9632; Stop</button>
+    </div>
+    <div class="run-phase" id="run-phase"></div>
+  </div>
+  <div class="run-tests" id="run-tests"></div>
 </section>
 </main>
 

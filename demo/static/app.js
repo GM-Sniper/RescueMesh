@@ -46,7 +46,7 @@ function showView(v) {
   $$("#tabs button").forEach(b => b.classList.toggle("active", b.dataset.view === v));
   $$(".view").forEach(x => x.classList.toggle("active", x.id === "v-" + v));
   if (S.snap) render(S.snap);
-  if (v === "results") drawResults();
+  if (v === "run") renderRun(S.snap);
   window.dispatchEvent(new Event("resize"));
 }
 
@@ -58,6 +58,7 @@ const CONFIRM = {
   nodes_stop: "Stop the 3 nodes?",
   apply_faults: "This restarts the 3 nodes (a few seconds of downtime) with the new setting. Continue?",
   node_restart: "This restarts that node. Continue?",
+  power_cut: "POWER CUT: this kill -9s the node AND its SeaweedFS storage on that PC. Continue?",
 };
 
 function loadParams(btn) {
@@ -106,7 +107,7 @@ document.addEventListener("click", e => {
     const n = +h.dataset.node;
     const m = S.snap && nodes(S.snap).find(x => x.id === n);
     const on = m && m.proc && m.proc.hogs > 0;
-    runAction(on ? "hog_off" : "hog_on", { node: n }, h);
+    runAction(on ? "hog_off" : "hog_on", { node: n, cores: +$("#hog-cores").value || 0 }, h);
     return;
   }
   const v = e.target.closest("[data-goto]");
@@ -116,6 +117,15 @@ document.addEventListener("click", e => {
 $("#auto-toggle").addEventListener("click", e => runAction("apply_faults", { enabled: !(S.snap && S.snap.faults_enabled) }, e.target));
 $("#slow-go").addEventListener("click", e => runAction("node_restart", { node: +$("#slow-node").value, iterations: +$("#slow-it").value }, e.target));
 $("#slow-undo").addEventListener("click", e => runAction("node_restart", { node: +$("#slow-node").value, iterations: 0 }, e.target));
+$("#res-apply").addEventListener("click", async e => {
+  const n = Math.max(1, +$("#res-count").value || 0);
+  if (!confirm("Start with " + n + " resources? This DELETES all shared storage and restarts the 3 nodes.")) return;
+  try {
+    const s = JSON.parse(JSON.stringify(S.settings)); s.cluster.resource_count = n;
+    await api("/api/settings", s); S.settings = s;
+    runAction("full_reset", {}, e.target);
+  } catch (err) { toast("Could not apply", err.message, "fail"); }
+});
 $("#mute-secs").addEventListener("input", e => { $("#mute-secs-v").textContent = e.target.value; });
 $("#ld-mode").addEventListener("change", () => {
   const ramp = $("#ld-mode").value === "ramp";
@@ -326,8 +336,8 @@ const Topo = {
     g.save(); g.strokeStyle = "rgba(96,165,250,0.18)"; g.setLineDash([2, 6]); g.lineWidth = 1.2;
     g.beginPath(); g.ellipse(w * 0.665, h * 0.5, w * 0.28, h * 0.43, 0, 0, 7); g.stroke(); g.restore();
     g.fillStyle = "rgba(139,155,184,0.55)"; g.font = "600 11px Inter, Segoe UI, sans-serif"; g.textAlign = "center";
-    g.textAlign = "right"; g.fillText("CLOUD  ·  3 peers + replicated SeaweedFS state", w - 12, 16);
-    g.textAlign = "left"; g.fillText("CLIENT PCs  ·  simulated users", 12, 16);
+    g.textAlign = "right"; g.fillText("CLOUD", w - 12, 16);
+    g.textAlign = "left"; g.fillText("CLIENTS", 12, 16);
     // client -> node links
     for (const cl of cls) for (const m of ns) {
       const a = this.pos[cl.name], b = this.pos[m.id]; if (!a || !b) continue;
@@ -417,21 +427,19 @@ const Topo = {
       const mt = m.metrics || {}, pr = m.proc || {};
       const ly = p.y + R + 26;
       g.font = "12px ui-monospace, Consolas, monospace"; g.fillStyle = "#c9d5ea";
-      g.fillText(`${share != null ? share.toFixed(0) + "% of work" : "-"}  ·  load ${mt.load != null ? mt.load.toFixed(3) : "-"}`, p.x, ly);
-      g.fillStyle = "#8b9bb8";
-      g.fillText(`CPU ${m.sys ? m.sys.cpu.toFixed(0) : "-"}%  ·  queue ${mt.queue != null ? mt.queue : "-"}  ·  ${pr.node_rss ? pr.node_rss.toFixed(0) + " MB" : "-"}`, p.x, ly + 15);
+      g.fillText(`${share != null ? share.toFixed(0) + "%  ·  " : ""}CPU ${m.sys ? m.sys.cpu.toFixed(0) : "-"}%`, p.x, ly);
       const weedOk = pr.weed && pr.weed.s3 && pr.weed.filer && pr.weed.volume && pr.weed.master;
       g.fillStyle = weedOk ? OK : (pr.weed && (pr.weed.s3 || pr.weed.master)) ? WARN : "#5b6b88";
-      g.fillText(`● SeaweedFS ${weedOk ? "replica up" : pr.weed ? "partial" : "-"}`, p.x, ly + 30);
+      g.fillText(`● storage${weedOk ? "" : pr.weed ? " partial" : " -"}`, p.x, ly + 15);
       g.fillStyle = "#5b6b88"; g.font = "11px ui-monospace, Consolas, monospace"; g.fillText(m.ip || "", p.x, p.y - R - 16);
     }
     if (!cls.some(c => c.state === "running") && ns.some(m => ELIGIBLE.has(m.state))) {
       g.fillStyle = "rgba(139,155,184,0.6)"; g.font = "600 13px Inter, Segoe UI, sans-serif"; g.textAlign = "center";
-      g.fillText("Cluster idle: press ▶ Start load to send incidents", w * 0.5, h * 0.96);
+      g.fillText("idle", w * 0.5, h * 0.96);
     }
     if (!ns.length || ns.every(m => m.state === "offline")) {
       g.fillStyle = "rgba(139,155,184,0.8)"; g.font = "600 14px Inter, Segoe UI, sans-serif"; g.textAlign = "center";
-      g.fillText("No live link to the node PCs yet: fill in the IPs on the Setup page", w * 0.5, h * 0.96);
+      g.fillText("not connected: see Setup", w * 0.5, h * 0.96);
     }
   },
 };
@@ -448,30 +456,36 @@ function renderHeader(snap) {
   pill.className = "pill";
   if (ns.every(m => m.state === "offline")) { txt.textContent = "not connected"; }
   else if (muted.length) { pill.classList.add("warn"); txt.textContent = `node ${muted.map(m => m.id).join(", ")} silent · service continues`; }
+  else if (up === 3 && ns.some(m => m.weed_down && m.weed_down.length)) {
+    // All 3 nodes run, but part of the shared storage on a node PC is down (it is restarted
+    // automatically; a node keeps working through another PC's filer meanwhile).
+    pill.classList.add("warn");
+    txt.textContent = "3/3 peers up · storage: " + ns.filter(m => m.weed_down && m.weed_down.length).map(m => `N${m.id} ${m.weed_down.join("+")} down`).join(", ");
+  }
   else if (up === 3) { pill.classList.add("ok"); txt.textContent = "3/3 cloud peers up"; }
   else { pill.classList.add("bad"); txt.textContent = `${up}/3 cloud peers up`; }
 }
 
 function renderKpis(snap) {
   const k = snap.kpi;
-  const ok = $("#k-ok"); ok.textContent = fmtInt(k.ok); $("#k-ok-sub").textContent = `of ${fmtInt(k.requests)} sent · ${k.unassigned ? fmtInt(k.unassigned) + " found no free resource" : "all got a plan"}`;
+  const ok = $("#k-ok"); ok.textContent = fmtInt(k.ok); $("#k-ok-sub").textContent = `of ${fmtInt(k.requests)}${k.unassigned ? " · " + fmtInt(k.unassigned) + " no resource" : ""}`;
   $("#k-okps").textContent = k.okps.toFixed(k.okps < 10 ? 1 : 0);
   const pcs = Object.entries(k.per_client || {}).map(([n, c]) => `${n} ${fmtInt(c)}`).join(" · ");
-  $("#k-okps-sub").textContent = pcs || "last 5 s";
+  $("#k-okps-sub").textContent = pcs;
   $("#k-p50").textContent = k.p50 == null ? "-" : k.p50.toFixed(1);
-  $("#k-p50-sub").textContent = `p95 ${k.p95 == null ? "-" : k.p95.toFixed(0)} ms · overall ${k.p50_all == null ? "-" : k.p50_all.toFixed(1)}`;
+  $("#k-p50-sub").textContent = k.p95 == null ? "" : `p95 ${k.p95.toFixed(0)} ms`;
   $("#k-p99").textContent = k.p99 == null ? "-" : k.p99.toFixed(0);
-  $("#k-p99-sub").textContent = `last 10 s · overall ${k.p99_all == null ? "-" : k.p99_all.toFixed(0)} ms`;
+  $("#k-p99-sub").textContent = "";
   const lost = $("#k-lost"); lost.textContent = fmtInt(k.lost); bump(lost, k.lost);
   $("#kpi-lost").className = "kpi " + (k.requests ? (k.lost ? "some" : "zero") : "");
-  $("#k-rel").textContent = k.reliability == null ? "reliability -" : `reliability ${k.reliability.toFixed(k.reliability === 100 ? 0 : 3)}%`;
+  $("#k-rel").textContent = k.reliability == null ? "" : `${k.reliability.toFixed(k.reliability === 100 ? 0 : 3)}% ok`;
   $("#k-retried").textContent = fmtInt(k.retried);
-  $("#k-dup").textContent = `${fmtInt(k.dup)} duplicate${k.dup === 1 ? "" : "s"} answered from the store`;
+  $("#k-dup").textContent = k.dup ? `${fmtInt(k.dup)} duplicate${k.dup === 1 ? "" : "s"}` : "";
   $("#k-el").textContent = fmtInt(k.elections);
-  $("#k-el-sub").textContent = `${k.elps} /s · p50 ${k.el_p50 == null ? "-" : k.el_p50.toFixed(2)} ms`;
+  $("#k-el-sub").textContent = k.elps ? `${k.elps}/s` : "";
   const f = $("#k-fail"); f.textContent = fmtInt(k.failures); bump(f, k.failures);
   const lf = snap.failures[snap.failures.length - 1];
-  $("#k-fail-sub").textContent = lf ? (lf.detect != null ? `last detected in ${fmtS(lf.detect)}` : "detecting…") : "no failure yet";
+  $("#k-fail-sub").textContent = lf ? (lf.detect != null ? `detected in ${fmtS(lf.detect)}` : "detecting…") : "";
 }
 
 function parseBids(s) { const o = {}; (s || "").split(";").forEach(x => { const [a, b] = x.split(":"); if (a && b) o[+a] = +b; }); return o; }
@@ -488,10 +502,10 @@ function renderElection(snap) {
         <span class="score">${win ? '<span class="crown">ELECTED </span>' : ""}${has ? b[i].toFixed(4) : "no bid"}</span></div>`;
     }).join("");
     const sc = b[e.winner];
-    $("#el-why").innerHTML = `<b style="color:${NODE_COL[e.winner]}">Node ${e.winner}</b> won with the lowest load score${sc != null ? " (" + sc.toFixed(4) + ")" : ""}. Score = 0.5·queue + 0.3·CPU + 0.2·service time; every node computes the same winner from the same bids.` +
-      (Object.keys(b).length < 3 ? ` <span style="color:${BAD}">A node did not bid: it is silent, so the others decided without it.</span>` : "") +
-      (e.round > 0 ? ` <span style="color:${WARN}">Re-election (round ${e.round}): the first winner went down.</span>` : "");
-    $("#el-meta").textContent = `request ${String(e.req).slice(0, 8)}… · ${(e.dur_us / 1000).toFixed(2)} ms · seen by N${e.seen_by}`;
+    $("#el-why").innerHTML = `<b style="color:${NODE_COL[e.winner]}">N${e.winner}</b> won (lowest score)` +
+      (Object.keys(b).length < 3 ? ` · <span style="color:${BAD}">a silent node did not bid</span>` : "") +
+      (e.round > 0 ? ` · <span style="color:${WARN}">re-election ${e.round}</span>` : "");
+    $("#el-meta").textContent = `${(e.dur_us / 1000).toFixed(2)} ms`;
   }
   const bar = (el, sh) => {
     el.innerHTML = [1, 2, 3].map(i => { const v = sh[i] || 0; return `<i style="width:${v}%;background:${NODE_COL[i]}">${v >= 8 ? v.toFixed(0) + "%" : ""}</i>`; }).join("");
@@ -500,10 +514,9 @@ function renderElection(snap) {
   const k = snap.kpi, sa = [1, 2, 3].map(i => k.share_all[i] || 0), ss = sum(sa), sq = sa.reduce((a, x) => a + x * x, 0);
   const jain = sq ? (ss * ss) / (3 * sq) : null;
   $("#el-stats").innerHTML = [
-    ["elections / s", k.elps], ["election p50 / p99", `${k.el_p50 == null ? "-" : k.el_p50.toFixed(2)} / ${k.el_p99 == null ? "-" : k.el_p99.toFixed(0)} ms`],
-    ["waited for a silent peer", `${k.waited_pct}%`], ["split views, all resolved", fmtInt(k.split)],
-    ["state: snapshot / commit", `${k.snap_ms == null ? "-" : k.snap_ms} / ${k.commit_ms == null ? "-" : k.commit_ms} ms`],
-    ["fairness (Jain, 1 = even)", jain == null ? "-" : jain.toFixed(3)],
+    ["election p50", `${k.el_p50 == null ? "-" : k.el_p50.toFixed(2)} ms`],
+    ["snapshot / commit", `${k.snap_ms == null ? "-" : k.snap_ms} / ${k.commit_ms == null ? "-" : k.commit_ms} ms`],
+    ["fairness", jain == null ? "-" : jain.toFixed(3)],
   ].map(([a, b]) => `<div><span>${a}</span><b>${b}</b></div>`).join("");
 }
 
@@ -523,18 +536,16 @@ function renderFailures(snap) {
   if (!snap.failures.length) return;
   const now = snap.now;
   list.innerHTML = snap.failures.slice().reverse().map(f => {
-    const kind = { manual: "manual mute", auto: "automatic fault", down: "process down" }[f.kind] || f.kind;
+    const kind = { manual: "mute", auto: "auto", down: "down" }[f.kind] || f.kind;
     const silent = f.end ? f.end - f.start : now - f.start;
     const prog = f.open && f.planned ? Math.min(100, 100 * (now - f.start) / f.planned) : 0;
     const chip = f.open ? `<span class="chip fail">${f.end ? "rejoining" : "silent"}</span>` : `<span class="chip ok">recovered</span>`;
     return `<div class="fcard ${f.open ? "open" : ""}">
       <div class="fh"><b style="color:${NODE_COL[f.node]}">Node ${f.node}</b><span class="muted">${kind} · ${hhmmss(f.start)}</span>${chip}</div>
-      <div class="frow"><span>detected by a peer after</span><b>${f.detect == null ? (f.kind === "down" ? "stopped, not muted" : "…") : fmtS(f.detect)}${f.detected_by ? " (N" + f.detected_by + ")" : ""}</b></div>
-      <div class="frow"><span>silent for</span><b>${fmtS(silent)}${f.planned ? " of " + fmtS(f.planned) : ""}</b></div>
-      <div class="frow"><span>caught up and ready again</span><b>${f.recovery == null ? "…" : "+" + fmtS(f.recovery)}</b></div>
-      <div class="frow"><span>requests answered meanwhile</span><b style="color:${OK}">${fmtInt(f.during_ok)}</b></div>
-      <div class="frow"><span>lost · saved by a retry</span><b style="color:${f.during_lost ? BAD : OK}">${fmtInt(f.during_lost)} · ${fmtInt(f.during_retried)}</b></div>
-      <div class="frow"><span>slowest request meanwhile</span><b>${fmtMs(f.during_max_ms, 0)}</b></div>
+      <div class="frow"><span>detected</span><b>${f.detect == null ? (f.kind === "down" ? "-" : "…") : fmtS(f.detect)}</b></div>
+      <div class="frow"><span>down for</span><b>${fmtS(silent)}</b></div>
+      <div class="frow"><span>ready again</span><b>${f.recovery == null ? "…" : "+" + fmtS(f.recovery)}</b></div>
+      <div class="frow"><span>ok · lost · retried</span><b style="color:${f.during_lost ? BAD : OK}">${fmtInt(f.during_ok)} · ${fmtInt(f.during_lost)} · ${fmtInt(f.during_retried)}</b></div>
       ${f.open ? `<div class="prog" style="width:${prog}%"></div>` : ""}
     </div>`;
   }).join("");
@@ -542,7 +553,7 @@ function renderFailures(snap) {
 
 function renderTimeline(snap) {
   const tl = $("#timeline");
-  tl.innerHTML = snap.timeline.slice().reverse().map(e => `<div class="ev ${e.kind}"><time>${hhmmss(e.t)}</time><i></i><span>${esc(e.text)}</span></div>`).join("") || '<div class="empty">Nothing yet.</div>';
+  tl.innerHTML = snap.timeline.slice().reverse().map(e => `<div class="ev ${e.kind}"><time>${hhmmss(e.t)}</time><i></i><span>${esc(e.text)}</span></div>`).join("") || '<div class="empty">-</div>';
 }
 
 /* ======================================================================= setup */
@@ -550,7 +561,7 @@ async function loadSettings() {
   S.settings = await api("/api/settings");
   const tb = $("#mtable tbody");
   tb.innerHTML = S.settings.machines.map((m, i) => `<tr>
-    <td>${esc(m.label)}<span class="role">${m.role === "node" ? "cloud node " + m.id : "client PC " + m.name}</span></td>
+    <td>${esc(m.label)}</td>
     <td><input data-m="${i}.ip" value="${esc(m.ip)}" placeholder="10.x.x.x"></td>
     <td><input data-m="${i}.ssh_host" value="${esc(m.ssh_host)}" placeholder="same as IP"></td>
     <td><input data-m="${i}.user" value="${esc(m.user)}" placeholder="default"></td>
@@ -565,6 +576,7 @@ async function loadSettings() {
     $("#ld-rate").value = L.rate; $("#ld-clients").value = L.clients; $("#ld-req").value = L.requests;
     $("#ld-stages").value = L.stages; $("#ld-ss").value = L.stage_secs;
     $("#mute-secs").value = S.settings.demo.mute_secs; $("#mute-secs-v").textContent = S.settings.demo.mute_secs;
+    $("#res-count").value = S.settings.cluster.resource_count || 100;
     S.loadFormInit = true;
   }
 }
@@ -629,7 +641,7 @@ function lastAction(snap, name) { const a = snap.actions.filter(x => x.name === 
 function nodeById(snap, id) { return nodes(snap).find(m => m.id === id); }
 
 const ACTS = [
-  { title: "The cloud at a glance", goal: "Scenario: normal cloud operation. Three cloud peers, three client PCs, replicated shared state.",
+  { title: "The cloud at a glance", goal: "3 cloud peers, 3 client PCs, replicated state.",
     say: "Three lab PCs are the cloud: each runs a RescueMesh node and a SeaweedFS replica. The other three PCs simulate many campus users. Every incident is multicast to all three peers.",
     show: "the Live mesh: blue dots are requests going to all 3 nodes, green dots are the plans coming back.",
     buttons: `<button class="btn go" data-action="load_start">▶ Start steady load</button><button class="btn ghost" data-goto="live">Open Mission Control</button>`,
@@ -638,7 +650,7 @@ const ACTS = [
       ["shared storage (S3 gateway) up on all 3 node PCs", s => { const n = nodes(s).filter(m => m.proc && m.proc.weed && m.proc.weed.s3).length; return [n === 3, n + "/3"]; }],
       ["client PCs are sending incidents", s => { const n = clientsOf(s).filter(c => c.state === "running").length; return [n >= 1, n + "/3"]; }],
     ] },
-  { title: "Election and transparency", goal: "Different cloud peers are elected as load conditions change; the client never picks a server.",
+  { title: "Election and transparency", goal: "Peers are elected by load; clients never pick a server.",
     say: "For every request the three peers exchange bids with their load score, and the lowest score does the work. The client just multicasts and takes the first plan: it never knows or cares which server answered.",
     show: "Latest election (the three bids, the winner), the win-share bars, and the latency KPIs.",
     buttons: "",
@@ -647,7 +659,7 @@ const ACTS = [
       ["requests answered fast (p50 under 50 ms)", s => [s.kpi.p50 != null && s.kpi.p50 < 50, fmtMs(s.kpi.p50)]],
       ["hundreds of elections decided", s => [s.kpi.elections >= 300, fmtInt(s.kpi.elections)]],
     ] },
-  { title: "Load imbalance", goal: "Artificially increase the load on one server; the election must move work away from it.",
+  { title: "Load imbalance", goal: "Stress one server: work moves away from it.",
     say: "We now make one server's machine busy. Its CPU goes up, so its load score rises, its bids lose, and the other two peers take its share. Nothing in the clients changes.",
     show: "the Load score and Win share charts: the stressed node's line jumps up and its share drops.",
     buttons: `<button class="btn warn hog" data-node="1">Stress N1</button><button class="btn warn hog" data-node="2">Stress N2</button><button class="btn warn hog" data-node="3">Stress N3</button><button class="btn ghost" data-action="hog_off">Remove stress</button>`,
@@ -656,7 +668,7 @@ const ACTS = [
       ["its load score is the highest of the three", s => { const m = nodes(s).find(x => x.proc && x.proc.hogs > 0); if (!m || !m.metrics) return [false, "-"]; const mx = Math.max(...nodes(s).map(x => (x.metrics || {}).load || 0)); return [m.metrics.load >= mx, m.metrics.load.toFixed(3)]; }],
       ["its share of the work fell below 15% (last 30 s)", s => { const m = nodes(s).find(x => x.proc && x.proc.hogs > 0); if (!m) return [false, "-"]; const v = s.kpi.share30[m.id]; return [v != null && v < 15, v == null ? "-" : v.toFixed(0) + "%"]; }],
     ] },
-  { title: "Server failure", goal: "Force the elected server to become nonresponsive during active workload; service must continue.",
+  { title: "Server failure", goal: "Silence the elected server under load: service continues.",
     say: "Now the busiest server stops answering anything, like a crash. Its peers notice the missing heartbeats in about a second and a half, requests that were in flight are retried by the client with the same request id, and a live peer answers them.",
     show: "the red node with its countdown, the KPI 'Lost requests' staying at 0, and the failure card filling in.",
     buttons: `<button class="btn danger" data-action="mute_leader">⚡ Mute the busiest node</button><button class="btn danger" data-action="mute" data-node="1">Mute N1</button><button class="btn danger" data-action="mute" data-node="2">Mute N2</button><button class="btn danger" data-action="mute" data-node="3">Mute N3</button>`,
@@ -665,7 +677,7 @@ const ACTS = [
       ["its peers detected it in under 2 s", s => { const f = s.failures.filter(x => x.detect != null && x.kind !== "down").pop(); return [!!f && f.detect < 2000, f ? fmtS(f.detect) : "-"]; }],
       ["0 requests lost while it was silent", s => { const f = s.failures.filter(x => !x.open && x.kind !== "down").pop(); return [!!f && f.during_lost === 0 && f.during_ok > 0, f ? `${fmtInt(f.during_ok)} ok, ${f.during_lost} lost` : "-"]; }],
     ] },
-  { title: "Server recovery", goal: "Bring the failed server back and show state reconstruction before it takes part again.",
+  { title: "Server recovery", goal: "The server catches up before it bids again.",
     say: "The silent node comes back on its own. Before it bids again it checks it is current with the shared state (our rejoin rule), and only then does it start winning elections again.",
     show: "the 'caught up and ready again' line in the failure card, and the node's share coming back in the Win share chart.",
     buttons: "",
@@ -673,7 +685,7 @@ const ACTS = [
       ["it rejoined and caught up (READY)", s => { const f = s.failures.filter(x => x.recovery != null && x.kind !== "down").pop(); return [!!f, f ? "+" + fmtS(f.recovery) : "-"]; }],
       ["it does work again (share above 5%)", s => { const f = s.failures.filter(x => x.recovery != null && x.kind !== "down").pop(); if (!f) return [false, "-"]; const v = s.kpi.share30[f.node]; return [v != null && v > 5, v == null ? "-" : v.toFixed(0) + "%"]; }],
     ] },
-  { title: "Automatic fault injection", goal: "The servers themselves periodically elect one machine to ignore communication (up to 20 s), as the project asks.",
+  { title: "Automatic fault injection", goal: "The servers silence one of themselves (up to 20 s).",
     say: "Until now we chose the victim. In the real setting the three servers run their own election with random scores, the winner goes silent for a random time up to 20 seconds, then rejoins. We leave it on and the service keeps going.",
     show: "the 'Automatic injector' chip, the failure cards marked 'automatic fault', and the Lost KPI.",
     buttons: `<button class="btn danger" id="act-auto-on">Turn automatic faults ON</button><button class="btn ghost" id="act-auto-off">Turn OFF</button>`,
@@ -682,18 +694,18 @@ const ACTS = [
       ["an automatic fault happened", s => { const n = s.failures.filter(x => x.kind === "auto").length; return [n > 0, n + ""]; }],
       ["service continued with 0 lost requests", s => [s.kpi.requests > 0 && s.kpi.lost === 0 && s.failures.length > 0, fmtInt(s.kpi.lost) + " lost"]],
     ] },
-  { title: "Correctness: no double work, one shared truth", goal: "Duplicates are harmless (idempotent request ids) and all peers see the same state.",
+  { title: "Correctness: no double work, one shared truth", goal: "Duplicates are harmless; all peers see the same state.",
     say: "A client resends a request with the same id: the system returns the stored plan instead of planning twice. Then we read the shared state through each node PC's own gateway: all three see exactly the same resources, claims and requests.",
     show: "the toast and the Consoles tab with the output of both checks.",
-    buttons: `<button class="btn stop" data-action="load_stop">■ Stop load first</button><button class="btn info" data-action="dup_test">Duplicate test</button><button class="btn info" data-action="state_check">State check</button><button class="btn ghost" data-goto="console">Show output</button>`,
+    buttons: `<button class="btn stop" data-action="load_stop">■ Stop load first</button><button class="btn info" data-action="dup_test">Duplicate test</button><button class="btn info" data-action="state_check">State check</button><button class="btn ghost" data-action="repair_storage">Repair storage</button><button class="btn ghost" data-goto="console">Show output</button>`,
     checks: [
       ["duplicate request answered from the store", s => { const a = lastAction(s, "dup_test"); return [!!a && a.status === "ok", a ? a.status : "-"]; }],
       ["all 3 gateways agree on the state", s => { const a = lastAction(s, "state_check"); return [!!a && a.status === "ok", a ? a.status : "-"]; }],
     ] },
-  { title: "Scale and the measured results", goal: "Large automated experiments: latency, throughput, election overhead, failure recovery.",
-    say: "Live we can only run a few minutes, so here is a short ramp, and then the full lab measurements: half a million requests with 147 injected failures and not a single lost request.",
-    show: "the Throughput and Latency charts during the ramp, then the Lab Results tab.",
-    buttons: `<button class="btn go" data-action="load_start" data-mode="ramp">▶ Start a ramp</button><button class="btn ghost" data-goto="results">Open Lab Results</button>`,
+  { title: "Scale", goal: "Throughput and latency as the load grows.",
+    say: "Live we can only run a few minutes, so here is a short ramp: the number of clients doubles in stages while we watch throughput and latency.",
+    show: "the Throughput and Latency charts during the ramp. The Demo Run tab runs this and every other scenario automatically.",
+    buttons: `<button class="btn go" data-action="load_start" data-mode="ramp">▶ Start a ramp</button><button class="btn ghost" data-goto="run">Open Demo Run</button>`,
     checks: [
       ["a client ramp was run", s => [S.rampStarted, S.rampStarted ? "yes" : "-"]],
       ["over 1,000 requests answered live", s => [s.kpi.ok >= 1000, fmtInt(s.kpi.ok)]],
@@ -702,7 +714,7 @@ const ACTS = [
 
 function buildActs() {
   $("#acts").innerHTML = ACTS.map((a, i) => `<div class="card act" id="act-${i}"><div class="anum">${i + 1}</div><div>
-    <h3>${esc(a.title)}</h3><div class="goal">${esc(a.goal)}</div><div class="say">${esc(a.say)}</div><div class="show">${esc(a.show)}</div>
+    <h3>${esc(a.title)}</h3><div class="goal">${esc(a.goal)}</div><div class="say">${esc(a.say)}</div>
     <div class="row wrap">${a.buttons}</div><ul class="checks">${a.checks.map((c, j) => `<li id="chk-${i}-${j}">${esc(c[0])}<span class="val"></span></li>`).join("")}</ul></div></div>`).join("");
   $("#act-auto-on").addEventListener("click", e => runAction("apply_faults", { enabled: true }, e.target));
   $("#act-auto-off").addEventListener("click", e => runAction("apply_faults", { enabled: false }, e.target));
@@ -732,67 +744,97 @@ function renderScript(snap) {
   $("#script-ring").innerHTML = `<span style="background:#0b1220;border-radius:50%;width:42px;height:42px;display:grid;place-items:center">${Math.round(p * 100)}%</span>`;
 }
 
-/* ======================================================================= lab results (measured, Nov 4-5) */
-const LAB = {
-  ramp: { clients: [6, 12, 24, 48, 96], okps: [163, 167, 172, 175, 175], p50: [13.8, 16.0, 17.9, 21.9, 30.8], p95: [26.5, 36.2, 1056.6, 2058.1, 2103.2],
-          p99: [1031.5, 2051.7, 2067.6, 4062.8, 4112.4], taken: [17.0, 23.1, 34.0, 43.9, 55.5] },
-  pool: { clients: [6, 12, 24, 48, 96], okps: [193, 234, 301, 363, 485], assigned: [25.1, 20.6, 16.5, 13.9, 10.5] },
-  windows: { label: ["0-10", "10-20", "20-30", "30-40", "40-50", "50-60", "60-70", "70-80"], p50: [13.8, 14.0, 14.0, 13.9, 14.0, 13.9, 14.0, 14.0],
-             p95: [25.5, 28.4, 31.1, 28.6, 28.1, 26.0, 28.8, 30.8], p99: [322.1, 322.0, 324.6, 323.5, 322.2, 320.6, 323.8, 323.7], rps: [105, 105, 105, 105, 105, 105, 105, 98.4] },
-};
-let resultsDrawn = false;
-function drawResults() {
-  const R = $("#results");
-  if (!resultsDrawn) {
-    R.innerHTML = `
-    <div class="hero">
-      <div class="card intro"><h1>Measured in the lab</h1><p>6 lab PCs (3 cloud nodes with SeaweedFS, 3 client PCs), 100 resources, Nov 4&ndash;5. The long run kept P5's automatic fault injector on the whole time.</p></div>
-      <div class="big-num ok"><div class="l">requests answered</div><div class="v">500,001</div><div class="s">of 500,001 &middot; 79.4 min at 105 req/s</div></div>
-      <div class="big-num ok"><div class="l">lost</div><div class="v">0</div><div class="s">100% reliability; 1,362 saved by a retry</div></div>
-      <div class="big-num"><div class="l">latency p50 / p95 / p99</div><div class="v">14 <small style="font-size:16px;color:#8b9bb8">/ 28 / 322 ms</small></div><div class="s">p99.9 2.05 s (one client timeout + retry)</div></div>
-      <div class="big-num"><div class="l">failures survived</div><div class="v">147</div><div class="s">a node was silent 35% of the run</div></div>
-    </div>
-    <div class="card span2"><div class="card-head"><h2>Latency as clients increase (Run 4, 100 resources)</h2><div class="legend"><span><i class="lg" style="background:#34d399"></i>p50</span><span><i class="lg" style="background:#fb923c"></i>p95</span><span><i class="lg" style="background:#f87171"></i>p99</span></div></div><canvas class="chart" id="r-ramp" style="height:230px"></canvas>
-      <table class="rtable"><tr><th>clients (total)</th>${LAB.ramp.clients.map(c => `<th>${c}</th>`).join("")}</tr>
-      <tr><td>answered / s</td>${LAB.ramp.okps.map(v => `<td>${v}</td>`).join("")}</tr>
-      <tr><td>p50 ms</td>${LAB.ramp.p50.map(v => `<td>${v}</td>`).join("")}</tr>
-      <tr><td>p95 ms</td>${LAB.ramp.p95.map(v => `<td>${v}</td>`).join("")}</tr>
-      <tr><td>p99 ms</td>${LAB.ramp.p99.map(v => `<td>${v}</td>`).join("")}</tr>
-      <tr><td>commit collisions</td>${LAB.ramp.taken.map(v => `<td>${v}%</td>`).join("")}</tr></table>
-      <div class="note">Saturation at ~170 answered/s: 100 resources with 0.5 s missions can be handed out about 200 times a second, and extra clients only collide on the few free ones (17% &rarr; 56% collisions).</div></div>
-    <div class="card span2"><div class="card-head"><h2>When every resource is busy (Run 5, 50 resources)</h2></div><canvas class="chart" id="r-pool" style="height:230px"></canvas>
-      <div class="note">Answers keep scaling to 485/s because "no free resource" replies are cheap, while resources handed out stay at ~50/s (50 resources / 1 s missions). The nodes are not the bottleneck: the resource pool is.</div></div>
-    <div class="card span2"><div class="card-head"><h2>500K run: stable for 80 minutes</h2></div><canvas class="chart" id="r-win" style="height:210px"></canvas>
-      <div class="note">p50 and p99 per 10-minute window. The p99 of ~320 ms is one bid timeout: while a node is silent, elections wait 300 ms for its bid.</div></div>
-    <div class="card"><div class="card-head"><h2>Failover and recovery (147 mutes)</h2></div>
-      <table class="rtable"><tr><th>measure</th><th>value</th></tr>
-      <tr><td>detection (missed heartbeats)</td><td>mean 1.33 s, p95 1.52 s</td></tr>
-      <tr><td>reroute (first plan without it)</td><td>0.33 s</td></tr>
-      <tr><td>failover (caught requests)</td><td>median 2.04 s</td></tr>
-      <tr><td>recovery (ready again)</td><td>mean 0.15 s, max 0.29 s</td></tr>
-      <tr><td>p50 / p95 no failure</td><td>13.7 / 20 ms</td></tr>
-      <tr><td>p50 / p95 one node down</td><td>15.2 / 318 ms</td></tr></table></div>
-    <div class="card"><div class="card-head"><h2>Elections and state</h2></div>
-      <table class="rtable"><tr><th>measure</th><th>value</th></tr>
-      <tr><td>elections</td><td>500,020</td></tr>
-      <tr><td>duration p50 / p99</td><td>0.41 / 300.7 ms</td></tr>
-      <tr><td>bid messages / election</td><td>5.30 (6 max)</td></tr>
-      <tr><td>split views, all resolved</td><td>309</td></tr>
-      <tr><td>win share N1 / N2 / N3</td><td>21.8 / 46.2 / 32.0%</td></tr>
-      <tr><td>snapshot / commit p50</td><td>3&ndash;6 / ~8 ms</td></tr>
-      <tr><td>commit collisions</td><td>~3%</td></tr></table>
-      <div class="note">Uneven on purpose: node 1's PC had the highest CPU and slowest storage, so its bids lost more often.</div></div>`;
-    resultsDrawn = true;
-    R._charts = {
-      ramp: new Chart($("#r-ramp"), { labels: LAB.ramp.clients.map(c => c + " cl"), log: true, logMin: 10, unit: "ms", points: true }),
-      pool: new Chart($("#r-pool"), { labels: LAB.pool.clients.map(c => c + " cl"), points: true }),
-      win: new Chart($("#r-win"), { labels: LAB.windows.label.map(l => l + "m"), log: true, logMin: 10, unit: "ms", points: true }),
-    };
+/* ======================================================================= demo run
+   The server runs the tests (DemoRun in server.py) so a run survives closing the page; this
+   only shows snap.demo and sends run / stop. */
+const RUNSEL_KEY = "rm-demo-run-selection";
+function loadSel() { try { return JSON.parse(localStorage.getItem(RUNSEL_KEY) || "null"); } catch (e) { return null; } }
+function saveSel() { try { localStorage.setItem(RUNSEL_KEY, JSON.stringify(selectedTests())); } catch (e) { /* private window */ } }
+function selectedTests() { return $$(".rt-pick").filter(c => c.checked).map(c => c.value); }
+function fmtDur(s) { s = Math.max(0, Math.round(s)); return s >= 60 ? Math.floor(s / 60) + " min " + String(s % 60).padStart(2, "0") + " s" : s + " s"; }
+function runLeft(d) { return d && d.until ? (d.until - S.snap.now - (Date.now() - S.snapAt)) / 1000 : null; }
+const RUN_CHIP = { pending: ["", "waiting"], running: ["run", "running"], pass: ["ok", "PASS"], fail: ["fail", "FAIL"], skipped: ["", "skipped"], stopped: ["", "stopped"] };
+
+function buildRun(tests) {
+  const box = $("#run-tests");
+  if (box.dataset.ready || !tests) return;
+  box.dataset.ready = "1";
+  const sel = loadSel();
+  box.innerHTML = tests.map((t, i) => `<div class="card rtest" id="rt-${t.id}">
+    <div class="rt-head"><label class="chk"><input type="checkbox" class="rt-pick" value="${t.id}" ${!sel || sel.includes(t.id) ? "checked" : ""}></label>
+      <span class="anum">${i + 1}</span><div class="rt-title"><h3>${esc(t.title)}</h3><div class="goal">${esc(t.goal)}</div></div>
+      <span class="muted rt-est">~${fmtDur(t.secs)}</span><span class="chip rt-chip hidden"></span>
+      <button class="btn ghost xs rt-one" data-test="${t.id}">Run</button></div>
+    <ul class="checks rt-checks"></ul><div class="rt-note"></div></div>`).join("");
+  $$(".rt-pick").forEach(c => c.addEventListener("change", () => { saveSel(); runEstimate(); }));
+  $$(".rt-one").forEach(b => b.addEventListener("click", () => startRun([b.dataset.test], b)));
+  runEstimate();
+}
+function runEstimate() {
+  const tests = (S.snap && S.snap.demo_tests) || [], sel = new Set(selectedTests());
+  const secs = tests.filter(t => sel.has(t.id)).reduce((n, t) => n + t.secs, 0);
+  $("#run-est").textContent = sel.size ? `~${fmtDur(secs)}` : "";
+}
+async function startRun(tests, btn) {
+  if (!tests.length) { toast("Nothing to run", "Select at least one test.", "fail"); return; }
+  const cut = tests.includes("powercut") ? " It also power-cuts one node PC and brings it back." : "";
+  if (!confirm(`Run ${tests.length} test${tests.length === 1 ? "" : "s"}? The panel starts and stops load, stresses, mutes and restarts nodes by itself.${cut}`)) return;
+  await runAction("demo_run", { tests, rate: +$("#run-rate").value || 20, clients: +$("#run-clients").value || 4 }, btn);
+  showView("live");
+}
+$("#run-go").addEventListener("click", e => startRun(selectedTests(), e.target));
+$("#run-stop").addEventListener("click", e => runAction("demo_stop", {}, e.target));
+$("#run-all").addEventListener("click", () => { $$(".rt-pick").forEach(c => c.checked = true); saveSel(); runEstimate(); });
+$("#run-none").addEventListener("click", () => { $$(".rt-pick").forEach(c => c.checked = false); saveSel(); runEstimate(); });
+document.addEventListener("click", e => {
+  if (e.target.closest("#rb-stop")) runAction("demo_stop", {}, e.target);
+  if (e.target.closest("#rb-close")) { S.bannerClosed = S.snap && S.snap.demo && S.snap.demo.id; $("#run-banner").classList.add("hidden"); }
+});
+
+function renderRun(snap) {
+  if (!snap) return;
+  buildRun(snap.demo_tests);
+  const d = snap.demo, running = !!d && d.status === "running";
+  const byId = {}; if (d) d.tests.forEach(t => byId[t.id] = t);
+  // the tab badge and the Mission Control banner are drawn on every snapshot
+  const done = d ? d.tests.filter(t => t.status === "pass").length : 0, total = d ? d.tests.length : 0;
+  const badge = $("#run-badge");
+  badge.textContent = running ? `${d.current + 1}/${total}` : d ? `${done}/${total}` : "";
+  badge.className = "tab-badge " + (running ? "run" : d ? (d.status === "ok" ? "ok" : "fail") : "");
+  renderBanner(snap, d, running, done, total);
+  if (S.view !== "run") return;
+  $("#run-go").disabled = running; $("#run-stop").disabled = !running;
+  $$(".rt-one").forEach(b => b.disabled = running);
+  $("#run-total").textContent = total || selectedTests().length; $("#run-passed").textContent = done;
+  const p = total ? done / total : 0;
+  $("#run-ring").style.background = `conic-gradient(${OK} ${p * 360}deg, rgba(255,255,255,0.07) 0)`;
+  $("#run-ring").innerHTML = `<span style="background:#0b1220;border-radius:50%;width:42px;height:42px;display:grid;place-items:center">${Math.round(p * 100)}%</span>`;
+  $("#run-status").textContent = !d ? "" : running ? fmtDur((snap.now - d.started) / 1000) : `${hhmmss(d.started)} · ${fmtDur((d.ended - d.started) / 1000)}`;
+  const left = runLeft(d);
+  $("#run-phase").innerHTML = running ? `<span class="chip run">now</span> ${esc(d.phase)}${left != null && left > 0 ? ` <b>${fmtDur(left)}</b>` : ""}` : "";
+  for (const t of snap.demo_tests || []) {
+    const card = $("#rt-" + t.id); if (!card) continue;
+    const r = byId[t.id], st = r ? r.status : null;
+    const [cls, label] = st ? RUN_CHIP[st] : ["", "-"];
+    const chip = $(".rt-chip", card); chip.className = "chip rt-chip " + cls + (st ? "" : " hidden"); chip.textContent = label;
+    card.classList.toggle("done", st === "pass"); card.classList.toggle("failed", st === "fail"); card.classList.toggle("active", st === "running");
+    $(".rt-checks", card).innerHTML = r ? r.checks.map(c => `<li class="${c.pass == null ? "info" : c.pass ? "pass" : "bad"}">${esc(c.label)}<span class="val">${esc(c.value)}</span></li>`).join("") +
+      (st === "running" ? `<li class="wait">${esc(d.phase)}${left != null && left > 0 ? " · " + fmtDur(left) : ""}</li>` : "") : "";
+    $(".rt-note", card).textContent = r && r.note ? "Error: " + r.note : "";
   }
-  const C = R._charts, idx = LAB.ramp.clients;
-  C.ramp.set(idx, [{ label: "p50", color: OK, data: LAB.ramp.p50 }, { label: "p95", color: WARN, data: LAB.ramp.p95 }, { label: "p99", color: BAD, data: LAB.ramp.p99 }]);
-  C.pool.set(idx, [{ label: "ok/s", color: INFO, data: LAB.pool.okps, fill: true }, { label: "assigned/s", color: OK, data: LAB.pool.okps.map((v, i) => Math.round(v * LAB.pool.assigned[i] / 100)) }]);
-  C.win.set(LAB.windows.label, [{ label: "p50", color: OK, data: LAB.windows.p50 }, { label: "p95", color: WARN, data: LAB.windows.p95 }, { label: "p99", color: BAD, data: LAB.windows.p99 }]);
+}
+
+function renderBanner(snap, d, running, done, total) {
+  const b = $("#run-banner");
+  const recent = d && !running && snap.now - d.ended < 15 * 60 * 1000 && S.bannerClosed !== d.id;
+  if (!d || !(running || recent)) { b.classList.add("hidden"); return; }
+  b.classList.remove("hidden");
+  b.className = "run-banner " + (running ? "running" : d.status === "ok" ? "ok" : "fail");
+  const dots = d.tests.map((t, i) => `<i class="rd ${t.status}" title="${esc(t.title)}: ${t.status}">${i + 1}</i>`).join("");
+  const cur = d.tests[d.current] || {}, left = runLeft(d);
+  b.innerHTML = running
+    ? `<b>DEMO RUN</b><span class="rb-test">${d.current + 1}/${total} ${esc(cur.title || "")}</span><span class="rb-phase">${esc(d.phase)}${left != null && left > 0 ? ` <b>${fmtDur(left)}</b>` : ""}</span><span class="rb-dots">${dots}</span><button class="btn stop xs" id="rb-stop">Stop</button>`
+    : `<b>DEMO RUN</b><span class="rb-test">${done}/${total} passed</span><span class="rb-dots">${dots}</span><button class="btn ghost xs" data-goto="run">results</button><button class="btn ghost xs" id="rb-close">&times;</button>`;
 }
 
 /* ======================================================================= main loop */
@@ -804,6 +846,7 @@ function render(snap) {
   else renderScript(snap); // keeps sticky checks up to date in the background
   if (S.view === "setup") renderSetup(snap);
   if (S.view === "console") renderConsoles(snap);
+  renderRun(snap);
 }
 
 function onSnap(snap) {
@@ -825,7 +868,7 @@ function connect() {
 }
 
 setInterval(() => { $("#clock").textContent = new Date().toTimeString().slice(0, 8); }, 500);
-window.addEventListener("resize", () => { if (S.snap && S.view === "live") renderCharts(S.snap); if (S.view === "results") drawResults(); });
+window.addEventListener("resize", () => { if (S.snap && S.view === "live") renderCharts(S.snap); });
 buildActs();
 loadSettings().catch(e => toast("Could not load settings", e.message, "fail"));
 connect();

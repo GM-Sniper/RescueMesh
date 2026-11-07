@@ -7,7 +7,7 @@ default-run = "loadgen"          # `cargo run -p loadgen` runs the load generato
 [dependencies]
 client = { path = "../client" }  # ClientMiddleware: sends one request and times it (P6, Sun)
 common = { path = "../common" }  # P2's generate_incident and incident_to_pb
-tokio.workspace = true           # runs many fake clients at once, and the rate timer
+tokio = { workspace = true, features = ["signal", "sync"] }  # many fake clients at once, the rate timer; signal + sync: a clean stop that still resolves every assigned incident
 clap.workspace = true            # reads --clients --requests --seed --rate from the command line
 anyhow.workspace = true          # simple error handling in main
 serde.workspace = true           # experiment runner: reads the experiment config file into a struct

@@ -41,6 +41,10 @@ pub fn target_addr(
 /// A muted node hangs instead of answering, so without a limit the client would wait forever.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Most quick retries of one request after the winner answered "aborted" (contention), on top
+/// of the normal attempts. Each waits 25 ms to 0.8 s (growing), so 8 of them add at most ~4 s.
+pub const MAX_QUICK_RETRIES: u32 = 8;
+
 /// When to give up on an attempt and retry (Step B). Final values: P1's design log.
 #[derive(Debug, Clone, Copy)] // lets us print and copy it
 pub struct RetryPolicy {
@@ -198,14 +202,18 @@ impl ClientMiddleware {
         let mut no_plan_replies = 0; // losers' replies seen so far, all attempts together
         let mut silent = false; // a node gave no answer in the last attempt: decides Timeout vs Error
         let mut last_error = String::from("no node returned a plan"); // why it failed, if it does
+        let mut quick_retries = 0u32; // retries after an explicit "aborted" (see below)
+        let mut attempt = 0u32;
 
-        for attempt in 1..=self.policy.attempts {
+        while attempt < self.policy.attempts {
+            attempt += 1;
             if attempt > 1 {
                 // A short random pause (0-50 ms), so many clients retrying together don't all hit the nodes at once.
                 let pause_ms = Uuid::new_v4().as_bytes()[0] as u64 % 51; // a random byte; avoids a new dependency
                 tokio::time::sleep(Duration::from_millis(pause_ms)).await;
             }
             silent = false; // only the last attempt decides the final status
+            let mut contended = false; // the winner said "aborted: resources kept changing, retry"
             let deadline = tokio::time::Instant::now() + self.policy.attempt_timeout; // one deadline for the whole attempt
             let mut calls = self.send_to_all(&message, deadline); // every node at once, so nobody waits on the slowest
             while let Some(joined) = calls.join_next().await {
@@ -221,6 +229,7 @@ impl ClientMiddleware {
                     }
                     // This node (or the network to it) answered with a gRPC error.
                     Ok(Err(status)) => {
+                        contended |= status.code() == tonic::Code::Aborted;
                         last_error =
                             format!("node {node_id}: {:?}: {}", status.code(), status.message())
                     }
@@ -249,11 +258,24 @@ impl ClientMiddleware {
                             plan: Some(plan),
                             duplicate: reply.duplicate,
                             error: None,
-                            attempts: attempt,
+                            attempts: attempt + quick_retries,
                             no_plan_replies,
                         };
                     }
                 }
+            }
+            // The winner is alive and answered "aborted": other requests kept taking the
+            // resources it planned with (contention under load). Waiting out the 2 s deadline
+            // would gain nothing, so retry after a short random pause, growing 25-50, 50-100,
+            // ... up to 400-800 ms, so clients that collided do not collide again. These quick
+            // retries do not use up the normal attempts: up to MAX_QUICK_RETRIES of them.
+            if contended && quick_retries < MAX_QUICK_RETRIES {
+                let base_ms = 25u64 << quick_retries.min(4);
+                let jitter_ms = Uuid::new_v4().as_bytes()[0] as u64 * base_ms / 255;
+                quick_retries += 1;
+                attempt -= 1; // same attempt again
+                tokio::time::sleep(Duration::from_millis(base_ms + jitter_ms)).await;
+                continue;
             }
             // No plan in this attempt. Wait out its deadline before retrying, even if every node
             // already answered: if the winner just died, the others still call it alive for up to
@@ -270,7 +292,7 @@ impl ClientMiddleware {
         };
         let mut outcome =
             SubmitOutcome::failed(request_id, micros_since(start), status, last_error);
-        outcome.attempts = self.policy.attempts;
+        outcome.attempts = self.policy.attempts + quick_retries;
         outcome.no_plan_replies = no_plan_replies;
         outcome
     }

@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 common = { path = "../common" }
 tonic.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }  # sync: the semaphore that caps parallel calls to the S3 gateway
 clap.workspace = true
 anyhow.workspace = true
 sysinfo.workspace = true

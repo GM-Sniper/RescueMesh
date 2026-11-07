@@ -115,7 +115,15 @@ pub struct S3Store {
     lease: Duration,
     /// Resources are fixed definitions: read at connect and on `reload()`, never per request.
     resources: RwLock<Vec<Resource>>,
+    /// Caps the HTTP calls in flight to the gateway. A snapshot reads every claim in parallel
+    /// (one GET per resource), so 100 resources x a dozen requests at once meant ~1200
+    /// sockets: past the default limit of 1024 open files ("Too many open files", Nov 7).
+    /// Calls beyond the cap wait for a free slot; reused keep-alive connections stay below it.
+    inflight: tokio::sync::Semaphore,
 }
+
+/// Most HTTP calls one node has open to its gateway at once (see `S3Store::inflight`).
+const MAX_INFLIGHT_CALLS: usize = 128;
 
 impl S3Store {
     /// Connects, creates the bucket if needed, writes the starting resources if nobody has
@@ -127,6 +135,9 @@ impl S3Store {
     ) -> Result<Self, StateUnavailable> {
         let http = Client::builder()
             .timeout(Duration::from_millis(cfg.request_timeout_ms))
+            // Keep as many idle connections as calls may run at once, so busy periods reuse
+            // them instead of opening (and closing) new sockets for every burst.
+            .pool_max_idle_per_host(MAX_INFLIGHT_CALLS)
             // The gateway is on the lab LAN. A system HTTP proxy (HTTP_PROXY) would send these
             // calls somewhere else, or nowhere, so proxies are always off here.
             .no_proxy()
@@ -137,6 +148,7 @@ impl S3Store {
             base: format!("{}/{}", cfg.endpoint.trim_end_matches('/'), cfg.bucket),
             lease: Duration::from_millis(cfg.lease_ms),
             resources: RwLock::new(Vec::new()),
+            inflight: tokio::sync::Semaphore::new(MAX_INFLIGHT_CALLS),
         };
         let mut last = None;
         for _ in 0..20 {
@@ -153,7 +165,10 @@ impl S3Store {
     }
 
     async fn init(&self, starting: &[Resource]) -> Result<(), StateUnavailable> {
-        let resp = self.http.put(&self.base).send().await.map_err(transport)?;
+        let resp = {
+            let _slot = self.inflight.acquire().await.expect("the semaphore is never closed");
+            self.http.put(&self.base).send().await.map_err(transport)?
+        };
         // 409 = BucketAlreadyOwnedByYou: another node (or an earlier start) made it.
         if !(resp.status().is_success() || resp.status() == StatusCode::CONFLICT) {
             return Err(unavailable(format!(
@@ -210,6 +225,7 @@ impl S3Store {
         &self,
         key: &str,
     ) -> Result<Option<(T, String)>, StateUnavailable> {
+        let _slot = self.inflight.acquire().await.expect("the semaphore is never closed");
         let resp = self
             .http
             .get(self.url(key))
@@ -235,6 +251,7 @@ impl S3Store {
         body: &T,
         cond: Cond<'_>,
     ) -> Result<Put, StateUnavailable> {
+        let _slot = self.inflight.acquire().await.expect("the semaphore is never closed");
         let body =
             serde_json::to_vec(body).map_err(|e| unavailable(format!("encode {key}: {e}")))?;
         let req = self.http.put(self.url(key)).body(body);
@@ -253,6 +270,13 @@ impl S3Store {
     /// DELETE only if the object is still the version we wrote. Best effort: a failure just
     /// leaves the claim to expire.
     async fn delete_if_match(&self, key: &str, etag: &str) -> Result<(), StateUnavailable> {
+        self.try_delete_if_match(key, etag).await.map(|_| ())
+    }
+
+    /// Like `delete_if_match`, but says whether the object is gone (`true`: deleted, or not
+    /// there) or changed under us (`false`: 412, someone wrote a newer version first).
+    async fn try_delete_if_match(&self, key: &str, etag: &str) -> Result<bool, StateUnavailable> {
+        let _slot = self.inflight.acquire().await.expect("the semaphore is never closed");
         let resp = self
             .http
             .delete(self.url(key))
@@ -262,11 +286,128 @@ impl S3Store {
             .map_err(transport)?;
 
         match resp.status() {
-            StatusCode::NOT_FOUND => Ok(()),
-            s if s.is_success() => Ok(()),
-            StatusCode::PRECONDITION_FAILED => Ok(()),
+            StatusCode::NOT_FOUND => Ok(true),
+            s if s.is_success() => Ok(true),
+            StatusCode::PRECONDITION_FAILED => Ok(false),
             s => Err(unavailable(format!("DELETE {key}: HTTP {s}"))),
         }
+    }
+
+    /// Deletes `claims/<resource>` if it belongs to `incident_id`, re-reading it if it changes
+    /// between our read and our delete. That happens when a commit confirms the claim at that
+    /// moment (the confirm is a new version, so the old ETag no longer matches); treating the
+    /// 412 as done would leave a confirmed claim for a resolved incident, held for good.
+    async fn release_claim_of(
+        &self,
+        resource: ResourceId,
+        incident_id: IncidentId,
+    ) -> Result<(), StateUnavailable> {
+        let key = claim_key(resource);
+        for _ in 0..5 {
+            let Some((claim, etag)) = self.get::<Claim>(&key).await? else {
+                return Ok(());
+            };
+            if claim.assignment.incident_id != incident_id {
+                return Ok(());
+            }
+            if self.try_delete_if_match(&key, &etag).await? {
+                return Ok(());
+            }
+        }
+        Err(unavailable(format!("{key} kept changing while releasing it")))
+    }
+
+    /// Housekeeping, run every few seconds by every node (see main.rs): gives
+    /// back the resources of claims whose incident is already resolved, and removes claims
+    /// abandoned by a node that died before committing (lease over, request never saved). Normally `resolve`
+    /// deletes them itself; this catches the ones a crash, a lost reply or a straggling
+    /// commit left behind, which would otherwise be held for good (a confirmed claim never
+    /// expires). Returns how many claims it released.
+    pub async fn sweep_claims(&self) -> Result<usize, StateUnavailable> {
+        let now = now_ms();
+        let reads = self.claimed_resource_ids().await?.into_iter().map(|id| async move {
+            let key = claim_key(id);
+            let Some((claim, etag)) = self.get::<Claim>(&key).await? else {
+                return Ok::<_, StateUnavailable>(false);
+            };
+            let incident = claim.assignment.incident_id;
+            if self.incident_is_resolved(incident).await? {
+                self.release_claim_of(id, incident).await?;
+                tracing::info!(resource = id, incident, "sweeper: released a claim of a resolved incident");
+                return Ok(true);
+            }
+            // An unconfirmed claim whose lease ran out. The snapshot counts every claim as
+            // taken (see `snapshot`), so an abandoned one must be removed here, by the same
+            // rule `claim()` uses to take one over.
+            if !claim.confirmed && now >= claim.expires_at_ms {
+                if self.committed_with(&claim.request_id, id).await? {
+                    // Its request did commit with it; the confirm step was lost. Repair it.
+                    let fixed = Claim { confirmed: true, ..claim };
+                    let _ = self.put(&key, &fixed, Cond::IfMatch(&etag)).await;
+                    return Ok(false);
+                }
+                if self.try_delete_if_match(&key, &etag).await? {
+                    tracing::info!(resource = id, incident, "sweeper: freed an abandoned claim (lease over, never committed)");
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        });
+        let mut released = 0;
+        for r in join_all(reads).await {
+            if r? {
+                released += 1;
+            }
+        }
+        Ok(released)
+    }
+
+    /// The known resources that have a claim object right now, from ONE listing of `claims/`
+    /// (keys only) instead of one GET per resource.
+    ///
+    /// Why (Nov 7 lab): snapshot, resolve and the sweeper each used to GET `claims/<id>` for
+    /// every resource, almost all of them "404, no claim". With 500 resources that was ~1000
+    /// gateway calls per incident; the S3 gateway used ~13 of 24 cores on every node PC and
+    /// throughput fell as the resource count rose. Now the cost follows the number of claims
+    /// actually held (the incidents in progress), not the number of resources.
+    ///
+    /// Safe to be a moment stale: a claim created right after the listing is still caught by
+    /// `commit` (its claim is create-if-absent, so a taken resource returns `ResourceTaken`
+    /// and the node plans again), and a claim a resolve misses this way is freed by the
+    /// commit's own resolved check or by the sweeper.
+    async fn claimed_resource_ids(&self) -> Result<Vec<ResourceId>, StateUnavailable> {
+        let mut ids = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut url = format!("{}?list-type=2&prefix=claims%2F&max-keys=1000", self.base);
+            if let Some(t) = &token {
+                url.push_str("&continuation-token=");
+                url.push_str(&percent_encode(t));
+            }
+            let body = {
+                let _slot = self.inflight.acquire().await.expect("the semaphore is never closed");
+                let resp = self.http.get(&url).send().await.map_err(transport)?;
+                if !resp.status().is_success() {
+                    return Err(unavailable(format!("LIST claims/: HTTP {}", resp.status())));
+                }
+                resp.text().await.map_err(transport)?
+            };
+            for key in xml_values(&body, "Key") {
+                if let Some(id) = key.strip_prefix("claims/").and_then(|s| s.parse().ok()) {
+                    ids.push(id);
+                }
+            }
+            let truncated = xml_values(&body, "IsTruncated").first().is_some_and(|v| v == "true");
+            match xml_values(&body, "NextContinuationToken").into_iter().next() {
+                Some(t) if truncated => token = Some(t),
+                _ => break,
+            }
+        }
+        let known: HashSet<ResourceId> = self.known_resources().iter().map(|r| r.id).collect();
+        ids.retain(|id| known.contains(id));
+        ids.sort_unstable();
+        ids.dedup();
+        Ok(ids)
     }
 
     // ---- claims ---------------------------------------------------------------------------
@@ -318,10 +459,15 @@ impl S3Store {
             match classify_claim(&existing, request_id, now_ms()) {
                 ClaimView::Held => return Ok(None),
                 ClaimView::Expired
-                    if self
-                        .committed_with(&existing.request_id, a.resource_id)
-                        .await? =>
+                    if !self
+                        .incident_is_resolved(existing.assignment.incident_id)
+                        .await?
+                        && self
+                            .committed_with(&existing.request_id, a.resource_id)
+                            .await? =>
                 {
+                    // (A resolved incident's claim is free even if its request committed: it
+                    // falls through to the takeover below instead of being confirmed for good.)
                     // Its request did commit with it; the confirm step was lost. Repair it.
                     let fixed = Claim {
                         confirmed: true,
@@ -368,25 +514,26 @@ impl SharedState for S3Store {
     /// Resources from the cache, assignments from the live claims. `incidents` is left empty:
     /// the planner does not read it, and listing every request on every snapshot would make
     /// each request slower than the last. The consistency check reads `requests/` directly.
+    ///
+    /// Taken resources come from ONE listing of `claims/`: every claim object counts as taken,
+    /// and the claims are not read. (Reading each one cost ~90 gateway calls per request at
+    /// 175 req/s, Nov 7.) The planner only asks "is this resource taken?", so each assignment
+    /// here carries only its `resource_id`: `incident_id` and `score` are 0.
+    /// Counting a claim whose lease ran out as taken is safe; it only delays reusing that
+    /// resource until the sweeper (every 5 s) removes the abandoned claim. `commit` still
+    /// checks every claim for real, so a stale listing can never double-book a resource.
     async fn snapshot(&self) -> Result<Snapshot, StateUnavailable> {
         let resources = self.known_resources();
-        let now = now_ms();
-        let reads = resources.iter().map(|r| async move {
-            let Some((claim, _)) = self.get::<Claim>(&claim_key(r.id)).await? else {
-                return Ok(None);
-            };
-            let holds = match classify_claim(&claim, "", now) {
-                ClaimView::Held | ClaimView::Ours => true,
-                ClaimView::Expired => self.committed_with(&claim.request_id, r.id).await?,
-            };
-            Ok::<_, StateUnavailable>(holds.then_some(claim.assignment))
-        });
-        let mut assignments = Vec::new();
-        for a in join_all(reads).await {
-            if let Some(a) = a? {
-                assignments.push(a);
-            }
-        }
+        let assignments = self
+            .claimed_resource_ids()
+            .await?
+            .into_iter()
+            .map(|resource_id| Assignment {
+                incident_id: 0,
+                resource_id,
+                score: 0.0,
+            })
+            .collect();
         Ok(Snapshot {
             incidents: Vec::new(),
             resources,
@@ -471,12 +618,20 @@ impl SharedState for S3Store {
             incident,
             plan: plan.clone(),
         };
+        let incident_id = record.incident.id;
         match self
             .put(&request_key(request_id), &record, Cond::IfAbsent)
             .await
         {
             Ok(Put::Done(_)) => {
-                self.confirm(request_id, &plan, &held).await;
+                // The client may already have resolved this incident (it can get the plan from
+                // another node during a failover, and resolves ~1 s later). Confirming after
+                // that would hold the resources for good, so give them back instead.
+                if matches!(self.incident_is_resolved(incident_id).await, Ok(true)) {
+                    self.release(&held).await;
+                } else {
+                    self.confirm(request_id, &plan, &held).await;
+                }
                 CommitOutcome::Committed
             }
             Ok(Put::Lost) => match self.lookup_request(request_id).await {
@@ -489,7 +644,14 @@ impl SharedState for S3Store {
                     // Two nodes that both thought they won share the same claims ("Ours"), and
                     // our swap changed their ETag, so the winner's confirm failed. We hold the
                     // latest version: confirm the ones the stored plan uses (seen Oct 31 e2e).
-                    self.confirm(request_id, &stored, &kept).await;
+                    // But this is the slower node: if the client already resolved the
+                    // incident, our claims were re-created after the resolve deleted them,
+                    // so release them rather than confirm them for good.
+                    if matches!(self.incident_is_resolved(incident_id).await, Ok(true)) {
+                        self.release(&kept).await;
+                    } else {
+                        self.confirm(request_id, &stored, &kept).await;
+                    }
                     CommitOutcome::AlreadyCommitted(stored)
                 }
                 Ok(None) => CommitOutcome::StateUnavailable(unavailable("request record vanished")),
@@ -562,15 +724,17 @@ impl SharedState for S3Store {
             }
         }
 
-        // Release only claims belonging to this incident.
-        for resource in self.known_resources() {
-            let key = claim_key(resource.id);
-
-            if let Some((claim, etag)) = self.get::<Claim>(&key).await? {
-                if claim.assignment.incident_id == incident_id {
-                    self.delete_if_match(&key, &etag).await?;
-                }
-            }
+        // Release only claims belonging to this incident (re-reading a claim that changes under
+        // us, see `release_claim_of`). All resources at once: one by one, a resolve made
+        // ~100 sequential round trips and was the slowest request type during a failover.
+        // Only resources that have a claim at all (one listing of claims/).
+        let releases = self
+            .claimed_resource_ids()
+            .await?
+            .into_iter()
+            .map(|id| self.release_claim_of(id, incident_id));
+        for r in join_all(releases).await {
+            r?;
         }
 
         Ok(())
@@ -626,6 +790,34 @@ fn resolved_incident_key(incident_id: IncidentId) -> String {
     format!("resolved/{incident_id}")
 }
 
+/// Every `<tag>value</tag>` in an S3 XML reply, in order. Enough for ListObjectsV2: our keys
+/// (`claims/<number>`) and SeaweedFS's tokens contain no markup, so no XML library is needed.
+fn xml_values(xml: &str, tag: &str) -> Vec<String> {
+    let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+    let mut out = Vec::new();
+    let mut rest = xml;
+    while let Some(start) = rest.find(&open) {
+        let after = &rest[start + open.len()..];
+        let Some(end) = after.find(&close) else { break };
+        out.push(after[..end].replace("&amp;", "&"));
+        rest = &after[end + close.len()..];
+    }
+    out
+}
+
+/// Percent-encodes everything except unreserved characters (for a query parameter).
+fn percent_encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 fn etag_of(resp: &reqwest::Response) -> String {
     resp.headers()
         .get("etag")
@@ -665,6 +857,19 @@ mod tests {
     use common::domain::*;
 
     use super::*;
+
+    #[test]
+    fn xml_values_reads_a_list_objects_reply() {
+        let xml = "<ListBucketResult><IsTruncated>true</IsTruncated>\
+            <Contents><Key>claims/7</Key><Size>9</Size></Contents>\
+            <Contents><Key>claims/12</Key></Contents>\
+            <NextContinuationToken>a&amp;b=</NextContinuationToken></ListBucketResult>";
+        assert_eq!(xml_values(xml, "Key"), vec!["claims/7", "claims/12"]);
+        assert_eq!(xml_values(xml, "IsTruncated"), vec!["true"]);
+        assert_eq!(xml_values(xml, "NextContinuationToken"), vec!["a&b="]);
+        assert!(xml_values(xml, "Missing").is_empty());
+        assert_eq!(percent_encode("a&b=/c"), "a%26b%3D%2Fc");
+    }
 
     fn claim(request_id: &str, expires_at_ms: u64, confirmed: bool) -> Claim {
         Claim {
@@ -810,8 +1015,10 @@ mod tests {
 
         let snap = n[2].snapshot().await.unwrap();
         assert_eq!(snap.assignments.len(), 1);
-        assert_eq!(snap.assignments[0].incident_id, 2);
         assert_eq!(snap.assignments[0].resource_id, 1);
+        // The snapshot only says "taken"; the claim itself says by whom.
+        let (held, _) = n[2].get::<Claim>(&claim_key(1)).await.unwrap().unwrap();
+        assert_eq!(held.assignment.incident_id, 2);
 
         drop_bucket(&n[0]).await;
     }
@@ -838,8 +1045,9 @@ mod tests {
 
         let snap = n[0].snapshot().await.unwrap();
         assert_eq!(snap.assignments.len(), 1);
-        assert_eq!(snap.assignments[0].incident_id, 2);
         assert_eq!(snap.assignments[0].resource_id, 1);
+        let (held, _) = n[0].get::<Claim>(&claim_key(1)).await.unwrap().unwrap();
+        assert_eq!(held.assignment.incident_id, 2);
 
         drop_bucket(&n[0]).await;
     }
@@ -994,6 +1202,10 @@ mod tests {
         );
 
         tokio::time::sleep(Duration::from_millis(4_200)).await;
+        // The snapshot is one listing and does not read leases: the abandoned claim still
+        // shows as taken until a sweeper round removes it.
+        assert_eq!(n[1].snapshot().await.unwrap().assignments.len(), 1);
+        assert_eq!(n[2].sweep_claims().await.unwrap(), 1, "expired and never committed: freed");
         assert!(
             n[1].snapshot().await.unwrap().assignments.is_empty(),
             "expired and never committed: free"
@@ -1053,6 +1265,7 @@ mod tests {
             base: "http://127.0.0.1:1/nothing".into(),
             lease: Duration::from_secs(10),
             resources: RwLock::new(resources(5)),
+            inflight: tokio::sync::Semaphore::new(MAX_INFLIGHT_CALLS),
         };
         assert!(broken.snapshot().await.is_err());
         assert!(broken.lookup_request("r1").await.is_err());
