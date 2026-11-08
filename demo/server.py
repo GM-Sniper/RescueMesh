@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """RescueMesh demo control panel (Phase 1 demo). Run it on a PC that can SSH to all 6 lab PCs:
 
-    python3 demo/server.py            then open http://localhost:8080
+    python3 demo/server.py            then open http://localhost:8090
     python3 demo/server.py --port 9000 --bind 0.0.0.0
+
+Not 8080: SeaweedFS's volume server uses it, and the panel may run on a node PC (e.g. N1).
 
 What it does:
 - Settings page: the 6 PCs' IPs and SSH login, the repo folder, run options (demo/settings.json).
@@ -2301,7 +2303,7 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     global HUB, ACTIONS
     ap = argparse.ArgumentParser(description="RescueMesh demo control panel")
-    ap.add_argument("--port", type=int, default=8080)
+    ap.add_argument("--port", type=int, default=8090)  # not 8080: SeaweedFS's volume port
     ap.add_argument("--bind", default="127.0.0.1")
     args = ap.parse_args()
     if not shutil.which("ssh"):

@@ -15,8 +15,9 @@ commands as the runbook and reads the logs the programs already write.
    ```
 3. Start the panel and open it in a browser:
    ```bash
-   python3 demo/server.py         # then open http://localhost:8080
+   python3 demo/server.py         # then open http://localhost:8090
    ```
+   It can run on one of the node PCs (e.g. N1). Not on port 8080: that is SeaweedFS's volume port.
 
 ## Using it
 
@@ -30,7 +31,7 @@ commands as the runbook and reads the logs the programs already write.
 - **Lab Results:** the measured numbers from the Nov 4-5 lab runs.
 
 Each **Start load** uses fresh seeds, so no wipe is needed between demo runs.
-If the page shows "panel server unreachable" behind a proxy, open `http://localhost:8080/?poll`.
+If the page shows "panel server unreachable" behind a proxy, open `http://localhost:8090/?poll`.
 
 ## Files
 
