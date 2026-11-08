@@ -333,7 +333,7 @@ impl S3Store {
             let incident = claim.assignment.incident_id;
             if self.incident_is_resolved(incident).await? {
                 self.release_claim_of(id, incident).await?;
-                tracing::info!(resource = id, incident, "sweeper: released a claim of a resolved incident");
+                tracing::debug!(resource = id, incident, "sweeper: released a claim of a resolved incident");
                 return Ok(true);
             }
             // An unconfirmed claim whose lease ran out. The snapshot counts every claim as
@@ -347,7 +347,7 @@ impl S3Store {
                     return Ok(false);
                 }
                 if self.try_delete_if_match(&key, &etag).await? {
-                    tracing::info!(resource = id, incident, "sweeper: freed an abandoned claim (lease over, never committed)");
+                    tracing::debug!(resource = id, incident, "sweeper: freed an abandoned claim (lease over, never committed)");
                     return Ok(true);
                 }
             }

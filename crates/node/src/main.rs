@@ -33,6 +33,8 @@ mod store;
 mod mute;
 mod gated_store;
 mod s3_store;
+// One INFO line every 5 s with what the node did (activity.rs).
+mod activity;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -95,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. Logging: "info" by default; RUST_LOG=debug shows every heartbeat.
     tracing_subscriber::fmt()
+        .with_target(false) // shorter lines in the demo console; the message says what it is
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -160,7 +163,7 @@ async fn main() -> anyhow::Result<()> {
                 tick.tick().await;
                 match sweeper.sweep_claims().await {
                     Ok(0) => {}
-                    Ok(n) => tracing::info!(released = n, "sweeper: gave back leaked resources"),
+                    Ok(n) => activity::add_n(&activity::COUNTERS.swept, n as u64),
                     Err(e) => tracing::debug!(%e, "sweeper: shared state not reachable this round"),
                 }
             }
@@ -173,6 +176,7 @@ async fn main() -> anyhow::Result<()> {
     // 6. Background tasks: CPU sampling for the load score (P3), heartbeats to
     //    each peer, and the detector ticker.
     load::spawn_sampler(state.clone());
+    activity::spawn(state.clone(), std::time::Duration::from_secs(5));
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
     fault_round::spawn(state.clone());

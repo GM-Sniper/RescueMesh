@@ -530,8 +530,23 @@ fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Res
     )?;
 
     let mut counts = Counts::default();
+    let mut live = Live::new();
+    let mut flushed = Instant::now();
 
-    for row in rx {
+    loop {
+        // Wake at least twice a second, so the live line and the CSV flush happen while quiet too.
+        let row = match rx.recv_timeout(Duration::from_millis(500)) {
+            Ok(row) => Some(row),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        if flushed.elapsed() >= Duration::from_secs(1) {
+            w.flush()?; // the demo panel reads this file live
+            flushed = Instant::now();
+        }
+        live.print_if_due();
+        let Some(row) = row else { continue };
+        live.add(&row);
         match row.status {
             SubmitStatus::Ok => counts.ok += 1,
             SubmitStatus::Timeout => counts.timeout += 1,
@@ -565,7 +580,77 @@ fn write_csv(path: &Path, run_id: &str, rx: mpsc::Receiver<Row>) -> std::io::Res
     }
 
     w.flush()?;
+    live.print_if_due();
     Ok(counts)
+}
+
+/// One stdout line every 5 s with what the clients saw, e.g.
+///   live (5 s): 312 answered (62/s) · p50 14 ms · p95 31 ms · by node 1/2/3: 104/98/110 · 2 retried · 0 lost
+/// Nothing is printed while no request finishes.
+struct Live {
+    since: Instant,
+    lat_us: Vec<u64>,
+    by_node: [u64; 4],
+    ok: u64,
+    retried: u64,
+    lost: u64,
+    no_resource: u64,
+}
+
+impl Live {
+    const EVERY: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Live { since: Instant::now(), lat_us: Vec::new(), by_node: [0; 4], ok: 0, retried: 0, lost: 0, no_resource: 0 }
+    }
+
+    fn add(&mut self, row: &Row) {
+        if matches!(row.status, SubmitStatus::Ok) {
+            self.ok += 1;
+            self.lat_us.push(row.latency_us);
+            if let Some(n) = row.executor_node.filter(|&n| (1..=3).contains(&n)) {
+                self.by_node[n as usize] += 1;
+            }
+            if row.attempts > 1 {
+                self.retried += 1;
+            }
+            if row.assigned == Some(false) {
+                self.no_resource += 1;
+            }
+        } else {
+            self.lost += 1;
+        }
+    }
+
+    fn print_if_due(&mut self) {
+        let secs = self.since.elapsed();
+        if secs < Self::EVERY {
+            return;
+        }
+        if self.ok + self.lost > 0 {
+            self.lat_us.sort_unstable();
+            let pct = |q: f64| self.lat_us.get(((self.lat_us.len() as f64 - 1.0) * q) as usize).map_or(0.0, |&v| v as f64 / 1000.0);
+            let mut line = format!(
+                "live ({} s): {} answered ({:.0}/s) · p50 {:.0} ms · p95 {:.0} ms · by node 1/2/3: {}/{}/{} · {} retried · {} lost",
+                secs.as_secs(),
+                self.ok,
+                self.ok as f64 / secs.as_secs_f64(),
+                pct(0.5),
+                pct(0.95),
+                self.by_node[1],
+                self.by_node[2],
+                self.by_node[3],
+                self.retried,
+                self.lost
+            );
+            if self.no_resource > 0 {
+                line.push_str(&format!(" · {} found no free resource", self.no_resource));
+            }
+            println!("{line}");
+            let _ = std::io::stdout().flush();
+        }
+        *self = Live::new();
+    }
 }
 
 /// Returns a deterministic mission delay between 1 and max_ms.
