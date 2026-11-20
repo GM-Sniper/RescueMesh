@@ -329,7 +329,7 @@ pub async fn run_election(state: &Arc<NodeState>, request: &SubmitRequest) -> Op
     // Lock, read, unlock: the table is never locked while we wait on the network.
     let (round, mine) = {
         let mut table = state.election.lock().unwrap();
-        let mine = table.my_bid(&request_id, || own_bid(state));
+        let mine = table.my_bid(&request_id, || bid_for(state, &request_id));
         (table.round(&request_id).unwrap_or(0), mine)
     };
 
@@ -431,14 +431,18 @@ pub fn handle_exchange_bid(state: &NodeState, call: BidRequest) -> Result<pb::Bi
     // joined a newer round below, also start our own election here. Otherwise, when
     // we have the lowest bid, the peers decide we won but we never plan, and the
     // client has to time out and retry.
-    let mut mine = table.my_bid(&request_id, || own_bid(state));
+    let mut mine = table.my_bid(&request_id, || bid_for(state, &request_id));
     let mut recorded = table.record_bid(&request_id, theirs.round, bid_from_pb(&theirs));
     if recorded == Recorded::NewerRound {
         // The peer saw the winner fail before we did: follow it (part 4, option A).
-        if let Some(fresh) = table.join_round(&request_id, theirs.round, || own_bid(state)) {
+        if let Some(fresh) = table.join_round(&request_id, theirs.round, || bid_for(state, &request_id)) {
             mine = fresh;
             recorded = table.record_bid(&request_id, theirs.round, bid_from_pb(&theirs));
         }
+    }
+    // P5, Fix 3: a fault round (docs/p3-election-design.md, Section 7).
+    if let Some(fault_round) = crate::fault_round::parse_round(&request_id) {
+        crate::fault_round::on_peer_bid(state, fault_round, &mut mine);
     }
     tracing::debug!(%request_id, from = theirs.node_id, ?recorded, "bid call received");
     let round = table.round(&request_id).unwrap_or(0);
@@ -497,6 +501,15 @@ pub fn handle_announce_winner(
         }
     }
     Ok(CoordinatorAck { node_id: state.id })
+}
+
+/// My bid for this election: the seeded fault-round score for `fault-<round>`
+/// (P5, Fix 3; design doc Section 7), otherwise my load score.
+fn bid_for(state: &NodeState, request_id: &str) -> Bid {
+    match crate::fault_round::parse_round(request_id) {
+        Some(round) => crate::fault_round::bid(state, round),
+        None => own_bid(state),
+    }
 }
 
 /// My bid right now, from P3's load collector.

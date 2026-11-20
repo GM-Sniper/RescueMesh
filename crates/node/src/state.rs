@@ -67,6 +67,9 @@ pub struct NodeState {
     /// P1's request CSV: START and END of each Submit's work, for P6's measurements
     /// (see request_log.rs). None in tests, so they write no files.
     pub request_log: Option<RequestLog>,
+    /// P5's automatic injector: the highest fault round a peer has bid in, and whether
+    /// this node is about to silence itself (see fault_round.rs).
+    pub faults: crate::fault_round::Shared,
 }
 
 /// One Submit's result, copied to everyone waiting for it.
@@ -97,6 +100,7 @@ impl NodeState {
             election_log: None,
             in_progress: Mutex::new(HashMap::new()),
             request_log: None,
+            faults: Default::default(),
         }
     }
 
