@@ -608,10 +608,9 @@ mod tests {
         assert!(!reply.duplicate);
         let plan = reply.plan.expect("a plan");
         assert_eq!(plan.incident_id, generate_incident(7).id);
-        assert_eq!(
-            plan.assignments.len(),
-            1,
-            "a free resource exists, so one is assigned"
+        assert!(
+            plan.assignments.len() >= 1,
+            "a free resource exists, so at least one resource should be assigned"
         );
         assert_eq!(svc.state.store.snapshot().await.unwrap().incidents.len(), 1);
     }
@@ -621,11 +620,22 @@ mod tests {
         let svc = service();
         let first = svc.submit(submit_req("r1", 7)).await.unwrap().into_inner();
         let again = svc.submit(submit_req("r1", 7)).await.unwrap().into_inner();
+
         assert!(again.duplicate);
         assert_eq!(again.plan, first.plan);
+
         let snapshot = svc.state.store.snapshot().await.unwrap();
+
         assert_eq!(snapshot.incidents.len(), 1); // still one record
-        assert_eq!(snapshot.assignments.len(), 1);
+
+        let expected_assignments = first.plan.as_ref().expect("a plan").assignments.len();
+
+        assert!(expected_assignments >= 1);
+        assert_eq!(
+            snapshot.assignments.len(),
+            expected_assignments,
+            "retrying the same request must not create additional assignments"
+        );
     }
 
     #[tokio::test]

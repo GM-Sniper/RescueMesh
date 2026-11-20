@@ -53,8 +53,13 @@ pub fn plan_with_workload(
             .total_cmp(&a.score)
             .then(a.resource_id.cmp(&b.resource_id))
     });
-    scored.truncate(1); // v1: one resource per incident
+    let wanted = match incident.severity {
+        1..=3 => 1,
+        4..=7 => 2,
+        _ => 3,
+    };
 
+    scored.truncate(wanted);
     Plan {
         incident_id: incident.id,
         priority,
@@ -199,13 +204,87 @@ mod tests {
             &Weights::default(),
             0,
         );
-        assert_eq!(pa.assignments[0].resource_id, 3);
+        assert_eq!(
+            pa.assignments
+                .iter()
+                .map(|a| a.resource_id)
+                .collect::<Vec<_>>(),
+            vec![3, 5]
+        );
         assert_eq!(pa, pb);
     }
 
     #[test]
     fn empty_does_not_panic() {
         let p = plan(&inc(), &Snapshot::default(), &Weights::default(), 0);
+        assert!(p.assignments.is_empty());
+    }
+
+    #[test]
+    fn high_severity_gets_three_resources_when_available() {
+        let snapshot = Snapshot {
+            resources: vec![
+                res(1, ResourceType::Ambulance, 0, 0),
+                res(2, ResourceType::Ambulance, 0, 0),
+                res(3, ResourceType::Ambulance, 0, 0),
+                res(4, ResourceType::Ambulance, 0, 0),
+            ],
+            ..Default::default()
+        };
+
+        let p = plan(&inc(), &snapshot, &Weights::default(), 0);
+
+        assert_eq!(p.assignments.len(), 3);
+        assert_eq!(
+            p.assignments
+                .iter()
+                .map(|a| a.resource_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn high_severity_gets_all_resources_when_fewer_are_available() {
+        let mut unavailable = res(3, ResourceType::Ambulance, 0, 0);
+        unavailable.available = false;
+
+        let snapshot = Snapshot {
+            resources: vec![
+                res(1, ResourceType::Ambulance, 0, 0),
+                res(2, ResourceType::Ambulance, 0, 0),
+                unavailable,
+            ],
+            ..Default::default()
+        };
+
+        let p = plan(&inc(), &snapshot, &Weights::default(), 0);
+
+        assert_eq!(p.assignments.len(), 2);
+        assert_eq!(
+            p.assignments
+                .iter()
+                .map(|a| a.resource_id)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+    }
+
+    #[test]
+    fn high_severity_gets_no_assignments_when_no_resources_are_free() {
+        let mut r1 = res(1, ResourceType::Ambulance, 0, 0);
+        let mut r2 = res(2, ResourceType::Ambulance, 0, 0);
+
+        r1.available = false;
+        r2.available = false;
+
+        let snapshot = Snapshot {
+            resources: vec![r1, r2],
+            ..Default::default()
+        };
+
+        let p = plan(&inc(), &snapshot, &Weights::default(), 0);
+
         assert!(p.assignments.is_empty());
     }
 
