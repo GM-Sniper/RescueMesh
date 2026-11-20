@@ -81,6 +81,14 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     resolve_after_ms: u64,
 
+    /// With resolution on: how long to keep asking about an incident that got "no resource
+    /// yet" (it waits in the nodes' pending queue). Asked again after 1 s, then every 2 s;
+    /// once it has a plan, it is resolved after its mission delay like any other.
+    /// If it still has none after this long, it is cancelled (resolved), so a late assignment
+    /// can never hold a resource nobody will give back.
+    #[arg(long, default_value_t = 30_000)]
+    wait_for_resource_ms: u64,
+
     /// Ramp mode: number of clients in each stage, e.g. "1,2,4,8". Each stage lasts --stage-secs, and every
     /// client sends its next request as soon as the previous one returns. Replaces --clients, --requests and --rate.
     /// Without --stages, the run is a single stage of --clients clients sending --requests requests (Step A mode).
@@ -136,6 +144,11 @@ struct ClientJob {
     tx: mpsc::Sender<Row>,
     seed: u64,
     resolve_after_ms: u64,
+    wait_for_resource: Duration,
+    /// Incidents first answered "no resource yet" that got a plan later (from the queue).
+    assigned_later: Arc<AtomicU64>,
+    /// Incidents still without a plan after `wait_for_resource`: cancelled.
+    gave_up_waiting: Arc<AtomicU64>,
     max_requests: Option<u64>,
     stage_end: Option<Instant>,
     interval: Option<Duration>,
@@ -162,6 +175,49 @@ async fn resolve_until_done(client: &ClientMiddleware, incident_id: u64) -> bool
     }
     eprintln!("Failed to resolve incident {incident_id} after 4 rounds: {last:?}");
     false
+}
+
+/// One incident that was answered "no resource yet" (see `follow_up`).
+struct FollowUp {
+    client: ClientMiddleware,
+    request_id: String,
+    incident: common::pb::Incident,
+    mission: Duration,
+    wait: Duration,
+    stop: tokio::sync::watch::Receiver<bool>,
+    assigned_later: Arc<AtomicU64>,
+    gave_up_waiting: Arc<AtomicU64>,
+}
+
+/// Asks again about a waiting incident with backoff until it has a plan, then resolves it after
+/// its mission; or, after `wait` (or on a stop), cancels it with a resolve. Either way the
+/// incident ends resolved, so nothing it was given later stays held. Returns the resolve result.
+async fn follow_up(mut f: FollowUp) -> bool {
+    let incident_id = f.incident.id;
+    let deadline = Instant::now() + f.wait;
+    let mut gap = Duration::from_secs(1);
+    loop {
+        let next = (Instant::now() + gap).min(deadline);
+        tokio::select! {
+            _ = tokio::time::sleep_until(next) => {}
+            _ = f.stop.wait_for(|s| *s) => break,
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        let again = f.client.submit_with_id(f.request_id.clone(), f.incident.clone()).await;
+        if again.assigned() == Some(true) {
+            f.assigned_later.fetch_add(1, Ordering::Relaxed);
+            tokio::select! {
+                _ = tokio::time::sleep(f.mission) => {}
+                _ = f.stop.wait_for(|s| *s) => {}
+            }
+            return resolve_until_done(&f.client, incident_id).await;
+        }
+        gap = (gap * 2).min(Duration::from_secs(2));
+    }
+    f.gave_up_waiting.fetch_add(1, Ordering::Relaxed);
+    resolve_until_done(&f.client, incident_id).await
 }
 
 impl ClientJob {
@@ -196,7 +252,8 @@ impl ClientJob {
             let incident = incident_to_pb(&generated_incident);
             let timestamp_ms = unix_ms();
 
-            let outcome = self.client.submit(incident).await;
+            // Cloned: a "no resource yet" answer is asked about again with the same incident.
+            let outcome = self.client.submit(incident.clone()).await;
 
             let assigned = outcome.assigned();
             let result = outcome.outcome();
@@ -206,7 +263,8 @@ impl ClientJob {
             // request can commit on a node while its reply is lost, and nobody else would ever
             // resolve that incident, so its resources would stay claimed for good. Resolving an
             // incident that never committed is harmless, and it stops a late commit of it.
-            // Only a plan with nothing assigned (Some(false)) holds nothing and needs no resolve.
+            // A plan with nothing assigned (Some(false)) means "waiting in the queue": the
+            // follow-up below asks again and resolves it once it has a plan.
             if assigned != Some(false) && self.resolve_after_ms > 0 {
                 let delay_ms = mission_delay_ms(self.seed, n, self.resolve_after_ms);
 
@@ -222,6 +280,20 @@ impl ClientJob {
                     resolve_until_done(&resolve_client, incident_id).await
                 });
 
+                resolution_tasks.push(task);
+            } else if self.resolve_after_ms > 0 {
+                // No resource yet: the incident waits in the nodes' queue. Ask again (same
+                // request_id) until it has a plan, then run its mission and resolve it.
+                let task = tokio::spawn(follow_up(FollowUp {
+                    client: self.client.clone(),
+                    request_id: outcome.request_id.clone(),
+                    incident,
+                    mission: Duration::from_millis(mission_delay_ms(self.seed, n, self.resolve_after_ms)),
+                    wait: self.wait_for_resource,
+                    stop: self.stop.clone(),
+                    assigned_later: self.assigned_later.clone(),
+                    gave_up_waiting: self.gave_up_waiting.clone(),
+                }));
                 resolution_tasks.push(task);
             }
 
@@ -354,6 +426,8 @@ async fn main() -> anyhow::Result<()> {
     });
 
     let next = Arc::new(AtomicU64::new(0));
+    let assigned_later = Arc::new(AtomicU64::new(0));
+    let gave_up_waiting = Arc::new(AtomicU64::new(0));
     let interval = (args.rate > 0.0).then(|| Duration::from_secs_f64(1.0 / args.rate));
 
     // A clean stop (Ctrl+C, or SIGTERM from `kill`, which the demo panel sends): stop sending,
@@ -396,6 +470,9 @@ async fn main() -> anyhow::Result<()> {
                 tx: tx.clone(),
                 seed: args.seed,
                 resolve_after_ms: args.resolve_after_ms,
+                wait_for_resource: Duration::from_millis(args.wait_for_resource_ms),
+                assigned_later: assigned_later.clone(),
+                gave_up_waiting: gave_up_waiting.clone(),
                 max_requests: (!ramp).then_some(args.requests),
                 stage_end,
                 interval,
@@ -447,9 +524,11 @@ async fn main() -> anyhow::Result<()> {
     let throughput = counts.ok as f64 / secs;
 
     println!(
-        "done in {secs:.2} s: {} ok ({} with nothing assigned, {} retried), {} timeout, {} error, {late_plans} late plans, {} resolves sent ({} successful, {} failed), {throughput:.1} ok/s",
+        "done in {secs:.2} s: {} ok ({} with nothing assigned at first: {} got a resource later, {} cancelled after waiting; {} retried), {} timeout, {} error, {late_plans} late plans, {} resolves sent ({} successful, {} failed), {throughput:.1} ok/s",
         counts.ok,
         counts.unassigned,
+        assigned_later.load(Ordering::Relaxed),
+        gave_up_waiting.load(Ordering::Relaxed),
         counts.retried,
         counts.timeout,
         counts.error,
@@ -467,7 +546,7 @@ async fn main() -> anyhow::Result<()> {
          stages: {}\nstage_secs: {}\nclients: {}\nrequests: {}\nseed: {}\nrate: {}\nresolve_after_ms: {}\n\
 git_commit: {}\n\
 duration_s: {secs:.3}\n\
-ok: {}\nunassigned: {}\nretried: {}\ntimeout: {}\nerror: {}\nlate_plans: {late_plans}\n\
+ok: {}\nunassigned: {}\nassigned_later: {}\ngave_up_waiting: {}\nwait_for_resource_ms: {}\nretried: {}\ntimeout: {}\nerror: {}\nlate_plans: {late_plans}\n\
 resolve_sent: {}\nresolve_ok: {}\nresolve_failed: {}\n\
 throughput_ok_per_s: {throughput:.1}\n",
         std::env::args().collect::<Vec<_>>().join(" "),
@@ -506,6 +585,9 @@ throughput_ok_per_s: {throughput:.1}\n",
         git_commit(),
         counts.ok,
         counts.unassigned,
+        assigned_later.load(Ordering::Relaxed),
+        gave_up_waiting.load(Ordering::Relaxed),
+        args.wait_for_resource_ms,
         counts.retried,
         counts.timeout,
         counts.error,

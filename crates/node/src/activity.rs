@@ -28,6 +28,12 @@ pub struct Counters {
     /// Still taken after every re-plan: the client retries the same request.
     pub collisions: AtomicU64,
     pub resolved: AtomicU64,
+    /// No resource free: the incident joined the pending queue.
+    pub queued: AtomicU64,
+    /// Queued incidents this node's dispatcher gave a resource to.
+    pub dispatched: AtomicU64,
+    /// Queued incidents dropped because their time-to-live ran out.
+    pub expired: AtomicU64,
     /// Resources the sweeper gave back.
     pub swept: AtomicU64,
     /// Shared-state calls that failed (the client retries).
@@ -43,6 +49,9 @@ pub static COUNTERS: Counters = Counters {
     replanned: AtomicU64::new(0),
     collisions: AtomicU64::new(0),
     resolved: AtomicU64::new(0),
+    queued: AtomicU64::new(0),
+    dispatched: AtomicU64::new(0),
+    expired: AtomicU64::new(0),
     swept: AtomicU64::new(0),
     storage_errors: AtomicU64::new(0),
 };
@@ -78,11 +87,12 @@ pub fn spawn(state: Arc<NodeState>, every: Duration) {
             let (received, won, lost, planned) = (take(&c.received), take(&c.won), take(&c.lost), take(&c.planned));
             let (dups, replanned, collisions) = (take(&c.duplicates), take(&c.replanned), take(&c.collisions));
             let (resolved, swept, errors) = (take(&c.resolved), take(&c.swept), take(&c.storage_errors));
+            let (queued, dispatched, expired) = (take(&c.queued), take(&c.dispatched), take(&c.expired));
             let peers = format!("peers {}/{}", state.alive_peers().len(), state.config.nodes.len().saturating_sub(1));
             if state.is_muted() {
                 continue; // the mute itself is logged; a muted node does no work
             }
-            if received + resolved + swept + errors == 0 {
+            if received + resolved + swept + errors + dispatched + expired == 0 {
                 quiet += every;
                 if quiet >= Duration::from_secs(30) {
                     quiet = Duration::ZERO;
@@ -100,6 +110,9 @@ pub fn spawn(state: Arc<NodeState>, every: Duration) {
                 (replanned, format!("{replanned} re-planned")),
                 (collisions, format!("{collisions} retried by the client")),
                 (resolved, format!("resolved {resolved}")),
+                (queued, format!("{queued} told to wait (no resource free)")),
+                (dispatched, format!("{dispatched} assigned from the queue")),
+                (expired, format!("{expired} dropped from the queue (TTL over)")),
                 (swept, format!("{swept} resources returned by the sweeper")),
                 (errors, format!("{errors} storage errors (retried)")),
             ] {

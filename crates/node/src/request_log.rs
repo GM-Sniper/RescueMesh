@@ -8,7 +8,7 @@
 //! | column        | meaning                                                                 |
 //! |---------------|-------------------------------------------------------------------------|
 //! | `event`       | `START` (the work began), `END` (it stopped), or `SNAPSHOT` / `COMMIT` (one shared-state call, see below) |
-//! | `detail`      | END: `committed` (we planned and saved it), `duplicate` (the stored plan was returned), `lost` (another node won the election), or `error:<code>` (e.g. `error:unavailable` when muted). SNAPSHOT / COMMIT: how the call ended (`ok`, `committed`, `resource_taken`, ...) |
+//! | `detail`      | END: `committed` (we planned and saved it), `queued` (no resource free: the incident joined the pending queue), `duplicate` (the stored plan was returned), `lost` (another node won the election), or `error:<code>` (e.g. `error:unavailable` when muted). SNAPSHOT / COMMIT: how the call ended (`ok`, `committed`, `resource_taken`, ...) |
 //! | `duration_us` | END: START to END. SNAPSHOT / COMMIT: how long that one call took       |
 //! | `wall_ts_us`  | wall clock, like P5's fault log, so rows join by time with the other files |
 //!
@@ -91,6 +91,8 @@ fn end_detail(outcome: &SubmitResult, own_id: NodeId) -> String {
     match outcome {
         Ok(reply) if reply.plan.is_none() || reply.executor_node != own_id => "lost".to_string(),
         Ok(reply) if reply.duplicate => "duplicate".to_string(),
+        // An empty plan is not saved: no resource was free and the incident was queued.
+        Ok(reply) if reply.plan.as_ref().is_some_and(|p| p.assignments.is_empty()) => "queued".to_string(),
         Ok(_) => "committed".to_string(),
         Err(status) => format!("error:{}", code_name(status.code())),
     }
@@ -136,7 +138,7 @@ fn csv_field(s: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use common::pb::{Plan, SubmitReply};
+    use common::pb::{Assignment, Plan, SubmitReply};
     use tonic::Status;
 
     use super::*;
@@ -154,8 +156,19 @@ mod tests {
         Ok(SubmitReply {
             request_id: "r1".into(),
             executor_node,
-            plan: plan.then(Plan::default),
+            // One assignment: a saved plan; an empty one means "queued" (see `queued_reply`).
+            plan: plan.then(|| Plan { assignments: vec![Assignment::default()], ..Plan::default() }),
             duplicate,
+        })
+    }
+
+    /// What the winner replies when no resource was free: a plan with no assignments.
+    fn queued_reply(executor_node: NodeId) -> SubmitResult {
+        Ok(SubmitReply {
+            request_id: "r1".into(),
+            executor_node,
+            plan: Some(Plan::default()),
+            duplicate: false,
         })
     }
 
@@ -176,6 +189,7 @@ mod tests {
     fn end_detail_names_how_the_work_ended() {
         assert_eq!(end_detail(&reply(2, true, false), 2), "committed");
         assert_eq!(end_detail(&reply(2, true, true), 2), "duplicate");
+        assert_eq!(end_detail(&queued_reply(2), 2), "queued");
         assert_eq!(end_detail(&reply(3, false, false), 2), "lost");
         assert_eq!(
             end_detail(&Err(Status::unavailable("node is muted")), 2),
