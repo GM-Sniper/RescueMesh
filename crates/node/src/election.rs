@@ -484,12 +484,13 @@ pub fn handle_announce_winner(
         announcement.node_id,
     );
     match announced {
-        Announced::Split { step_aside } => tracing::warn!(
+        // Two nodes both thought they won; the rule picks one, so this is expected, not a fault.
+        Announced::Split { step_aside } => tracing::info!(
             %request_id,
             round = announcement.round,
             from = announcement.node_id,
             step_aside,
-            "split_decision"
+            "split decision settled"
         ),
         other => {
             tracing::debug!(%request_id, from = announcement.node_id, ?other, "announcement received")

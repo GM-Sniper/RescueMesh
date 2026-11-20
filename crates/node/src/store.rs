@@ -29,9 +29,20 @@ use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
 const DEFAULT_RESOURCE_SEED: u64 = 42;
 const DEFAULT_RESOURCE_COUNT: usize = 10;
 
+/// How many starting resources to generate. 10 unless `node --resource-count N` changed it at
+/// startup. Every node must be started with the same value (the demo panel does this).
+static RESOURCE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_RESOURCE_COUNT);
+
+/// Called once at startup by `--resource-count`.
+pub fn set_resource_count(n: usize) {
+    RESOURCE_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The starting resources every node (and the S3 backend's first writer) uses.
 pub fn default_resources() -> Vec<Resource> {
-    generate_snapshot(DEFAULT_RESOURCE_SEED, 0, DEFAULT_RESOURCE_COUNT).resources
+    let n = RESOURCE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    generate_snapshot(DEFAULT_RESOURCE_SEED, 0, n).resources
 }
 
 #[derive(Default)]

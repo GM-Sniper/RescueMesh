@@ -18,6 +18,7 @@ use common::shared_state::{CommitOutcome, StateUnavailable};
 use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 
+use crate::activity;
 use crate::election;
 use crate::state::{NodeState, SubmitResult};
 
@@ -80,6 +81,7 @@ impl Node for NodeService {
         }
 
         // Normal incident requests follow the existing election/planning flow.
+        activity::add(&activity::COUNTERS.received);
         let reply = wait_for(start_or_join(&self.state, req)).await?;
 
         // If muted during processing, the client retries.
@@ -235,6 +237,7 @@ async fn handle_submit(
         .await
         .map_err(unavailable)?
     {
+        activity::add(&activity::COUNTERS.duplicates);
         return Ok(reply(&stored, true));
     }
 
@@ -245,10 +248,11 @@ async fn handle_submit(
 
     // 4. Election (P3): every node that got this request bids, and only the winner plans.
     match election::elect(state, &req).await {
-        Some(winner) if winner == state.id => {}
+        Some(winner) if winner == state.id => activity::add(&activity::COUNTERS.won),
         // Lost: name the winner and send no plan (Q2). "No plan" is not an empty plan;
         // the client keeps the reply that has one.
         Some(winner) => {
+            activity::add(&activity::COUNTERS.lost);
             return Ok(Response::new(SubmitReply {
                 request_id,
                 executor_node: winner,
@@ -317,16 +321,19 @@ async fn handle_submit(
                     attempt,
                     "submit committed"
                 );
+                activity::add(&activity::COUNTERS.planned);
                 return Ok(reply(&plan, false));
             }
             // Another request (maybe on another node) committed this request_id first:
             // its plan is the answer, ours is discarded.
             CommitOutcome::AlreadyCommitted(stored) => {
                 tracing::debug!(%request_id, attempt, "submit already committed; returning stored plan");
+                activity::add(&activity::COUNTERS.duplicates);
                 return Ok(reply(&stored, true));
             }
             CommitOutcome::ResourceTaken { resource_id } => {
                 tracing::debug!(%request_id, attempt, resource_id, "resource taken meanwhile; planning again");
+                activity::add(&activity::COUNTERS.replanned);
             }
             CommitOutcome::IncidentResolved => {
                 return Err(Status::failed_precondition("incident is already resolved"));
@@ -334,9 +341,10 @@ async fn handle_submit(
             CommitOutcome::StateUnavailable(why) => return Err(unavailable(why)),
         }
     }
-    // Conflicts every time: the client may retry with the same request_id.
-    // warn: the client only sees "error", so the node's log must say why.
-    tracing::warn!(%request_id, "submit aborted: resources kept changing during planning");
+    // Conflicts every time: the client retries the same request_id (quickly, see the client's
+    // MAX_QUICK_RETRIES). Normal under load, so only counted in the activity line.
+    tracing::debug!(%request_id, "submit aborted: resources kept changing during planning");
+    activity::add(&activity::COUNTERS.collisions);
     Err(Status::aborted(format!(
         "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
     )))
@@ -382,6 +390,7 @@ async fn handle_resolve(
         .map_err(unavailable)?;
 
     tracing::debug!(%request_id, incident_id, "resolved");
+    activity::add(&activity::COUNTERS.resolved);
 
     Ok(SubmitReply {
         request_id: request_id.to_string(),
@@ -393,7 +402,12 @@ async fn handle_resolve(
 /// A shared-state failure as a gRPC error. `Unavailable` tells the client the same
 /// request_id can be retried: commit is create-if-absent, so a retry cannot double-book.
 fn unavailable(why: StateUnavailable) -> Status {
-    tracing::warn!(%why, "shared state unavailable");
+    // The first one in 5 s as a WARN, the rest counted in the activity line.
+    if activity::first_storage_error_in_window() {
+        tracing::warn!(%why, "shared state unavailable (the client retries)");
+    } else {
+        tracing::debug!(%why, "shared state unavailable");
+    }
     Status::unavailable(why.to_string())
 }
 
