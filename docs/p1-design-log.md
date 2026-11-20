@@ -338,3 +338,25 @@ Node 2's plans took 19.6 ms on average when it won (vs 0.8 ms in the baseline), 
 | Each row flushed at once | A buffer | So a crash loses at most the row being written. The cost is one small write per row |
 
 **Evidence.** Tests in `request_log.rs` (row format, END details, header once across a restart) and `service.rs` (`request_log_has_one_start_and_end_per_piece_of_work`). The Oct 31 runs in `docs/p1-changes.md` read like the design says: in case 2 the muted winner's END is `error:unavailable` and the retry's winner logs `committed`.
+
+## 16. No free resource: a pending queue, not a stored empty plan (Phase 1 fix)
+
+**What.** When no resource is free, the commit no longer stores the empty plan as the request's answer. The incident joins a pending queue in the shared state (`pending/<since_ms>-<request_id>` on SeaweedFS, plus a `queued/<request_id>` marker) and the commit returns the new `CommitOutcome::Pending`. The client still gets an empty plan, which now means "waiting", not "final". A dispatcher on every node (`dispatch.rs`) serves the queue once a second, oldest first, through the normal commit under the client's own `request_id`. loadgen asks again about a waiting incident (same `request_id`, after 1 s then every 2 s) and resolves it after its mission once it has a plan, or cancels it with a resolve after `--wait-for-resource-ms` (default 30 s).
+
+**Why.** A stored plan is final (create-if-absent), so an incident that arrived while every resource was busy got "nothing" forever: every retry returned the stored empty plan, even after resources were freed. Run 5 (50 resources) answered 99.95 % of requests "ok" while about 85 % of the incidents never got a resource.
+
+**Decisions.**
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| Queue in the shared state, served by every node | Keep the empty plan; let the client retry; the winner waits for a resource | A retry alone serves an incident only if the client keeps asking. Waiting inside the request runs into the client's 2 s deadline. A shared queue survives a node going down, and any node can serve it |
+| Serve it with the normal commit | A separate assign path | One plan per `request_id` and one holder per resource are already proven for the commit. All 3 nodes may serve the same entry at once: one gets `Committed`, the others `AlreadyCommitted` and drop it |
+| Queue key starts with the time, zero-padded | Read every entry and sort | One listing is already oldest first: no extra reads per round |
+| `queued/<request_id>` marker | Allow duplicates | A client asking again keeps its place instead of adding entries every 2 s |
+| Time-to-live counted from when it was queued | From the incident's `timestamp` | That is the reporter's clock, and generated incidents carry fixed 2023 timestamps: every one would be expired at once |
+| A round stops at the first incident that still finds nothing free | Try every entry | Oldest first: a younger incident never jumps ahead of an older one in the queue |
+| A muted or not-ready node does not serve the queue | Serve it anyway | Same rule as elections: the mute gate refuses its store calls, and the rejoin rule must pass first |
+
+**Limits.** Oldest-first holds among queued incidents. A brand-new request, or a client asking again, can still take a resource freed between two dispatcher rounds (at most 1 s). The `incidents` list in a snapshot stays empty, as before. The SeaweedFS test (`empty_plan_is_queued_and_any_node_can_serve_it_later`) needs a gateway: `cargo test -p node -- --ignored empty_plan_is_queued`.
+
+**Evidence.** Tests in `store.rs`, `gated_store.rs`, `s3_store.rs` (key order), `request_log.rs` (`END queued`), `service.rs` (20 requests for 10 resources: 10 stored, 10 queued, none double-booked) and `dispatch.rs` (freed resource goes to the oldest waiting incident; younger ones keep waiting; expiry; settled entries; muted node). End to end on one PC (1 node, 3 resources, 60 requests at 20/s, missions up to 1.5 s): 47 incidents first had to wait, all 47 got a resource later, 60 of 60 resolved, 0 lost.
