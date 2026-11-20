@@ -304,3 +304,17 @@ Code: `crates/node/src/rejoin.rs`, called by the mute hook in `service.rs` when 
 | A node with no peers is ready once it can read the state | Wait for a heartbeat forever | Nobody could ever send it one. Only happens in single-node tests |
 
 Expected recovery time: up to one heartbeat interval (500 ms) plus one state read. Measured on the real machines in Step D.
+
+## P5: Fault injector uses the election (Phase 1 Fix 3, Nov 20)
+
+Code: `crates/node/src/fault_round.rs`; hooks in `election.rs` (`bid_for`, `on_peer_bid`), `state.rs` (`faults`), `service.rs` (no Submit for a fault round). Replaces the coordinator rule of `docs/p5-auto-injector-design.md` (Step B).
+
+| Decision | Alternatives | Why |
+|---|---|---|
+| The victim is elected with P3's election (design doc Section 7): election ID `fault-<round>`, each node bids a seeded score from `(seed, round, node_id)`, lowest wins, ties to the lowest ID | Keep the coordinator rule (lowest alive ID picks the victim) | The spec says the servers "elect" the machine to silence. The coordinator rule made node 1 decide every fault; now no node is special, and it reuses the election instead of a second mechanism |
+| A fault happens only if all three bid and all are ready; otherwise the round is skipped and tried again after a new gap, as the next attempt of the same election | Inject with two bids | A missing or not-ready bid means a node is down or still recovering: silencing another would leave one node serving |
+| The winner silences itself through `handle_inject_fault`; nobody sends a FaultCommand | The winner is told by a peer | Every node holding the same three bids picks the same winner, so the winner already knows. One less message that can be lost |
+| Round numbers stay in step: a node that sees a bid for a newer round joins it; a victim does not mute if a newer round has started, and answers "not ready" to newer-round bids while it is about to mute | Trust that rounds never drift | Rounds can drift when one node misses a bid the others got. This keeps "never two silent at once" in that case too |
+| Unchanged: seeded gap 10-30 s and duration 2-20 s, `busy_until`, the gap restarts when anyone is down, same seed = same sequence | | Same safety rules as before; tests kept and updated (12 tests, incl. 3 real nodes never two silent at once) |
+
+Fault rounds appear in `logs/elections-node*.csv` with `request_id = fault-<round>` and the three seeded scores in `bids`. P6: filter them out of request-election statistics (`request_id` starting with `fault-`).

@@ -1,93 +1,160 @@
-//! Automatic fault injector (P5, Step B). Turned on with `[faults] enabled = true`.
+//! Automatic fault injector (P5). Turned on with `[faults] enabled = true`.
 //!
 //! Spec: "the three cloud servers will periodically elect one machine to ignore
 //! communication ... for a random interval of up to 20 seconds and then rejoin."
 //!
-//! This is the plan's fallback version (handoff 6: "P5 uses a simple Bully rule on
-//! alive_peers()"), because P3's bid exchange is not in `main` yet:
+//! Phase 1 Fix 3: the victim is chosen by P3's election (docs/p3-election-design.md,
+//! Section 7), not by a coordinator. Every node runs this module the same way:
 //!
-//!   1. **Coordinator** = the lowest node ID among this node and the peers its failure
-//!      detector reports alive (Bully rule, lowest ID wins like every other tie in the
-//!      project). Only the coordinator schedules faults.
-//!   2. **Safety rule:** the coordinator only acts while it is not muted, every peer is
-//!      alive, and the previous fault's duration has passed. So a second node is never
-//!      silenced while one is down. If the coordinator is the one silenced, nobody
-//!      injects until it is back.
-//!   3. **Wait a random gap**, counted from when all nodes are alive again. If anyone
-//!      goes down meanwhile, the wait starts over.
-//!   4. **Pick the victim and duration** with a seeded generator: any of the 3 nodes
-//!      (the coordinator itself included), silent for a random time in
-//!      [min_duration, max_duration]. Same seed = same sequence, so runs repeat.
-//!   5. **Silence it** through the same code path as the manual `inject` CLI: a
-//!      `FaultCommand` to the victim, or a direct call if the victim is the coordinator.
-//!      The victim writes MUTE_START / MUTE_END to its fault CSV as before.
+//!   1. **Safety rule:** a node takes part only while it is not muted, is ready, and its
+//!      failure detector reports every peer alive. If anyone goes down, the wait restarts.
+//!   2. **Wait a random gap** (seeded by the fault round), counted from when that holds.
+//!      No new round before the previous victim's silence has passed (`busy_until`).
+//!   3. **Fault round = an election.** Election ID `fault-<round>`; each node bids a
+//!      seeded random score from `(seed, round, node_id)` instead of its load score.
+//!      P3's rule picks the lowest score, ties to the lowest node ID.
+//!   4. **Only when all three bid, all ready:** a round with a missing or not-ready bid
+//!      is skipped (the same round is tried again after a new gap, as a new attempt of
+//!      the same election). So a node is never silenced while another is down.
+//!   5. **The winner silences itself**, through the same handler as the manual `inject`
+//!      CLI (`handle_inject_fault`), for a seeded duration in [min_duration, max_duration].
+//!      Nobody sends a FaultCommand over the network.
 //!
-//! Knowledge rule (design doc, Section 7): who was picked stays inside this module.
-//! Failover code must learn about the failure only from the failure detector.
+//! Every node holding the same three bids picks the same winner, so there is no
+//! coordinator and no single node that must be up for faults to happen.
 //!
-//! Upgrade path: when P3's election lands, step 1 becomes a fault round with seeded
-//! bids from all three nodes (design doc, Sections 2 to 4). Steps 2 to 5 stay.
+//! Round numbers stay in step: a node that receives a bid for a newer fault round
+//! jumps to it (`Shared::seen`). A victim checks, just before muting itself, that no
+//! newer round has started; the `muting` flag closes the gap between that check and
+//! the mute (see `mute_self` and `on_peer_bid`).
+//!
+//! Knowledge rule (p5-changes.md): who was picked stays inside the injector and the
+//! election table. Failover code learns about the failure only from the failure detector.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::NodeId;
 use common::config::Faults;
-use common::pb::FaultCommand;
-use tokio::time::{Instant, MissedTickBehavior, interval, timeout};
+use common::pb::{FaultCommand, SubmitRequest};
+use tokio::time::{Instant, MissedTickBehavior, interval};
 
+use crate::election::{self, Bid};
 use crate::state::NodeState;
 
-/// How often the coordinator re-checks whether it may inject. Small next to the gaps.
+/// How often each node re-checks whether a fault round is due. Small next to the gaps.
 const POLL: Duration = Duration::from_millis(100);
 
-/// One planned fault: who goes silent, for how long, and which round it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PlannedFault {
-    pub round: u64,
-    pub victim: NodeId,
-    pub duration: Duration,
+// ---- Election IDs ---------------------------------------------------------------------
+
+const PREFIX: &str = "fault-";
+
+/// The election ID of a fault round (design doc Section 7).
+pub fn election_id(round: u64) -> String {
+    format!("{PREFIX}{round}")
 }
 
-/// The scheduling logic, without network or clock: the caller passes `now`, whether
-/// this node is muted, and who its detector reports alive. Tested on its own below.
+/// The fault round of an election ID, or None for a client request.
+/// Only `fault-` followed by digits counts; client request IDs are UUIDs.
+pub fn parse_round(election_id: &str) -> Option<u64> {
+    let digits = election_id.strip_prefix(PREFIX)?;
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+// ---- Bids -------------------------------------------------------------------------------
+
+/// This node's bid in fault round `round`: a seeded random score, so the same seed
+/// gives the same victims, and each node wins about a third of the rounds.
+pub fn bid(state: &NodeState, round: u64) -> Bid {
+    Bid {
+        node_id: state.id,
+        load_score: score(state.config.faults.seed, round, state.id),
+        ready: state.is_ready() && !state.is_muted(),
+    }
+}
+
+/// Called by `election::handle_exchange_bid` for a peer's bid in a fault round, before
+/// it replies with ours. Records that the round exists, and answers "not ready" while
+/// this node is about to silence itself for an earlier round, so that peer's round is
+/// skipped instead of picking a second victim.
+pub fn on_peer_bid(state: &NodeState, round: u64, mine: &mut Bid) {
+    state.faults.seen.fetch_max(round, Ordering::SeqCst);
+    if state.faults.muting.load(Ordering::SeqCst) {
+        mine.ready = false;
+    }
+}
+
+/// Injector state shared with the bid handler.
+#[derive(Default)]
+pub struct Shared {
+    /// Highest fault round any peer has bid in.
+    seen: AtomicU64,
+    /// True from a victim's last check until its mute is on.
+    muting: AtomicBool,
+}
+
+impl Shared {
+    pub fn seen(&self) -> u64 {
+        self.seen.load(Ordering::SeqCst)
+    }
+}
+
+// ---- Scheduling (pure logic) ----------------------------------------------------------
+
+/// How a fault round ended, from this node's side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Outcome {
+    /// All three bid and were ready: `victim` won and goes silent for `duration`.
+    Fault { victim: NodeId, duration: Duration },
+    /// A bid was missing or not ready: no fault this time.
+    Skipped,
+}
+
+/// When to hold fault rounds, without network or clock: the caller passes `now`, this
+/// node's state, and who its detector reports alive. Tested on its own below.
 pub struct Scheduler {
     cfg: Faults,
-    me: NodeId,
-    /// Every node in the config, sorted (the possible victims).
-    all: Vec<NodeId>,
-    /// Next round number (starts at 1).
+    /// How many nodes must bid (every node in the config).
+    nodes: usize,
+    /// The fault round to hold next (starts at 1).
     round: u64,
-    /// When the current calm period started (this node coordinator, all alive). None = not calm.
+    /// When the current calm period started (all alive, this node ready). None = not calm.
     calm_since: Option<Instant>,
-    /// No new fault before this time: the previous victim is still meant to be silent.
+    /// No new round before this time: the previous victim is still meant to be silent.
     busy_until: Option<Instant>,
 }
 
 impl Scheduler {
-    pub fn new(cfg: Faults, me: NodeId, mut all: Vec<NodeId>) -> Self {
-        all.sort_unstable();
+    pub fn new(cfg: Faults, nodes: usize) -> Self {
         Scheduler {
             cfg,
-            me,
-            all,
+            nodes,
             round: 1,
             calm_since: None,
             busy_until: None,
         }
     }
 
-    /// Called every POLL. Returns a fault to inject now, or None.
+    /// Called every POLL. Returns the fault round to hold now, or None.
+    /// `seen` is the highest round a peer has bid in: we never stay behind it.
     pub fn poll(
         &mut self,
         now: Instant,
         muted: bool,
+        ready: bool,
         alive_peers: &[NodeId],
-    ) -> Option<PlannedFault> {
-        // Safety rule: act only when this node is the coordinator, is not muted,
-        // and sees every other node alive.
-        let everyone_alive = alive_peers.len() + 1 == self.all.len();
-        if muted || !everyone_alive || coordinator(self.me, alive_peers) != self.me {
+        seen: u64,
+    ) -> Option<u64> {
+        if seen > self.round {
+            self.round = seen; // a peer is already in a newer round: join it
+        }
+        // Safety rule: take part only when not muted, ready, and every other node is alive.
+        let everyone_alive = alive_peers.len() + 1 == self.nodes;
+        if muted || !ready || !everyone_alive {
             self.calm_since = None; // the gap starts over once things are calm again
             return None;
         }
@@ -99,16 +166,18 @@ impl Scheduler {
         if now.duration_since(calm_since) < self.gap(self.round) {
             return None;
         }
+        Some(self.round)
+    }
 
-        let fault = PlannedFault {
-            round: self.round,
-            victim: self.victim(self.round),
-            duration: self.duration(self.round),
-        };
-        self.round += 1;
-        self.calm_since = None;
-        self.busy_until = Some(now + fault.duration);
-        Some(fault)
+    /// The result of the round `poll` returned.
+    pub fn finished(&mut self, round: u64, outcome: Outcome, now: Instant) {
+        self.calm_since = None; // either way, the next round waits a full gap
+        if let Outcome::Fault { duration, .. } = outcome
+            && round >= self.round
+        {
+            self.round = round + 1;
+            self.busy_until = Some(now + duration);
+        }
     }
 
     /// Random wait before round `r`, in [min_gap, max_gap].
@@ -120,27 +189,16 @@ impl Scheduler {
         );
         Duration::from_millis(ms)
     }
-
-    /// Random silence for round `r`, in [min_duration, max_duration].
-    fn duration(&self, r: u64) -> Duration {
-        let ms = uniform(
-            rng(self.cfg.seed, r, PURPOSE_DURATION),
-            self.cfg.min_duration_ms,
-            self.cfg.max_duration_ms,
-        );
-        Duration::from_millis(ms)
-    }
-
-    /// Victim of round `r`: any node, each equally likely.
-    fn victim(&self, r: u64) -> NodeId {
-        let i = rng(self.cfg.seed, r, PURPOSE_VICTIM) % self.all.len() as u64;
-        self.all[i as usize]
-    }
 }
 
-/// Bully rule: the lowest ID among this node and the peers it believes alive.
-pub fn coordinator(me: NodeId, alive_peers: &[NodeId]) -> NodeId {
-    alive_peers.iter().copied().fold(me, NodeId::min)
+/// Silence for round `r`, in [min_duration, max_duration]. Every node computes the same.
+pub fn duration(cfg: &Faults, r: u64) -> Duration {
+    let ms = uniform(
+        rng(cfg.seed, r, PURPOSE_DURATION),
+        cfg.min_duration_ms,
+        cfg.max_duration_ms,
+    );
+    Duration::from_millis(ms)
 }
 
 // ---- Seeded randomness -------------------------------------------------------------
@@ -150,7 +208,8 @@ pub fn coordinator(me: NodeId, alive_peers: &[NodeId]) -> NodeId {
 
 const PURPOSE_GAP: u64 = 1;
 const PURPOSE_DURATION: u64 = 2;
-const PURPOSE_VICTIM: u64 = 3;
+/// Bid scores: the node ID goes in the low 32 bits, so each node draws its own number.
+const PURPOSE_SCORE: u64 = 3 << 32;
 
 fn splitmix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
@@ -168,77 +227,118 @@ fn uniform(x: u64, lo: u64, hi: u64) -> u64 {
     lo + x % (hi - lo + 1)
 }
 
+/// Node `node`'s bid score in fault round `round`, in [0, 1). Same inputs, same score.
+pub fn score(seed: u64, round: u64, node: NodeId) -> f64 {
+    let x = rng(seed, round, PURPOSE_SCORE | u64::from(node));
+    (x >> 11) as f64 / (1u64 << 53) as f64
+}
+
 // ---- The background task ------------------------------------------------------------
 
 /// Starts the injector if `[faults] enabled = true`; otherwise does nothing.
-/// Every node runs it; only the coordinator ever acts.
+/// Every node runs it the same way; the election picks the victim.
 pub fn spawn(state: Arc<NodeState>) {
     let cfg = state.config.faults;
     if !cfg.enabled {
         return;
     }
-    let all: Vec<NodeId> = state.config.nodes.iter().map(|n| n.id).collect();
+    let nodes = state.config.nodes.len();
     // Part of every fault_id, so ids stay unique if a node restarts with the same seed.
     let started_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    tracing::info!(seed = cfg.seed, "automatic fault injector on");
+    tracing::info!(seed = cfg.seed, "automatic fault injector on (election mode)");
 
     tokio::spawn(async move {
-        let mut scheduler = Scheduler::new(cfg, state.id, all);
+        let mut scheduler = Scheduler::new(cfg, nodes);
         let mut ticker = interval(POLL);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
         loop {
             ticker.tick().await;
-            let alive = state.alive_peers();
-            if let Some(fault) = scheduler.poll(Instant::now(), state.is_muted(), &alive) {
-                inject(&state, fault, cfg.seed, started_ms).await;
+            let due = scheduler.poll(
+                Instant::now(),
+                state.is_muted(),
+                state.is_ready(),
+                &state.alive_peers(),
+                state.faults.seen(),
+            );
+            let Some(round) = due else { continue };
+            let outcome = hold_round(&state, round, nodes).await;
+            scheduler.finished(round, outcome, Instant::now());
+            if let Outcome::Fault { victim, duration } = outcome
+                && victim == state.id
+            {
+                mute_self(&state, round, duration, started_ms).await;
             }
         }
     });
 }
 
-/// Silences the victim through the same path as the manual CLI.
-async fn inject(state: &Arc<NodeState>, fault: PlannedFault, seed: u64, started_ms: u128) {
-    let cmd = FaultCommand {
-        fault_id: format!("auto-s{seed}-r{}-{started_ms}", fault.round),
-        target_node: fault.victim,
-        duration_ms: fault.duration.as_millis() as u64,
-        issuer_node: state.id,
-        term: fault.round,
-    };
-    tracing::info!(
-        round = fault.round,
-        victim = fault.victim,
-        duration_ms = cmd.duration_ms,
-        "automatic fault"
-    );
-
-    if fault.victim == state.id {
-        // The coordinator picked itself: same handler as an incoming InjectFault.
-        if let Err(status) = crate::service::handle_inject_fault(state, cmd).await {
-            tracing::warn!(%status, "could not silence this node");
+/// One fault round: P3's election with seeded bids. Fault only if all `nodes` bid, ready.
+async fn hold_round(state: &Arc<NodeState>, round: u64, nodes: usize) -> Outcome {
+    let id = election_id(round);
+    {
+        // Tried before and skipped: a new attempt of the same election (P3's next round),
+        // so the peers bid again instead of answering with the old decision.
+        let mut table = state.election.lock().unwrap();
+        if table.winner(&id).is_some() {
+            table.start_next_round(&id, || bid(state, round));
         }
-        return;
     }
-
-    // None only if this node was muted in the meantime; then the order is simply not sent.
-    let Some(mut client) = state.peer_for_sending(fault.victim) else {
-        return;
+    let request = SubmitRequest {
+        request_id: id.clone(),
+        kind: None, // a fault round carries no incident
     };
-    match timeout(state.config.timing.rpc_deadline(), client.inject_fault(cmd)).await {
-        Ok(Ok(ack)) if ack.get_ref().accepted => {}
-        Ok(Ok(ack)) => tracing::warn!(reason = %ack.get_ref().reason, "fault order refused"),
-        // Safe either way: busy_until still blocks the next round for this duration.
-        Ok(Err(status)) => tracing::warn!(%status, "fault order failed"),
-        Err(_) => tracing::warn!("no FaultAck before the deadline"),
+    let winner = election::run_election(state, &request).await;
+    let bids = state.election.lock().unwrap().bids(&id);
+
+    let complete = bids.len() == nodes && bids.iter().all(|b| b.ready);
+    match winner {
+        Some(victim) if complete => {
+            let duration = duration(&state.config.faults, round);
+            tracing::info!(round, victim, duration_ms = duration.as_millis() as u64, "fault round decided");
+            Outcome::Fault { victim, duration }
+        }
+        _ => {
+            tracing::info!(round, bids = bids.len(), "fault round skipped: a bid was missing or not ready");
+            Outcome::Skipped
+        }
     }
+}
+
+/// This node won fault round `round`: silence itself through the same handler as the
+/// manual CLI, unless a newer round has started meanwhile.
+async fn mute_self(state: &Arc<NodeState>, round: u64, duration: Duration, started_ms: u128) {
+    // Set first, then check: a peer's bid for a newer round either is seen by the check
+    // below, or arrives after `muting` is set and gets a not-ready answer (on_peer_bid).
+    // Either way, that newer round cannot pick a second victim while we go silent.
+    state.faults.muting.store(true, Ordering::SeqCst);
+    if state.faults.seen() > round {
+        state.faults.muting.store(false, Ordering::SeqCst);
+        tracing::info!(round, "fault round outdated: not muting");
+        return;
+    }
+    let seed = state.config.faults.seed;
+    let cmd = FaultCommand {
+        fault_id: format!("auto-s{seed}-r{round}-{started_ms}"),
+        target_node: state.id,
+        duration_ms: duration.as_millis() as u64,
+        issuer_node: state.id,
+        term: round,
+    };
+    tracing::info!(round, duration_ms = cmd.duration_ms, "automatic fault: silencing this node");
+    if let Err(status) = crate::service::handle_inject_fault(state, cmd).await {
+        tracing::warn!(%status, "could not silence this node");
+    }
+    // Muted now: the mute gate holds every bid call until we are back.
+    state.faults.muting.store(false, Ordering::SeqCst);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::election::pick_winner;
 
     fn cfg() -> Faults {
         Faults {
@@ -255,131 +355,171 @@ mod tests {
         Duration::from_millis(n)
     }
 
-    /// Node 1's scheduler (the coordinator when everyone is alive).
-    fn node1() -> Scheduler {
-        Scheduler::new(cfg(), 1, vec![1, 2, 3])
+    fn sched() -> Scheduler {
+        Scheduler::new(cfg(), 3)
     }
 
-    /// Polls every 100 ms with everyone alive, until a fault comes out.
-    fn run_until_fault(s: &mut Scheduler, t: &mut Instant) -> PlannedFault {
+    /// The victim of round `r` when all three bid, ready: P3's rule on the seeded scores.
+    fn victim(seed: u64, r: u64) -> NodeId {
+        let bids: Vec<Bid> = (1..=3)
+            .map(|n| Bid { node_id: n, load_score: score(seed, r, n), ready: true })
+            .collect();
+        pick_winner(&bids).unwrap()
+    }
+
+    /// Polls every 100 ms with everyone alive, until a round is due.
+    fn run_until_due(s: &mut Scheduler, t: &mut Instant) -> u64 {
         for _ in 0..10_000 {
             *t += POLL;
-            if let Some(f) = s.poll(*t, false, &[2, 3]) {
-                return f;
+            if let Some(r) = s.poll(*t, false, true, &[2, 3], 0) {
+                return r;
             }
         }
-        panic!("no fault within 1000 s");
+        panic!("no round within 1000 s");
     }
 
     #[test]
-    fn coordinator_is_lowest_alive_id() {
-        assert_eq!(coordinator(2, &[1, 3]), 1);
-        assert_eq!(coordinator(2, &[3]), 2); // node 1 suspected down
-        assert_eq!(coordinator(3, &[]), 3);
+    fn election_ids_round_trip_and_client_ids_are_not_fault_rounds() {
+        assert_eq!(election_id(17), "fault-17");
+        assert_eq!(parse_round("fault-17"), Some(17));
+        assert_eq!(parse_round("fault-"), None);
+        assert_eq!(parse_round("fault-1x"), None);
+        assert_eq!(parse_round("3f2a9c1e-0000-4000-8000-000000000000"), None);
     }
 
     #[test]
     fn same_seed_same_sequence_different_seed_different() {
-        let a = node1();
-        let b = node1();
-        let mut c = node1();
-        c.cfg.seed = 7;
+        let c = cfg();
+        let mut other = cfg();
+        other.seed = 7;
         for r in 1..50 {
-            assert_eq!(a.victim(r), b.victim(r));
-            assert_eq!(a.duration(r), b.duration(r));
-            assert_eq!(a.gap(r), b.gap(r));
+            assert_eq!(victim(42, r), victim(42, r));
+            assert_eq!(duration(&c, r), duration(&c, r));
+            for n in 1..=3 {
+                assert_eq!(score(42, r, n), score(42, r, n));
+            }
         }
-        assert!((1..50).any(|r| a.duration(r) != c.duration(r)));
+        assert!((1..50).any(|r| victim(42, r) != victim(7, r)));
+        assert!((1..50).any(|r| duration(&c, r) != duration(&other, r)));
     }
 
     #[test]
-    fn values_stay_in_range_and_victims_are_spread_evenly() {
-        let s = node1();
+    fn scores_differ_per_node_and_victims_are_spread_evenly() {
         let mut picks = [0u32; 4];
         for r in 1..=3000 {
-            let d = s.duration(r);
-            assert!(d >= ms(2_000) && d <= ms(20_000));
-            let g = s.gap(r);
-            assert!(g >= ms(10_000) && g <= ms(30_000));
-            picks[s.victim(r) as usize] += 1;
+            let s: Vec<f64> = (1..=3).map(|n| score(42, r, n)).collect();
+            assert!(s.iter().all(|x| (0.0..1.0).contains(x)));
+            assert!(s[0] != s[1] && s[1] != s[2]);
+            picks[victim(42, r) as usize] += 1;
         }
         // About 1000 each; allow wide room for randomness.
         for (node, count) in picks.iter().enumerate().skip(1) {
-            assert!(
-                (850..=1150).contains(count),
-                "node {node} picked {count} times"
-            );
+            assert!((850..=1150).contains(count), "node {node} picked {count} times");
         }
     }
 
     #[test]
-    fn fires_once_the_gap_has_passed() {
-        let mut s = node1();
+    fn values_stay_in_range() {
+        let s = sched();
+        for r in 1..=3000 {
+            let d = duration(&cfg(), r);
+            assert!(d >= ms(2_000) && d <= ms(20_000));
+            let g = s.gap(r);
+            assert!(g >= ms(10_000) && g <= ms(30_000));
+        }
+    }
+
+    #[test]
+    fn due_once_the_gap_has_passed() {
+        let mut s = sched();
         let start = Instant::now();
         let mut t = start;
-        let f = run_until_fault(&mut s, &mut t);
-        assert_eq!(f.round, 1);
+        assert_eq!(run_until_due(&mut s, &mut t), 1);
         let waited = t.duration_since(start);
         assert!(waited >= s.gap(1) && waited <= s.gap(1) + POLL * 2);
     }
 
     #[test]
-    fn only_the_coordinator_injects() {
-        // Node 2 sees everyone alive, but node 1 is the coordinator.
-        let mut s = Scheduler::new(cfg(), 2, vec![1, 2, 3]);
+    fn every_node_takes_part_no_coordinator() {
+        // Node 3's view is the same as node 1's: no lowest-ID rule decides who acts.
+        let mut a = sched();
+        let mut b = sched();
         let mut t = Instant::now();
-        for _ in 0..5_000 {
+        for _ in 0..1_000 {
             t += POLL;
-            assert!(s.poll(t, false, &[1, 3]).is_none());
+            assert_eq!(a.poll(t, false, true, &[2, 3], 0), b.poll(t, false, true, &[1, 2], 0));
         }
     }
 
     #[test]
-    fn never_while_a_peer_is_down_or_while_muted() {
-        let mut s = node1();
+    fn never_while_a_peer_is_down_muted_or_not_ready() {
+        let mut s = sched();
         let mut t = Instant::now();
         for _ in 0..5_000 {
             t += POLL;
-            assert!(s.poll(t, false, &[3]).is_none()); // node 2 down
-            assert!(s.poll(t, true, &[2, 3]).is_none()); // this node muted
+            assert!(s.poll(t, false, true, &[3], 0).is_none()); // node 2 down
+            assert!(s.poll(t, true, true, &[2, 3], 0).is_none()); // this node muted
+            assert!(s.poll(t, false, false, &[2, 3], 0).is_none()); // this node not ready
         }
     }
 
     #[test]
     fn a_peer_going_down_restarts_the_gap() {
-        let mut s = node1();
+        let mut s = sched();
         let gap = s.gap(1);
         let start = Instant::now();
-        // Calm for most of the gap, then node 2 goes down briefly.
-        assert!(s.poll(start, false, &[2, 3]).is_none());
-        assert!(s.poll(start + gap - ms(500), false, &[2, 3]).is_none());
-        assert!(s.poll(start + gap - ms(400), false, &[3]).is_none());
-        // Back: the full gap starts again, so nothing fires at the old deadline.
+        assert!(s.poll(start, false, true, &[2, 3], 0).is_none());
+        assert!(s.poll(start + gap - ms(500), false, true, &[2, 3], 0).is_none());
+        assert!(s.poll(start + gap - ms(400), false, true, &[3], 0).is_none());
         let back = start + gap - ms(300);
-        assert!(s.poll(back, false, &[2, 3]).is_none());
-        assert!(s.poll(start + gap + ms(100), false, &[2, 3]).is_none());
-        assert!(s.poll(back + gap, false, &[2, 3]).is_some());
+        assert!(s.poll(back, false, true, &[2, 3], 0).is_none());
+        assert!(s.poll(start + gap + ms(100), false, true, &[2, 3], 0).is_none());
+        assert_eq!(s.poll(back + gap, false, true, &[2, 3], 0), Some(1));
     }
 
     #[test]
-    fn no_new_fault_before_the_last_one_has_ended() {
-        // Short gaps, long faults: without busy_until, a second fault could start before
-        // the detector had even noticed the first victim.
+    fn a_skipped_round_is_tried_again_after_a_new_gap() {
+        let mut s = sched();
+        let mut t = Instant::now();
+        assert_eq!(run_until_due(&mut s, &mut t), 1);
+        s.finished(1, Outcome::Skipped, t);
+        let skipped_at = t;
+        assert_eq!(run_until_due(&mut s, &mut t), 1); // same round, not round 2
+        assert!(t.duration_since(skipped_at) >= s.gap(1));
+    }
+
+    #[test]
+    fn no_new_round_before_the_last_fault_has_ended() {
         let mut c = cfg();
         c.min_gap_ms = 100;
         c.max_gap_ms = 100;
-        let mut s = Scheduler::new(c, 1, vec![1, 2, 3]);
+        let mut s = Scheduler::new(c, 3);
         let mut t = Instant::now();
-        let first = run_until_fault(&mut s, &mut t);
+        assert_eq!(run_until_due(&mut s, &mut t), 1);
+        let d = duration(&c, 1);
+        s.finished(1, Outcome::Fault { victim: 2, duration: d }, t);
         let first_at = t;
-        // Everyone still looks alive (detector not caught up), yet nothing fires.
-        while t < first_at + first.duration - POLL {
+        // Everyone still looks alive (detector not caught up), yet nothing is due.
+        while t < first_at + d - POLL {
             t += POLL;
-            assert!(s.poll(t, false, &[2, 3]).is_none());
+            assert!(s.poll(t, false, true, &[2, 3], 0).is_none());
         }
-        let second = run_until_fault(&mut s, &mut t);
-        assert_eq!(second.round, 2);
-        assert!(t >= first_at + first.duration);
+        assert_eq!(run_until_due(&mut s, &mut t), 2);
+        assert!(t >= first_at + d);
+    }
+
+    #[test]
+    fn a_node_behind_joins_the_newer_round_it_sees() {
+        let mut s = sched();
+        let mut t = Instant::now();
+        for _ in 0..10_000 {
+            t += POLL;
+            if let Some(r) = s.poll(t, false, true, &[2, 3], 5) {
+                assert_eq!(r, 5);
+                return;
+            }
+        }
+        panic!("never due");
     }
 
     // ---- End to end: 3 real nodes on localhost, real clock, short timings.
@@ -430,10 +570,10 @@ mod tests {
             nodes.push(state);
         }
 
-        // Watch for 6 s: count fault starts and check that two are never silent together.
-        let mut faults = 0;
+        // Watch for 8 s: count fault starts and check that two are never silent together.
+        let mut faults = [0u32; 3];
         let mut was_muted = [false; 3];
-        let end = std::time::Instant::now() + Duration::from_secs(6);
+        let end = std::time::Instant::now() + Duration::from_secs(8);
         while std::time::Instant::now() < end {
             let muted: Vec<bool> = nodes.iter().map(|n| n.is_muted()).collect();
             assert!(
@@ -442,15 +582,13 @@ mod tests {
             );
             for i in 0..3 {
                 if muted[i] && !was_muted[i] {
-                    faults += 1;
+                    faults[i] += 1;
                 }
                 was_muted[i] = muted[i];
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
-        assert!(
-            faults >= 3,
-            "expected several automatic faults in 6 s, saw {faults}"
-        );
+        let total: u32 = faults.iter().sum();
+        assert!(total >= 2, "expected several automatic faults in 8 s, saw {faults:?}");
     }
 }

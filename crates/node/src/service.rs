@@ -108,6 +108,7 @@ impl Node for NodeService {
         // to go to; a client retry finds the committed plan. If the client's copy is already
         // being worked on here, this joins that work instead of planning a second time.
         if let Some(request) = request
+            && crate::fault_round::parse_round(&request.request_id).is_none() // fault rounds plan nothing
             && (before.is_none() || round_of(&request.request_id) > before)
         {
             start_or_join(&self.state, request); // nobody waits for this result

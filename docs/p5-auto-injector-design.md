@@ -1,5 +1,7 @@
 # P5: Automatic fault injector design (draft for team review)
 
+> **Superseded (Phase 1 Fix 3, Nov 20):** the coordinator rule described here was replaced by P3's election. See DESIGN_LOG, "P5: Fault injector uses the election", and the module comment in `crates/node/src/fault_round.rs`.
+
 Owner: P5. Step A plan item "Design doc for the automatic injector" (due Tue Oct 20). Builds on P3's election draft (`docs/p3-election-design.md`, Section 7, branch `StepA/P3-election-doc`). Implemented in Step B.
 
 **Who uses this:** P1 (bid RPC, background task), P3 (the fault round reuses the election), P6 (fault rows in the CSV, experiment setup). Everyone reviews: comment on the PR, especially on Section 8.
