@@ -146,6 +146,8 @@ pub fn resource_to_pb(value: &Resource) -> pb::Resource {
         available: value.available,
         location: Some(zone_to_pb(value.location)),
         lease_expiry_ms: value.lease_expiry,
+        owner: 0,             // proto v4: the domain type has no owner yet (0 = no owner)
+        lease_duration_ms: 0, // proto v4: not in the domain type yet (0 = not set)
     }
 }
 
@@ -162,6 +164,8 @@ pub fn assignment_to_pb(value: &Assignment) -> pb::Assignment {
         incident_id: value.incident_id,
         resource_id: value.resource_id,
         score: value.score,
+        created_at_ms: 0, // proto v4: not in the domain type yet (0 = not set)
+        expires_at_ms: 0, // proto v4: not in the domain type yet (0 = not set)
     }
 }
 
@@ -210,6 +214,8 @@ mod tests {
             available: true,
             location: Some(pb::Zone { x: 1, y: 3 }),
             lease_expiry_ms: 0,
+            owner: 0,
+            lease_duration_ms: 0,
         }
     }
 
