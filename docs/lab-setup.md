@@ -97,6 +97,8 @@ down does not cut the others off.
 - [ ] Reset between runs: `curl -X DELETE http://127.0.0.1:8333/rescuemesh` once, from any
   PC, then restart the nodes. Never a new bucket name per run (it uses up the volumes).
 
+**With 3 client PCs** (6 PCs in total): follow `docs/lab-clients.md` on the client PCs.
+
 **Where the client runs:** on a lab PC (a 4th one if there is one, otherwise next to a node).
 A laptop on the campus Wi-Fi is often on a different network from the lab PCs and cannot
 reach them; use it only if step 4's reachability test passes from it.

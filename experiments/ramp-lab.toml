@@ -13,3 +13,6 @@ stage_secs = 30                    # 2.5 minutes in total
 # Multicast to all 3 nodes (no `target`). Check the retry timing on the lab network:
 attempts = 3
 attempt_timeout_ms = 2000
+
+# Shared state: [shared_state] in config/nodes.lab.toml (SeaweedFS). The runner prints the reset
+# command to run before the nodes start, so every run begins with all 10 resources free.

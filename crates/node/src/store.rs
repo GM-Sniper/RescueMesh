@@ -21,7 +21,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use async_trait::async_trait;
 use common::domain::*;
 use common::generators::generate_snapshot;
-use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
+use common::shared_state::{CommitOutcome, PendingIncident, SharedState, StateUnavailable};
 
 // TODO(P4): remove once clients can offer resources; make configurable only if experiments
 // need a different resource count.
@@ -29,9 +29,20 @@ use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
 const DEFAULT_RESOURCE_SEED: u64 = 42;
 const DEFAULT_RESOURCE_COUNT: usize = 10;
 
+/// How many starting resources to generate. 10 unless `node --resource-count N` changed it at
+/// startup. Every node must be started with the same value (the demo panel does this).
+static RESOURCE_COUNT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(DEFAULT_RESOURCE_COUNT);
+
+/// Called once at startup by `--resource-count`.
+pub fn set_resource_count(n: usize) {
+    RESOURCE_COUNT.store(n, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The starting resources every node (and the S3 backend's first writer) uses.
 pub fn default_resources() -> Vec<Resource> {
-    generate_snapshot(DEFAULT_RESOURCE_SEED, 0, DEFAULT_RESOURCE_COUNT).resources
+    let n = RESOURCE_COUNT.load(std::sync::atomic::Ordering::Relaxed);
+    generate_snapshot(DEFAULT_RESOURCE_SEED, 0, n).resources
 }
 
 #[derive(Default)]
@@ -46,6 +57,9 @@ struct Contents {
     resolutions_by_request: HashMap<String, IncidentId>,
     /// Incident IDs that have been resolved, including IDs unknown when resolved.
     resolved_incidents: HashSet<IncidentId>,
+    /// Incidents waiting for a resource, oldest first (P1, Phase 1 fix: an empty plan is
+    /// queued, not stored as the answer).
+    pending: Vec<PendingIncident>,
 }
 
 /// Shared state kept in this process's memory. Implements [`SharedState`].
@@ -122,13 +136,22 @@ impl SharedState for InMemoryStore {
             }
         }
 
-        // An empty plan (nothing was free) is stored too, so a retry gets the same empty plan.
-        // TODO(P4): decide whether to queue such an incident and re-plan when resources free up.
-        incident.status = if plan.assignments.is_empty() {
-            IncidentStatus::Open
-        } else {
-            IncidentStatus::Assigned
-        };
+        // An empty plan (nothing was free) is not the answer: queue the incident, store nothing
+        // under the request, so a retry or the dispatcher can still give it a resource.
+        if plan.assignments.is_empty() {
+            // Already waiting (a client asking again): keep its place, add no second entry.
+            if contents.pending.iter().any(|p| p.request_id == request_id) {
+                return CommitOutcome::Pending;
+            }
+            incident.status = IncidentStatus::Open;
+            contents.pending.push(PendingIncident {
+                request_id: request_id.to_string(),
+                incident,
+                since_ms: now_ms(),
+            });
+            return CommitOutcome::Pending;
+        }
+        incident.status = IncidentStatus::Assigned;
 
         for assignment in &plan.assignments {
             contents
@@ -186,6 +209,32 @@ impl SharedState for InMemoryStore {
     async fn lookup_request(&self, request_id: &str) -> Result<Option<Plan>, StateUnavailable> {
         Ok(self.read().plans_by_request.get(request_id).cloned())
     }
+
+    /// Insertion order is age order: entries are only ever pushed at the end.
+    async fn pending(&self, limit: usize) -> Result<Vec<PendingIncident>, StateUnavailable> {
+        Ok(self.read().pending.iter().take(limit).cloned().collect())
+    }
+
+    async fn drop_pending(&self, entry: &PendingIncident) -> Result<(), StateUnavailable> {
+        let mut contents = self.write();
+        if let Some(i) = contents
+            .pending
+            .iter()
+            .position(|p| p.request_id == entry.request_id && p.since_ms == entry.since_ms)
+        {
+            contents.pending.remove(i);
+        }
+        Ok(())
+    }
+}
+
+/// Wall clock, Unix ms. Only labels a queue entry's age; nothing is decided by comparing it
+/// with another machine's clock.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -408,30 +457,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_request_with_no_free_resource_is_stored_as_open_with_an_empty_plan() {
+    async fn an_empty_plan_is_queued_not_stored_as_the_answer() {
         let store = store_with_resources(3);
 
-        assert_eq!(
-            commit(&store, "r1", 10, &[]).await,
-            CommitOutcome::Committed
-        );
+        assert_eq!(commit(&store, "r1", 10, &[]).await, CommitOutcome::Pending);
 
-        let snapshot = store.snapshot().await.unwrap();
+        // Nothing stored under the request: a retry plans again instead of getting "nothing".
+        assert_eq!(store.lookup_request("r1").await.unwrap(), None);
+        assert!(store.snapshot().await.unwrap().assignments.is_empty());
 
-        assert_eq!(snapshot.incidents.len(), 1);
-        assert_eq!(snapshot.incidents[0].status, IncidentStatus::Open);
-        assert!(snapshot.assignments.is_empty());
+        // Asking again while it waits keeps one entry (and its place in the queue).
+        assert_eq!(commit(&store, "r1", 10, &[]).await, CommitOutcome::Pending);
+        let queue = store.pending(10).await.unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].request_id, "r1");
+        assert_eq!(queue[0].incident.id, 10);
+        assert_eq!(queue[0].incident.status, IncidentStatus::Open);
 
-        assert_eq!(
-            store.lookup_request("r1").await.unwrap(),
-            Some(plan_assigning(10, &[]))
-        );
+        // A later attempt that finds a resource commits normally; the queue entry is then
+        // dropped by whoever made it (the dispatcher).
+        assert_eq!(commit(&store, "r1", 10, &[1]).await, CommitOutcome::Committed);
+        assert_eq!(store.lookup_request("r1").await.unwrap(), Some(plan_assigning(10, &[1])));
+        store.drop_pending(&queue[0]).await.unwrap();
+        assert!(store.pending(10).await.unwrap().is_empty());
+    }
 
-        // A retry gets the same empty plan, not a fresh attempt.
-        assert_eq!(
-            commit(&store, "r1", 10, &[1]).await,
-            CommitOutcome::AlreadyCommitted(plan_assigning(10, &[]))
-        );
+    #[tokio::test]
+    async fn the_queue_is_oldest_first_and_dropping_is_idempotent() {
+        let store = store_with_resources(3);
+        for (n, id) in [("a", 1), ("b", 2), ("c", 3)] {
+            assert_eq!(commit(&store, n, id, &[]).await, CommitOutcome::Pending);
+        }
+        let queue = store.pending(2).await.unwrap();
+        assert_eq!(queue.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+
+        store.drop_pending(&queue[0]).await.unwrap();
+        store.drop_pending(&queue[0]).await.unwrap(); // already gone: still Ok
+        let left = store.pending(10).await.unwrap();
+        assert_eq!(left.iter().map(|p| p.request_id.as_str()).collect::<Vec<_>>(), ["b", "c"]);
     }
 
     #[tokio::test]

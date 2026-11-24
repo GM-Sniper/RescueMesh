@@ -33,6 +33,9 @@ mod store;
 mod mute;
 mod gated_store;
 mod s3_store;
+// One INFO line every 5 s with what the node did (activity.rs).
+mod activity;
+mod dispatch;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -71,6 +74,11 @@ struct Args {
     /// per plan, 900000 about 0.3 s and 9000000 about 3 s.
     #[arg(long)]
     planner_iterations: Option<usize>,
+    /// How many resources the system starts with (default 10). Start ALL nodes with the same
+    /// value. With the S3 backend the first node to write seeds the bucket, so change it only on
+    /// an empty bucket (wipe SeaweedFS first).
+    #[arg(long)]
+    resource_count: Option<usize>,
 }
 
 /// `--planner-iterations`: replaces the config's `[planner] iterations` for this node.
@@ -90,12 +98,17 @@ async fn main() -> anyhow::Result<()> {
 
     // 2. Logging: "info" by default; RUST_LOG=debug shows every heartbeat.
     tracing_subscriber::fmt()
+        .with_target(false) // shorter lines in the demo console; the message says what it is
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
         .init();
 
     // 3. Load and check the config (plus this node's own planner load), then find ourselves in it.
+    if let Some(n) = args.resource_count {
+        anyhow::ensure!(n > 0, "--resource-count must be at least 1");
+        store::set_resource_count(n);
+    }
     let mut config = ClusterConfig::load(&args.config)?;
     apply_planner_iterations(&mut config, args.planner_iterations)?;
     let me = config
@@ -141,7 +154,22 @@ async fn main() -> anyhow::Result<()> {
         let s3 = s3_store::S3Store::connect(&backend, store::default_resources())
             .await
             .with_context(|| format!("cannot reach the shared state at {}/{}", backend.endpoint, backend.bucket))?;
-        node_state = node_state.with_store(Arc::new(s3));
+        let s3 = Arc::new(s3);
+        // Every 5 s: give back resources still claimed by already-resolved incidents, and free
+        // claims abandoned by a node that died before committing (the snapshot needs this).
+        let sweeper = s3.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
+            loop {
+                tick.tick().await;
+                match sweeper.sweep_claims().await {
+                    Ok(0) => {}
+                    Ok(n) => activity::add_n(&activity::COUNTERS.swept, n as u64),
+                    Err(e) => tracing::debug!(%e, "sweeper: shared state not reachable this round"),
+                }
+            }
+        });
+        node_state = node_state.with_store(s3);
     }
     tracing::info!(backend = ?backend.backend, endpoint = %backend.endpoint, bucket = %backend.bucket, "shared state");
     let state = Arc::new(node_state);
@@ -149,9 +177,12 @@ async fn main() -> anyhow::Result<()> {
     // 6. Background tasks: CPU sampling for the load score (P3), heartbeats to
     //    each peer, and the detector ticker.
     load::spawn_sampler(state.clone());
+    activity::spawn(state.clone(), std::time::Duration::from_secs(5));
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
     fault_round::spawn(state.clone());
+    // P1, Phase 1 fix: give queued incidents (no resource was free) a resource once one is.
+    dispatch::spawn(state.clone());
     // P3: a (re)started node has missed what happened while it was down, like a muted one,
     // so it bids again only once the rejoin rule passes (rejoin.rs).
     state.set_ready(false);

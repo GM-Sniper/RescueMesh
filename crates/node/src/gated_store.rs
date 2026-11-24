@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use common::domain::{Incident, Plan, Snapshot};
-use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
+use common::shared_state::{CommitOutcome, PendingIncident, SharedState, StateUnavailable};
 
 use crate::mute::MuteSwitch;
 
@@ -81,6 +81,16 @@ impl SharedState for MuteGatedStore {
         self.check()?;
         self.inner.reload().await
     }
+
+    async fn pending(&self, limit: usize) -> Result<Vec<PendingIncident>, StateUnavailable> {
+        self.check()?;
+        self.inner.pending(limit).await
+    }
+
+    async fn drop_pending(&self, entry: &PendingIncident) -> Result<(), StateUnavailable> {
+        self.check()?;
+        self.inner.drop_pending(entry).await
+    }
 }
 
 #[cfg(test)]
@@ -113,6 +123,15 @@ mod tests {
         }
     }
 
+    /// A plan that takes the store's first resource (a saved answer, unlike an empty plan).
+    async fn one_resource_plan(store: &InMemoryStore, incident_id: u64) -> Plan {
+        let resource_id = store.snapshot().await.unwrap().resources[0].id;
+        Plan {
+            assignments: vec![Assignment { incident_id, resource_id, score: 1.0 }],
+            ..empty_plan(incident_id)
+        }
+    }
+
     fn gated() -> (MuteGatedStore, Arc<InMemoryStore>, Arc<MuteSwitch>) {
         let inner = Arc::new(InMemoryStore::with_default_resources());
         let mute = Arc::new(MuteSwitch::default());
@@ -126,10 +145,14 @@ mod tests {
     #[tokio::test]
     async fn not_muted_passes_every_call_through() {
         let (store, inner, _mute) = gated();
-        assert_eq!(
-            store.commit("r1", incident(1), empty_plan(1)).await,
-            CommitOutcome::Committed
-        );
+        let plan = one_resource_plan(&inner, 1).await;
+        assert_eq!(store.commit("r1", incident(1), plan).await, CommitOutcome::Committed);
+        // No resource in the plan: queued, and the queue is reachable through the gate.
+        assert_eq!(store.commit("r2", incident(2), empty_plan(2)).await, CommitOutcome::Pending);
+        let queued = store.pending(10).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        store.drop_pending(&queued[0]).await.unwrap();
+        assert!(inner.pending(10).await.unwrap().is_empty());
         assert!(store.lookup_request("r1").await.unwrap().is_some());
         assert_eq!(store.snapshot().await.unwrap().incidents.len(), 1);
         assert_eq!(store.reload().await.unwrap().incidents.len(), 1);
@@ -151,21 +174,21 @@ mod tests {
             store.reload().await.is_err(),
             "rejoin must not pass while muted"
         );
-        // Nothing reached the backend.
+        assert!(store.pending(10).await.is_err(), "a muted node must not serve the queue");
+        // Nothing reached the backend: not as a plan, not as a queue entry.
         assert!(inner.lookup_request("r1").await.unwrap().is_none());
+        assert!(inner.pending(10).await.unwrap().is_empty());
     }
 
     #[tokio::test(start_paused = true)]
     async fn access_comes_back_when_the_mute_ends() {
-        let (store, _inner, mute) = gated();
+        let (store, inner, mute) = gated();
         mute.mute_for(Duration::from_secs(10));
         assert!(store.reload().await.is_err());
 
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(store.reload().await.is_ok());
-        assert_eq!(
-            store.commit("r1", incident(1), empty_plan(1)).await,
-            CommitOutcome::Committed
-        );
+        let plan = one_resource_plan(&inner, 1).await;
+        assert_eq!(store.commit("r1", incident(1), plan).await, CommitOutcome::Committed);
     }
 }

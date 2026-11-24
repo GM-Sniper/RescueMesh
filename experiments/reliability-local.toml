@@ -1,0 +1,27 @@
+# Reliability on one laptop: the three scenarios of the Step B plan in one run.
+#   0-10 s   no failure
+#   10-20 s  one node down: node 2 is muted (P5's injector: it hangs and answers nothing)
+#   20-30 s  no failure (node 2 is back)
+#   30-38 s  network cut: node 3's program is stopped (calls fail at once), then restarted
+#   38-50 s  no failure
+# reliability.txt in the run folder splits every request by the scenario it ran in.
+#   cargo run --release -p loadgen --bin experiment -- experiments/reliability-local.toml
+
+name = "reliability-local"
+cluster = "config/nodes.toml"
+start_nodes = true
+seed = 1
+stages = [4]          # 4 clients, all the time
+stage_secs = 50
+
+[[faults]]
+kind = "mute"         # one node down
+node = 2
+at_secs = 10
+duration_secs = 10    # at most 20 (the spec's limit)
+
+[[faults]]
+kind = "cut"          # network cut
+node = 3
+at_secs = 30
+duration_secs = 8

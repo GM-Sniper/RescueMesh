@@ -7,9 +7,9 @@
 //!
 //! | column        | meaning                                                                 |
 //! |---------------|-------------------------------------------------------------------------|
-//! | `event`       | `START` (the work began) or `END` (it stopped)                          |
-//! | `detail`      | END only: `committed` (we planned and saved it), `duplicate` (the stored plan was returned), `lost` (another node won the election), or `error:<code>` (e.g. `error:unavailable` when muted) |
-//! | `duration_us` | END only: START to END                                                  |
+//! | `event`       | `START` (the work began), `END` (it stopped), or `SNAPSHOT` / `COMMIT` (one shared-state call, see below) |
+//! | `detail`      | END: `committed` (we planned and saved it), `queued` (no resource free: the incident joined the pending queue), `duplicate` (the stored plan was returned), `lost` (another node won the election), or `error:<code>` (e.g. `error:unavailable` when muted). SNAPSHOT / COMMIT: how the call ended (`ok`, `committed`, `resource_taken`, ...) |
+//! | `duration_us` | END: START to END. SNAPSHOT / COMMIT: how long that one call took       |
 //! | `wall_ts_us`  | wall clock, like P5's fault log, so rows join by time with the other files |
 //!
 //! How P6 reads it, for a request the client had to retry:
@@ -20,6 +20,10 @@
 //!
 //! The rows come from the Submit task in `service.rs` (`start_or_join`), so a retry or a
 //! peer's bid that joins work already running writes no second START.
+//!
+//! SNAPSHOT and COMMIT rows (P1, Step D: "state cost under load") come from `handle_submit`,
+//! one per call, only on the node that won the election. A request planned again after
+//! `resource_taken` has several of each. Their `wall_ts_us` places them in a ramp stage.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -67,6 +71,11 @@ impl RequestLog {
         self.write(request_id, "END", &end_detail(outcome, self.node_id), Some(took));
     }
 
+    /// One shared-state call inside the work: `event` is `SNAPSHOT` or `COMMIT`.
+    pub fn step(&self, request_id: &str, event: &str, detail: &str, took: Duration) {
+        self.write(request_id, event, detail, Some(took));
+    }
+
     fn write(&self, request_id: &str, event: &str, detail: &str, took: Option<Duration>) {
         let line = format_row(&self.run_id, self.node_id, request_id, event, detail, took, wall_us());
         // A logging failure must never stop the node, so it is reported and ignored.
@@ -82,6 +91,8 @@ fn end_detail(outcome: &SubmitResult, own_id: NodeId) -> String {
     match outcome {
         Ok(reply) if reply.plan.is_none() || reply.executor_node != own_id => "lost".to_string(),
         Ok(reply) if reply.duplicate => "duplicate".to_string(),
+        // An empty plan is not saved: no resource was free and the incident was queued.
+        Ok(reply) if reply.plan.as_ref().is_some_and(|p| p.assignments.is_empty()) => "queued".to_string(),
         Ok(_) => "committed".to_string(),
         Err(status) => format!("error:{}", code_name(status.code())),
     }
@@ -127,7 +138,7 @@ fn csv_field(s: &str) -> String {
 mod tests {
     use std::path::PathBuf;
 
-    use common::pb::{Plan, SubmitReply};
+    use common::pb::{Assignment, Plan, SubmitReply};
     use tonic::Status;
 
     use super::*;
@@ -145,8 +156,19 @@ mod tests {
         Ok(SubmitReply {
             request_id: "r1".into(),
             executor_node,
-            plan: plan.then(Plan::default),
+            // One assignment: a saved plan; an empty one means "queued" (see `queued_reply`).
+            plan: plan.then(|| Plan { assignments: vec![Assignment::default()], ..Plan::default() }),
             duplicate,
+        })
+    }
+
+    /// What the winner replies when no resource was free: a plan with no assignments.
+    fn queued_reply(executor_node: NodeId) -> SubmitResult {
+        Ok(SubmitReply {
+            request_id: "r1".into(),
+            executor_node,
+            plan: Some(Plan::default()),
+            duplicate: false,
         })
     }
 
@@ -167,6 +189,7 @@ mod tests {
     fn end_detail_names_how_the_work_ended() {
         assert_eq!(end_detail(&reply(2, true, false), 2), "committed");
         assert_eq!(end_detail(&reply(2, true, true), 2), "duplicate");
+        assert_eq!(end_detail(&queued_reply(2), 2), "queued");
         assert_eq!(end_detail(&reply(3, false, false), 2), "lost");
         assert_eq!(
             end_detail(&Err(Status::unavailable("node is muted")), 2),
@@ -192,6 +215,19 @@ mod tests {
         assert!(lines[1].starts_with("run7,2,r1,START,,,"));
         assert!(lines[2].starts_with("run7,2,r1,END,committed,3000,"));
         assert!(lines[3].starts_with("run7,2,r2,START,,,"));
+    }
+
+    #[test]
+    fn step_rows_carry_the_call_and_its_duration() {
+        let path = temp_path("step");
+        let log = RequestLog::open(&path, 2, "run7").unwrap();
+        log.step("r1", "SNAPSHOT", "ok", Duration::from_micros(4120));
+        log.step("r1", "COMMIT", "committed", Duration::from_micros(9830));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert!(lines[1].starts_with("run7,2,r1,SNAPSHOT,ok,4120,"));
+        assert!(lines[2].starts_with("run7,2,r1,COMMIT,committed,9830,"));
     }
 
     #[test]

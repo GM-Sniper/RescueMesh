@@ -1,0 +1,30 @@
+# Step C dry run on one laptop: one fail-recover run with the load ramp. The runner prints every
+# number at the end (reliability.txt, failover.txt):
+#   reliability %, lost requests and their cases; detection, failover, recovery; latency before/during/after.
+#
+#   0-15 s   1 client
+#   15-30 s  2 clients   node 2 muted at 17 s for 8.4 s (P5's injector; the plan's example length)
+#   30-45 s  4 clients
+#   45-60 s  8 clients   node 3 cut at 47 s for 8 s (the runner stops its program, then restarts it)
+#
+#   cargo build --release
+#   cargo run --release -p loadgen --bin experiment -- experiments/fail-recover-local.toml
+
+name = "fail-recover-local"
+cluster = "config/nodes.toml"
+start_nodes = true
+seed = 1
+stages = [1, 2, 4, 8] # the load ramp: clients per stage
+stage_secs = 15
+
+[[faults]]
+kind = "mute"         # node down: hangs and answers nothing
+node = 2
+at_secs = 17
+duration_secs = 8.4   # at most 20 (the spec's limit)
+
+[[faults]]
+kind = "cut"          # network cut, under the heaviest load
+node = 3
+at_secs = 47
+duration_secs = 8

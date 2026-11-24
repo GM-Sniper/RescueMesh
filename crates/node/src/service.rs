@@ -18,6 +18,7 @@ use common::shared_state::{CommitOutcome, StateUnavailable};
 use tokio::sync::watch;
 use tonic::{Request, Response, Status};
 
+use crate::activity;
 use crate::election;
 use crate::state::{NodeState, SubmitResult};
 
@@ -80,6 +81,7 @@ impl Node for NodeService {
         }
 
         // Normal incident requests follow the existing election/planning flow.
+        activity::add(&activity::COUNTERS.received);
         let reply = wait_for(start_or_join(&self.state, req)).await?;
 
         // If muted during processing, the client retries.
@@ -108,6 +110,7 @@ impl Node for NodeService {
         // to go to; a client retry finds the committed plan. If the client's copy is already
         // being worked on here, this joins that work instead of planning a second time.
         if let Some(request) = request
+            && crate::fault_round::parse_round(&request.request_id).is_none() // fault rounds plan nothing
             && (before.is_none() || round_of(&request.request_id) > before)
         {
             start_or_join(&self.state, request); // nobody waits for this result
@@ -235,6 +238,7 @@ async fn handle_submit(
         .await
         .map_err(unavailable)?
     {
+        activity::add(&activity::COUNTERS.duplicates);
         return Ok(reply(&stored, true));
     }
 
@@ -245,10 +249,11 @@ async fn handle_submit(
 
     // 4. Election (P3): every node that got this request bids, and only the winner plans.
     match election::elect(state, &req).await {
-        Some(winner) if winner == state.id => {}
+        Some(winner) if winner == state.id => activity::add(&activity::COUNTERS.won),
         // Lost: name the winner and send no plan (Q2). "No plan" is not an empty plan;
         // the client keeps the reply that has one.
         Some(winner) => {
+            activity::add(&activity::COUNTERS.lost);
             return Ok(Response::new(SubmitReply {
                 request_id,
                 executor_node: winner,
@@ -279,7 +284,15 @@ async fn handle_submit(
     //    free, so a resource taken by another request in between is caught, and we plan again.
     for attempt in 1..=MAX_PLAN_ATTEMPTS {
         let now = now_unix_ms();
-        let snapshot = state.store.snapshot().await.map_err(unavailable)?;
+        let started = std::time::Instant::now(); // P1, Step D: state cost of each call
+        let snapshot = state.store.snapshot().await;
+        let detail = if snapshot.is_ok() {
+            "ok"
+        } else {
+            "unavailable"
+        };
+        log_step(state, &request_id, "SNAPSHOT", detail, started);
+        let snapshot = snapshot.map_err(unavailable)?;
         let to_plan = incident.clone();
         // The planner is CPU work: run it off the async threads so it can never
         // delay heartbeats (which would cause false PeerDowns).
@@ -289,11 +302,19 @@ async fn handle_submit(
         .await
         .map_err(|e| Status::internal(format!("planner failed: {e}")))?;
 
-        match state
+        let started = std::time::Instant::now();
+        let outcome = state
             .store
             .commit(&request_id, incident.clone(), plan.clone())
-            .await
-        {
+            .await;
+        log_step(
+            state,
+            &request_id,
+            "COMMIT",
+            commit_detail(&outcome),
+            started,
+        );
+        match outcome {
             CommitOutcome::Committed => {
                 tracing::debug!(
                     %request_id,
@@ -301,29 +322,66 @@ async fn handle_submit(
                     attempt,
                     "submit committed"
                 );
+                activity::add(&activity::COUNTERS.planned);
                 return Ok(reply(&plan, false));
             }
             // Another request (maybe on another node) committed this request_id first:
             // its plan is the answer, ours is discarded.
             CommitOutcome::AlreadyCommitted(stored) => {
                 tracing::debug!(%request_id, attempt, "submit already committed; returning stored plan");
+                activity::add(&activity::COUNTERS.duplicates);
                 return Ok(reply(&stored, true));
             }
             CommitOutcome::ResourceTaken { resource_id } => {
                 tracing::debug!(%request_id, attempt, resource_id, "resource taken meanwhile; planning again");
+                activity::add(&activity::COUNTERS.replanned);
             }
             CommitOutcome::IncidentResolved => {
                 return Err(Status::failed_precondition("incident is already resolved"));
             }
+            // No resource free: the incident is in the pending queue and nothing is stored as
+            // this request's answer. The client gets the empty plan as "waiting"; asking again
+            // with the same request_id returns the plan a node makes from the queue later.
+            CommitOutcome::Pending => {
+                tracing::debug!(%request_id, "no resource free; incident queued");
+                activity::add(&activity::COUNTERS.queued);
+                return Ok(reply(&plan, false));
+            }
             CommitOutcome::StateUnavailable(why) => return Err(unavailable(why)),
         }
     }
-    // Conflicts every time: the client may retry with the same request_id.
-    // warn: the client only sees "error", so the node's log must say why.
-    tracing::warn!(%request_id, "submit aborted: resources kept changing during planning");
+    // Conflicts every time: the client retries the same request_id (quickly, see the client's
+    // MAX_QUICK_RETRIES). Normal under load, so only counted in the activity line.
+    tracing::debug!(%request_id, "submit aborted: resources kept changing during planning");
+    activity::add(&activity::COUNTERS.collisions);
     Err(Status::aborted(format!(
         "resources kept changing during planning ({MAX_PLAN_ATTEMPTS} attempts); retry"
     )))
+}
+
+/// P1, Step D: one SNAPSHOT or COMMIT row in the request log, timed from `started`.
+fn log_step(
+    state: &NodeState,
+    request_id: &str,
+    event: &str,
+    detail: &str,
+    started: std::time::Instant,
+) {
+    if let Some(log) = &state.request_log {
+        log.step(request_id, event, detail, started.elapsed());
+    }
+}
+
+/// The COMMIT row's `detail`: how the commit ended, one word.
+fn commit_detail(outcome: &CommitOutcome) -> &'static str {
+    match outcome {
+        CommitOutcome::Committed => "committed",
+        CommitOutcome::AlreadyCommitted(_) => "already_committed",
+        CommitOutcome::ResourceTaken { .. } => "resource_taken",
+        CommitOutcome::IncidentResolved => "incident_resolved",
+        CommitOutcome::Pending => "queued",
+        CommitOutcome::StateUnavailable(_) => "unavailable",
+    }
 }
 /// Resolves an incident and releases its assigned resources.
 async fn handle_resolve(
@@ -342,6 +400,7 @@ async fn handle_resolve(
         .map_err(unavailable)?;
 
     tracing::debug!(%request_id, incident_id, "resolved");
+    activity::add(&activity::COUNTERS.resolved);
 
     Ok(SubmitReply {
         request_id: request_id.to_string(),
@@ -353,7 +412,12 @@ async fn handle_resolve(
 /// A shared-state failure as a gRPC error. `Unavailable` tells the client the same
 /// request_id can be retried: commit is create-if-absent, so a retry cannot double-book.
 fn unavailable(why: StateUnavailable) -> Status {
-    tracing::warn!(%why, "shared state unavailable");
+    // The first one in 5 s as a WARN, the rest counted in the activity line.
+    if activity::first_storage_error_in_window() {
+        tracing::warn!(%why, "shared state unavailable (the client retries)");
+    } else {
+        tracing::debug!(%why, "shared state unavailable");
+    }
     Status::unavailable(why.to_string())
 }
 
@@ -669,7 +733,11 @@ mod tests {
             "a resource was given to two incidents"
         );
         assert_eq!(total, 10, "all 10 resources end up assigned, once each");
-        assert_eq!(snap.incidents.len(), 20, "every request is stored once");
+        // The rest found nothing free: queued for later, not stored with an empty plan. (How
+        // many are stored depends on how many resources each plan takes.)
+        let queued = svc.state.store.pending(100).await.unwrap().len();
+        assert!(!snap.incidents.is_empty(), "requests that got a resource are stored");
+        assert_eq!(snap.incidents.len() + queued, 20, "every request is either stored or queued");
     }
 
     // ---- Task 4: mute hook. `start_paused` = fake clock that jumps ahead whenever
@@ -811,8 +879,10 @@ iterations = 20000
             events,
             [
                 "q1 START ",
+                "q1 SNAPSHOT ok", // P1, Step D: the shared-state calls, timed
+                "q1 COMMIT committed",
                 "q1 END committed",
-                "q1 START ",
+                "q1 START ", // found by lookup_request: no snapshot, no commit
                 "q1 END duplicate"
             ]
         );
