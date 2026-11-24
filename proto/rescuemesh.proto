@@ -3,6 +3,8 @@
 // v1 (Mon Oct 19): adds Submit, domain types, Bid, Replicate, FetchLog, FaultCommand.
 // v2 (Mon Oct 26): election calls ExchangeBid and AnnounceWinner; Bid gets round and ready (P3, agreed with P1 in Q1).
 // v3 (Tue Oct 27): removes LogEntry, ApplyPlan, Replicate* and FetchLog*: shared state moved to a DFS, nodes no longer replicate.
+// v4 (Sat Nov 21): Phase 2, as in the Phase 2 Contract. Directory service (cloud calls), Peer service
+//   (client to client), Resource gets owner and lease_duration_ms, Assignment gets created_at_ms and expires_at_ms.
 // Rule: every state-changing message carries request_id.
 // Rule: never change or reuse a field number once it is merged.
 syntax = "proto3";
@@ -110,12 +112,16 @@ message Resource {
   bool available = 4;
   Zone location = 5;
   uint64 lease_expiry_ms = 6;  // unix ms; 0 = not leased
+  uint32 owner = 7;              // v4: client_id of the offering client; 0 = no owner (a Phase 1 cloud resource)
+  uint64 lease_duration_ms = 8;  // v4: longest lease this owner grants; 0 = not set
 }
 
 message Assignment {
   uint64 incident_id = 1;
   uint64 resource_id = 2;
   double score = 3;
+  uint64 created_at_ms = 4;  // v4: unix ms when the assignment was made; 0 = not set
+  uint64 expires_at_ms = 5;  // v4: unix ms when it ends; 0 = not set
 }
 
 message Plan {
@@ -170,3 +176,265 @@ message Coordinator {
 message CoordinatorAck {
   uint32 node_id = 1;     // replier's ID, like HeartbeatReply
 }
+
+// =====================================================================
+// Phase 2 (v4). Field meanings and defaults: Phase 2 Contract.
+// Client IDs are u32 from 10000 up, so they never clash with node IDs 1 to 3.
+// Request, message, note and lease IDs are UUID strings made by the sender.
+// Durations travel as milliseconds; a lease is judged only on its owner's clock.
+// =====================================================================
+
+// ---- Directory (cloud calls, owner of the schema: P1) ----
+// Served by every cloud node on the same port as Node, as a second gRPC service.
+// Calls that change state go to all three nodes; Query goes to any one and falls back to another.
+service Directory {
+  // A client says it is online: zone, listener address, offers. Also used for a zone move or an offer
+  // change (same call, higher epoch). The reply carries every unexpired note waiting for this client.
+  rpc Register(RegisterRequest) returns (RegisterReply);
+
+  // Who is online, optionally in one zone and/or offering one resource type.
+  rpc Query(QueryRequest) returns (QueryReply);
+
+  // A client tells the cloud that a peer did not answer within the contact timeout.
+  rpc ReportSuspect(ReportSuspectRequest) returns (ReportSuspectReply);
+
+  // Leave a note for a client that is offline; delivered in its next Register reply.
+  rpc LeaveNote(LeaveNoteRequest) returns (LeaveNoteReply);
+
+  // The client has handled these notes: delete them.
+  rpc AckNotes(AckNotesRequest) returns (AckNotesReply);
+}
+
+// A resource offer inside a registration. The directory shows that the offer exists and was
+// available when published; the owner's own answer is the truth.
+message Offer {
+  uint64 resource_id = 1;
+  uint32 owner = 2;               // the offering client's ID
+  ResourceType resource_type = 3; // the capability: ambulance, fire truck, rescue team, supply truck
+  uint32 quantity = 4;            // how many units
+  bool available = 5;             // could be requested, as of this registration
+  Zone location = 6;              // zone where the resource is
+  uint64 lease_ms = 7;            // longest lease this owner grants (default 10 000)
+}
+
+// Set when another client reported this one silent. Cleared by a registration with a newer epoch.
+message Suspect {
+  uint32 reporter = 1;        // client that reported the silence
+  uint64 reported_at_ms = 2;  // cloud node's clock when the report was written
+}
+
+// One directory entry, stored at directory/<client_id>.
+message Registration {
+  uint32 client_id = 1;
+  string role = 2;              // free text, e.g. "hospital", "fire station"
+  Zone zone = 3;                // where the client is now
+  string endpoint = 4;          // "host:port" of the client's Peer listener
+  repeated Offer offers = 5;
+  uint64 epoch = 6;             // client's unix ms at registration; a higher epoch replaces a lower one
+  uint64 expires_at_ms = 7;     // cloud node's clock at write time + registration lease
+  Suspect suspect = 8;          // missing = not suspected
+}
+
+message RegisterRequest {
+  string request_id = 1;        // same ID on every retry
+  uint32 client_id = 2;
+  string role = 3;
+  Zone zone = 4;
+  string endpoint = 5;
+  repeated Offer offers = 6;
+  uint64 epoch = 7;
+}
+
+message RegisterReply {
+  uint64 expires_in_ms = 1;     // how long this registration lasts (a duration, not a time: clocks differ between PCs)
+  repeated Note notes = 2;      // every unexpired note for this client; handle these before anything else
+}
+
+message QueryRequest {
+  Zone zone = 1;                // missing = any zone
+  ResourceType capability = 2;  // UNSPECIFIED = any capability
+  bool online_only = 3;         // true = skip suspected clients
+  uint32 limit = 4;             // 0 = no limit
+}
+
+message QueryReply {
+  repeated Registration registrations = 1;  // expired entries skipped; suspects marked with `suspect`
+}
+
+message ReportSuspectRequest {
+  string request_id = 1;
+  uint32 reporter = 2;          // client that saw the silence
+  uint32 target = 3;            // client that did not answer
+}
+
+message ReportSuspectReply {}   // OK. Ignored by the node if the target registered after the report
+
+enum NoteKind {
+  NOTE_KIND_UNSPECIFIED = 0;
+  NOTE_KIND_NEED_RESOURCE = 1;    // "I need your resource"
+  NOTE_KIND_RETURN_RESOURCE = 2;  // "give it back"
+}
+
+// A note, stored at notes/<to>/<note_id>. About the current state, not history:
+// an expired note is dropped, never replayed.
+message Note {
+  string note_id = 1;           // UUID made by the sender, so a retry cannot create a second note
+  uint32 to = 2;                // recipient client
+  uint32 from = 3;              // sender client
+  NoteKind kind = 4;
+  uint64 resource_id = 5;       // the resource concerned
+  string lease_id = 6;          // RETURN_RESOURCE: the lease to drop; empty otherwise
+  uint32 urgency = 7;           // NEED_RESOURCE: 1..10; 0 otherwise
+  uint64 created_at_ms = 8;     // cloud node's clock, set by the node (the sender leaves it 0)
+  uint64 expires_at_ms = 9;     // cloud node's clock, set by the node (default lifetime 120 000 ms)
+}
+
+message LeaveNoteRequest {
+  string request_id = 1;
+  Note note = 2;
+}
+
+message LeaveNoteReply {}       // OK. Create-if-absent on note_id, so a retry is harmless
+
+message AckNotesRequest {
+  string request_id = 1;
+  uint32 client_id = 2;         // whose notes
+  repeated string note_ids = 3; // the notes it has handled
+}
+
+message AckNotesReply {}        // OK. Handled notes are deleted
+
+// ---- Peer (client to client, owner of the schema: P1) ----
+// Every client runs a listener at its endpoint. After discovery these calls go directly to the
+// peer; the cloud is not in the path. Every call carries a message_id: a receiver that has seen
+// it returns the stored reply and changes nothing.
+service Peer {
+  // Ask an owner for its resource. The owner collects requests for a short window and grants the most urgent.
+  rpc RequestResource(ResourceRequest) returns (ResourceReply);
+
+  // Holder asks to keep a lease longer.
+  rpc Renew(RenewRequest) returns (RenewReply);
+
+  // Holder gives the resource back early.
+  rpc Release(ReleaseRequest) returns (ReleaseReply);
+
+  // Ask the owner to push updates about one resource.
+  rpc Subscribe(SubscribeRequest) returns (SubscribeReply);
+
+  // Owner pushes a change of a resource or lease to a subscriber.
+  rpc PushUpdate(Update) returns (UpdateAck);
+
+  // Dissemination: pass an incident summary or acknowledgement on, with a hop limit.
+  rpc Forward(ForwardMessage) returns (ForwardAck);
+}
+
+// What a grant gives the borrower. The borrower runs its own timer from the moment it arrives.
+message Lease {
+  string lease_id = 1;          // UUID made by the owner
+  uint64 resource_id = 2;
+  uint64 version = 3;           // starts at 1, +1 on every change; an older version is STALE
+  uint64 duration_ms = 4;       // how long from the grant's arrival
+}
+
+message ResourceRequest {
+  string message_id = 1;
+  uint32 from = 2;              // requesting client
+  uint64 resource_id = 3;
+  uint32 quantity = 4;
+  uint32 urgency = 5;           // 1..10, same scale as incident severity
+  uint64 duration_ms = 6;       // how long the requester wants it
+  uint64 created_at_ms = 7;     // requester's clock; only breaks urgency ties
+  optional uint64 incident_id = 8;  // the incident this is for, if any
+}
+
+enum ResourceStatus {
+  RESOURCE_STATUS_UNSPECIFIED = 0;
+  RESOURCE_STATUS_GRANTED = 1;        // `lease` is set
+  RESOURCE_STATUS_REFUSED_BUSY = 2;   // `busy_for_ms` says roughly how long
+  RESOURCE_STATUS_REFUSED_UNKNOWN = 3;// this owner has no such resource
+}
+
+message ResourceReply {
+  ResourceStatus status = 1;
+  Lease lease = 2;              // GRANTED only
+  uint64 busy_for_ms = 3;       // REFUSED_BUSY only
+}
+
+message RenewRequest {
+  string message_id = 1;
+  string lease_id = 2;
+  uint64 version = 3;           // the version the holder has
+  uint64 duration_ms = 4;       // extra time wanted
+}
+
+enum RenewStatus {
+  RENEW_STATUS_UNSPECIFIED = 0;
+  RENEW_STATUS_GRANTED = 1;     // `lease` carries version + 1
+  RENEW_STATUS_REFUSED = 2;     // e.g. a more urgent request is waiting (Contract decision 1)
+  RENEW_STATUS_STALE = 3;       // the holder's version is old: drop the copy
+}
+
+message RenewReply {
+  RenewStatus status = 1;
+  Lease lease = 2;              // GRANTED only
+}
+
+message ReleaseRequest {
+  string message_id = 1;
+  string lease_id = 2;
+  uint64 version = 3;
+}
+
+enum ReleaseStatus {
+  RELEASE_STATUS_UNSPECIFIED = 0;
+  RELEASE_STATUS_OK = 1;
+  RELEASE_STATUS_STALE = 2;
+}
+
+message ReleaseReply {
+  ReleaseStatus status = 1;
+}
+
+message SubscribeRequest {
+  string message_id = 1;
+  uint64 resource_id = 2;
+  uint32 from = 3;              // subscriber; the owner finds its endpoint in the directory (not in the Contract yet)
+}
+
+message SubscribeReply {}       // OK
+
+enum UpdateState {
+  UPDATE_STATE_UNSPECIFIED = 0;
+  UPDATE_STATE_RENEWED = 1;
+  UPDATE_STATE_EXPIRED = 2;
+  UPDATE_STATE_REVOKED = 3;
+  UPDATE_STATE_AVAILABLE = 4;
+}
+
+message Update {
+  string message_id = 1;
+  uint64 resource_id = 2;
+  string lease_id = 3;          // empty for AVAILABLE
+  uint64 version = 4;
+  UpdateState state = 5;
+}
+
+message UpdateAck {}            // OK
+
+enum ForwardKind {
+  FORWARD_KIND_UNSPECIFIED = 0;
+  FORWARD_KIND_INCIDENT_SUMMARY = 1;
+  FORWARD_KIND_ACKNOWLEDGEMENT = 2;
+}
+
+message ForwardMessage {
+  string message_id = 1;        // same ID on every hop, so a duplicate is recognized
+  uint32 origin = 2;            // client that created the message
+  ForwardKind kind = 3;
+  Zone zone_scope = 4;          // the zone this concerns
+  bytes payload = 5;            // the summary itself; format agreed with P6
+  uint32 hops_left = 6;         // forward only while > 0, minus 1 per hop
+  uint64 created_at_ms = 7;     // origin's clock
+}
+
+message ForwardAck {}           // OK
