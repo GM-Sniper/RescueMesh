@@ -35,6 +35,7 @@ mod gated_store;
 mod s3_store;
 // One INFO line every 5 s with what the node did (activity.rs).
 mod activity;
+mod dispatch;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -180,6 +181,8 @@ async fn main() -> anyhow::Result<()> {
     heartbeat::spawn_senders(state.clone());
     heartbeat::spawn_ticker(state.clone());
     fault_round::spawn(state.clone());
+    // P1, Phase 1 fix: give queued incidents (no resource was free) a resource once one is.
+    dispatch::spawn(state.clone());
     // P3: a (re)started node has missed what happened while it was down, like a muted one,
     // so it bids again only once the rejoin rule passes (rejoin.rs).
     state.set_ready(false);

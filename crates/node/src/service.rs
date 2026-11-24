@@ -339,6 +339,14 @@ async fn handle_submit(
             CommitOutcome::IncidentResolved => {
                 return Err(Status::failed_precondition("incident is already resolved"));
             }
+            // No resource free: the incident is in the pending queue and nothing is stored as
+            // this request's answer. The client gets the empty plan as "waiting"; asking again
+            // with the same request_id returns the plan a node makes from the queue later.
+            CommitOutcome::Pending => {
+                tracing::debug!(%request_id, "no resource free; incident queued");
+                activity::add(&activity::COUNTERS.queued);
+                return Ok(reply(&plan, false));
+            }
             CommitOutcome::StateUnavailable(why) => return Err(unavailable(why)),
         }
     }
@@ -371,6 +379,7 @@ fn commit_detail(outcome: &CommitOutcome) -> &'static str {
         CommitOutcome::AlreadyCommitted(_) => "already_committed",
         CommitOutcome::ResourceTaken { .. } => "resource_taken",
         CommitOutcome::IncidentResolved => "incident_resolved",
+        CommitOutcome::Pending => "queued",
         CommitOutcome::StateUnavailable(_) => "unavailable",
     }
 }
@@ -714,7 +723,11 @@ mod tests {
             "a resource was given to two incidents"
         );
         assert_eq!(total, 10, "all 10 resources end up assigned, once each");
-        assert_eq!(snap.incidents.len(), 20, "every request is stored once");
+        // The rest found nothing free: queued for later, not stored with an empty plan. (How
+        // many are stored depends on how many resources each plan takes.)
+        let queued = svc.state.store.pending(100).await.unwrap().len();
+        assert!(!snap.incidents.is_empty(), "requests that got a resource are stored");
+        assert_eq!(snap.incidents.len() + queued, 20, "every request is either stored or queued");
     }
 
     // ---- Task 4: mute hook. `start_paused` = fake clock that jumps ahead whenever

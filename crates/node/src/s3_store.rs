@@ -13,6 +13,17 @@
 //! | `resources/<id>`       | `Resource`                                       | create-if-absent, once   |
 //! | `claims/<resource_id>` | `Claim { request_id, assignment, expires_at_ms, confirmed }` | create-if-absent, or swap with `If-Match` |
 //! | `requests/<request_id>`| `RequestRecord { incident, plan }`               | create-if-absent: **the commit point** |
+//! | `pending/<since_ms>-<request_id>` | `PendingIncident { request_id, incident, since_ms }` | create-if-absent; deleted once served |
+//! | `queued/<request_id>`  | the same `PendingIncident`                       | create-if-absent: "this request is waiting" |
+//!
+//! # No free resource (P1, Phase 1 fix)
+//! An empty plan is never written to `requests/`: a stored plan is final, so every retry got
+//! "nothing" even after resources were freed. The incident goes to `pending/` instead and the
+//! commit returns `Pending`. The key starts with the time (zero-padded), so one listing of
+//! `pending/` is already oldest first; `queued/<request_id>` says a request is already waiting, so a
+//! client asking again keeps its place instead of adding a second entry. Each node's dispatcher (`dispatch.rs`) commits queued
+//! incidents through the normal commit below, so serving the queue is exactly as safe as
+//! serving a client: one plan per request_id, one holder per resource.
 //!
 //! # Commit, step by step
 //! 1. `requests/<id>` exists: `AlreadyCommitted` with that plan.
@@ -46,7 +57,7 @@ use common::config::SharedStateConfig;
 use common::domain::{
     Assignment, Incident, IncidentId, IncidentStatus, Plan, Resource, ResourceId, Snapshot,
 };
-use common::shared_state::{CommitOutcome, SharedState, StateUnavailable};
+use common::shared_state::{CommitOutcome, PendingIncident, SharedState, StateUnavailable};
 use futures_util::future::join_all;
 use reqwest::{Client, StatusCode};
 use serde::de::DeserializeOwned;
@@ -554,6 +565,32 @@ impl SharedState for S3Store {
             Err(e) => return CommitOutcome::StateUnavailable(e),
         }
 
+        // No resource free: queue the incident; nothing is stored as this request's answer.
+        if plan.assignments.is_empty() {
+            // Already waiting (a client asking again): keep its place, add no second entry.
+            match self.get::<PendingIncident>(&queued_key(request_id)).await {
+                Ok(Some(_)) => return CommitOutcome::Pending,
+                Ok(None) => {}
+                Err(e) => return CommitOutcome::StateUnavailable(e),
+            }
+            incident.status = IncidentStatus::Open;
+            let entry = PendingIncident {
+                request_id: request_id.to_string(),
+                incident,
+                since_ms: now_ms(),
+            };
+            // Lost (412) = this request was queued in the same millisecond already: fine.
+            // The entry first, then the marker: a crash in between leaves at worst a second
+            // entry on the next ask, which the dispatcher drops once the first is served.
+            if let Err(e) = self.put(&pending_key(&entry), &entry, Cond::IfAbsent).await {
+                return CommitOutcome::StateUnavailable(e);
+            }
+            return match self.put(&queued_key(request_id), &entry, Cond::IfAbsent).await {
+                Ok(_) => CommitOutcome::Pending,
+                Err(e) => CommitOutcome::StateUnavailable(e),
+            };
+        }
+
         // Same rule as the in-memory store: unknown or repeated resource = taken.
         let known: HashSet<ResourceId> = self.known_resources().iter().map(|r| r.id).collect();
         let mut seen = HashSet::new();
@@ -608,12 +645,8 @@ impl SharedState for S3Store {
             }
         }
 
-        // Step 3: the commit point.
-        incident.status = if plan.assignments.is_empty() {
-            IncidentStatus::Open
-        } else {
-            IncidentStatus::Assigned
-        };
+        // Step 3: the commit point. (An empty plan never gets here: it was queued above.)
+        incident.status = IncidentStatus::Assigned;
         let record = RequestRecord {
             incident,
             plan: plan.clone(),
@@ -740,6 +773,50 @@ impl SharedState for S3Store {
         Ok(())
     }
 
+    /// One listing of `pending/` (keys sort by time, so oldest first), then the entries read
+    /// in parallel. An entry deleted between the listing and the read is skipped.
+    async fn pending(&self, limit: usize) -> Result<Vec<PendingIncident>, StateUnavailable> {
+        let url = format!(
+            "{}?list-type=2&prefix=pending%2F&max-keys={}",
+            self.base,
+            limit.clamp(1, 1000)
+        );
+        let body = {
+            let _slot = self.inflight.acquire().await.expect("the semaphore is never closed");
+            let resp = self.http.get(&url).send().await.map_err(transport)?;
+            if !resp.status().is_success() {
+                return Err(unavailable(format!("LIST pending/: HTTP {}", resp.status())));
+            }
+            resp.text().await.map_err(transport)?
+        };
+        let mut keys = xml_values(&body, "Key");
+        keys.sort(); // the gateway lists in key order already; sorting makes it a guarantee
+        keys.truncate(limit);
+        let reads = keys.iter().map(|k| self.get::<PendingIncident>(k));
+        let mut out = Vec::new();
+        for r in join_all(reads).await {
+            if let Some((entry, _)) = r? {
+                out.push(entry);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes the queue entry, then the "waiting" marker (the request is served, settled or
+    /// expired, so it is no longer waiting).
+    async fn drop_pending(&self, entry: &PendingIncident) -> Result<(), StateUnavailable> {
+        for key in [pending_key(entry), queued_key(&entry.request_id)] {
+            let _slot = self.inflight.acquire().await.expect("the semaphore is never closed");
+            let resp = self.http.delete(self.url(&key)).send().await.map_err(transport)?;
+            match resp.status() {
+                StatusCode::NOT_FOUND => {}
+                s if s.is_success() => {}
+                s => return Err(unavailable(format!("DELETE {key}: HTTP {s}"))),
+            }
+        }
+        Ok(())
+    }
+
     /// Rejoin: re-read the resource definitions from the bucket (not the cache), then
     /// return a fresh snapshot. `Ok` = this node can reach the shared state again.
     async fn reload(&self) -> Result<Snapshot, StateUnavailable> {
@@ -776,6 +853,33 @@ fn request_key(request_id: &str) -> String {
 }
 fn resolution_key(request_id: &str) -> String {
     let mut key = String::from("resolutions/");
+    for b in request_id.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
+            key.push(b as char);
+        } else {
+            key.push_str(&format!("%{b:02X}"));
+        }
+    }
+    key
+}
+
+/// `pending/<since_ms, 15 digits>-<request_id>`: the zero-padded time first, so the listing's
+/// key order is the queue's age order.
+fn pending_key(entry: &PendingIncident) -> String {
+    let mut key = format!("pending/{:015}-", entry.since_ms);
+    for b in entry.request_id.bytes() {
+        if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
+            key.push(b as char);
+        } else {
+            key.push_str(&format!("%{b:02X}"));
+        }
+    }
+    key
+}
+
+/// `queued/<request_id>`: present while that request waits in the queue.
+fn queued_key(request_id: &str) -> String {
+    let mut key = String::from("queued/");
     for b in request_id.bytes() {
         if b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.' {
             key.push(b as char);
@@ -906,6 +1010,54 @@ mod tests {
             classify_claim(&claim("r1", 500, false), "r2", 500),
             ClaimView::Expired
         );
+    }
+
+    #[test]
+    fn pending_keys_sort_oldest_first_and_stay_one_segment() {
+        let entry = |since_ms, id: &str| PendingIncident {
+            request_id: id.into(),
+            incident: incident(1),
+            since_ms,
+        };
+        let (old, new) = (pending_key(&entry(999, "z")), pending_key(&entry(1_000, "a")));
+        assert_eq!(old, "pending/000000000000999-z");
+        assert!(old < new, "a smaller time must list first even with a later request_id");
+        assert_eq!(pending_key(&entry(1, "a/b")), "pending/000000000000001-a%2Fb");
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn empty_plan_is_queued_and_any_node_can_serve_it_later() {
+        let n = three("pending", 10_000).await;
+
+        // No resource in the plan: queued, nothing stored as the request's answer.
+        assert_eq!(n[0].commit("r1", incident(1), plan(1, &[])).await, CommitOutcome::Pending);
+        assert_eq!(n[1].lookup_request("r1").await.unwrap(), None);
+
+        // Asking again (any node) while it waits adds no second entry.
+        assert_eq!(n[1].commit("r1", incident(1), plan(1, &[])).await, CommitOutcome::Pending);
+
+        // Every node sees the same queue.
+        let queued = n[2].pending(10).await.unwrap();
+        assert_eq!(queued.len(), 1);
+        assert_eq!(queued[0].request_id, "r1");
+
+        // Two nodes serve it at once: exactly one plan is stored, the other gets it back.
+        let (a, b) = tokio::join!(
+            n[1].commit("r1", incident(1), plan(1, &[2])),
+            n[2].commit("r1", incident(1), plan(1, &[2]))
+        );
+        let outcomes = [a, b];
+        assert_eq!(outcomes.iter().filter(|o| **o == CommitOutcome::Committed).count(), 1);
+        assert!(outcomes.iter().any(|o| matches!(o, CommitOutcome::AlreadyCommitted(_))));
+        assert_eq!(n[0].lookup_request("r1").await.unwrap(), Some(plan(1, &[2])));
+
+        n[1].drop_pending(&queued[0]).await.unwrap();
+        n[2].drop_pending(&queued[0]).await.unwrap(); // already gone: still Ok
+        assert!(n[0].pending(10).await.unwrap().is_empty());
+        assert!(n[0].get::<PendingIncident>(&queued_key("r1")).await.unwrap().is_none());
+
+        drop_bucket(&n[0]).await;
     }
 
     #[test]

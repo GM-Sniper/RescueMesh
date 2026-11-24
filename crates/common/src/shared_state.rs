@@ -15,6 +15,7 @@
 use std::fmt;
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::domain::{Incident, IncidentId, Plan, ResourceId, Snapshot};
 /// The shared state could not be reached well enough to give a trustworthy answer.
@@ -61,6 +62,14 @@ pub enum CommitOutcome {
         resource_id: ResourceId,
     },
 
+    /// The plan was empty: no resource was free. Nothing was stored as this request's answer;
+    /// instead the incident joined the pending queue ([`SharedState::pending`]), and a node
+    /// assigns it later, oldest first, when a resource is free (P1, Phase 1 fix).
+    /// Why not store the empty plan (the old rule): a stored plan is final, so every retry of
+    /// that request got "nothing" back even after resources were freed, and the incident was
+    /// never served.
+    Pending,
+
     /// Not enough of the shared state could be reached to decide. Nothing is known to have
     /// been written. Why not simply "Committed" or an error: the write may or may not have
     /// landed, so the caller must retry with the SAME `request_id`; the create-if-absent rule
@@ -69,6 +78,30 @@ pub enum CommitOutcome {
     /// This is a final outcome, not a temporary shared-state failure.
     IncidentResolved,
     StateUnavailable(StateUnavailable),
+}
+
+/// One incident waiting in the pending queue for a resource (see [`CommitOutcome::Pending`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PendingIncident {
+    /// The client's request: the plan made later is stored under this ID, so a retry of the
+    /// same request finds it.
+    pub request_id: String,
+    pub incident: Incident,
+    /// When the incident joined the queue (Unix ms). Orders the queue: oldest first.
+    pub since_ms: u64,
+}
+
+impl PendingIncident {
+    /// True once the incident has waited its time-to-live in the queue: no longer worth
+    /// serving. `ttl_secs = 0` means no limit.
+    ///
+    /// Counted from `since_ms` (a node's clock when it was queued), not from the incident's
+    /// `timestamp`: that is the reporter's clock, and generated test incidents carry fixed
+    /// timestamps from 2023, which would make every one of them "expired" at once.
+    pub fn expired(&self, now_ms: u64) -> bool {
+        self.incident.ttl_secs > 0
+            && now_ms >= self.since_ms.saturating_add(self.incident.ttl_secs.saturating_mul(1000))
+    }
 }
 
 /// Shared, cluster-wide state that every node reads and writes through.
@@ -106,8 +139,9 @@ pub trait SharedState: Send + Sync {
     /// the stored state must contain the incident itself (as `Assigned`, or as `Open` when the
     /// plan has no assignments because no resource was free).
     ///
-    /// Why an empty plan is allowed: "nothing was free" is a real answer. It is stored, so a
-    /// retry of that request gets the same empty plan instead of a fresh attempt.
+    /// An empty plan ("nothing was free") is NOT stored as the answer: the incident is added to
+    /// the pending queue and the result is [`CommitOutcome::Pending`]. A retry of that request
+    /// then plans again, or gets the plan a node made from the queue meanwhile.
     async fn commit(&self, request_id: &str, incident: Incident, plan: Plan) -> CommitOutcome;
 
     /// The stored plan for `request_id`, or `None` if this request was never committed.
@@ -129,6 +163,21 @@ pub trait SharedState: Send + Sync {
         request_id: &str,
         incident_id: IncidentId,
     ) -> Result<(), StateUnavailable>;
+
+    /// The incidents waiting for a resource, oldest first, at most `limit` of them.
+    ///
+    /// A request can appear more than once (a client retry while it was still waiting). That
+    /// is harmless: the first one committed makes the others come back `AlreadyCommitted`.
+    /// The default (no queue) is for test doubles; every real backend overrides it.
+    async fn pending(&self, _limit: usize) -> Result<Vec<PendingIncident>, StateUnavailable> {
+        Ok(Vec::new())
+    }
+
+    /// Removes one entry from the pending queue (it was assigned, resolved, or its TTL ran
+    /// out). Removing an entry that is already gone is not an error.
+    async fn drop_pending(&self, _entry: &PendingIncident) -> Result<(), StateUnavailable> {
+        Ok(())
+    }
 
     /// P5, Step C: called by a node coming back from a mute (P3's rejoin readiness rule)
     /// before it bids again. `Ok` means the shared state is reachable and the returned copy
