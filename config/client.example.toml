@@ -1,0 +1,9 @@
+# One client's identity (Phase 2). Each client has its own file; copy this one and change the values.
+# The cluster file (nodes.toml / nodes.lab.toml) stays the same on every machine and lists no clients.
+# The simulator builds identities in code instead (ClientIdentity::new), so it needs no file per client.
+
+[client]
+client_id = 10001                 # 10000 and up, unique per client (node ids are 1 to 3)
+role = "hospital"                 # free text, e.g. hospital, fire station
+zone = { x = 2, y = 3 }           # where the client is now, on the 5x5 grid (0 to 4)
+listen_addr = "127.0.0.1:60001"   # this client's Peer listener; other clients dial it, so a real IP and port

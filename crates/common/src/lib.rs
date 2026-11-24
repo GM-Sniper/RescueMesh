@@ -9,6 +9,9 @@ pub mod pb {
 /// Identifies a cloud node. IDs start at 1; 0 means "a client, not a node".
 pub type NodeId = u32;
 
+/// A client's ID (Phase 2). Starts at `config::FIRST_CLIENT_ID`, so it never clashes with a node ID.
+pub type ClientId = u32;
+
 pub mod config;
 pub mod conversions;
 pub mod domain;
