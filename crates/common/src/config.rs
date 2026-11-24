@@ -11,8 +11,8 @@ use std::time::Duration;
 use anyhow::{Context, bail};
 use serde::Deserialize;
 
-use crate::NodeId;
-use crate::domain::Weights;
+use crate::domain::{Weights, Zone};
+use crate::{ClientId, NodeId};
 use crate::load::LoadConfig;
 
 /// The whole config file.
@@ -256,6 +256,111 @@ impl ClusterConfig {
     }
 }
 
+/// Lowest client ID (Phase 2). Node IDs are small (1 to 3), so client IDs from here up never clash with them.
+pub const FIRST_CLIENT_ID: ClientId = 10_000;
+
+/// Who a client is (Phase 2, P1). Sent to the cloud in every Register.
+/// Each client has its own: read from a `[client]` table in its own file (`config/client.example.toml`),
+/// or built in code with `ClientIdentity::new` (the simulator runs many clients in one process).
+/// The cluster file (`nodes.toml`) stays the same on every machine and holds no client.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)] // a misspelt key fails at startup instead of being ignored
+pub struct ClientIdentity {
+    /// From `FIRST_CLIENT_ID` up, unique per client.
+    pub client_id: ClientId,
+    /// Free text, e.g. "hospital" or "fire station".
+    pub role: String,
+    /// Where the client is now, on the 5x5 grid. In the file: `zone = { x = 2, y = 3 }`.
+    pub zone: Zone,
+    /// "ip:port" of this client's Peer listener. Also published in the directory as the
+    /// endpoint other clients dial, so it must be a real address: not 0.0.0.0, not port 0.
+    pub listen_addr: String,
+}
+
+/// The client file: one `[client]` table.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClientFile {
+    client: ClientIdentity,
+}
+
+impl ClientIdentity {
+    /// Builds and checks an identity in code (the simulator's way).
+    pub fn new(
+        client_id: ClientId,
+        role: impl Into<String>,
+        zone: Zone,
+        listen_addr: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        let me = Self {
+            client_id,
+            role: role.into(),
+            zone,
+            listen_addr: listen_addr.into(),
+        };
+        me.check()?;
+        Ok(me)
+    }
+
+    /// Reads and checks a client file. A mistake fails here, at startup, with a clear message.
+    pub fn load(path: impl AsRef<Path>) -> anyhow::Result<Self> {
+        let path = path.as_ref();
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("cannot read client file {}", path.display()))?;
+        Self::parse(&text).with_context(|| format!("bad client file {}", path.display()))
+    }
+
+    /// Parses and checks client file text (separate from `load` so tests need no file).
+    pub fn parse(text: &str) -> anyhow::Result<Self> {
+        let file: ClientFile = toml::from_str(text)?;
+        file.client.check()?;
+        Ok(file.client)
+    }
+
+    /// The same checks for a file and for `new`.
+    pub fn check(&self) -> anyhow::Result<()> {
+        if self.client_id < FIRST_CLIENT_ID {
+            bail!(
+                "client_id {} is below {FIRST_CLIENT_ID}; client ids start at {FIRST_CLIENT_ID} so they never clash with node ids",
+                self.client_id
+            );
+        }
+        if self.role.trim().is_empty() {
+            bail!("client {}: role is empty", self.client_id);
+        }
+        if self.zone.x >= Zone::GRID || self.zone.y >= Zone::GRID {
+            bail!(
+                "client {}: zone ({}, {}) is off the grid; x and y must be 0 to {}",
+                self.client_id,
+                self.zone.x,
+                self.zone.y,
+                Zone::GRID - 1
+            );
+        }
+        let addr: SocketAddr = self.listen_addr.parse().with_context(|| {
+            format!(
+                "client {}: listen_addr {:?} is not ip:port",
+                self.client_id, self.listen_addr
+            )
+        })?;
+        if addr.ip().is_unspecified() {
+            bail!(
+                "client {}: listen_addr {} is published to other clients as the endpoint; use this machine's IP, not 0.0.0.0",
+                self.client_id,
+                self.listen_addr
+            );
+        }
+        if addr.port() == 0 {
+            bail!(
+                "client {}: listen_addr {} needs a real port, not 0, because other clients dial it",
+                self.client_id,
+                self.listen_addr
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Controls the extra deterministic work performed by the planner.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(default)]
@@ -376,5 +481,57 @@ mod tests {
         assert!(ClusterConfig::parse(&bad_timing).is_err());
         let bad_load = format!("{THREE_NODES}\n[load]\nqueue_max = 0\n");
         assert!(ClusterConfig::parse(&bad_load).is_err());
+    }
+
+    const ONE_CLIENT: &str = r#"
+        [client]
+        client_id = 10001
+        role = "hospital"
+        zone = { x = 2, y = 3 }
+        listen_addr = "127.0.0.1:60001"
+    "#;
+
+    #[test]
+    fn client_file_is_read() {
+        let me = ClientIdentity::parse(ONE_CLIENT).unwrap();
+        assert_eq!(me.client_id, 10_001);
+        assert_eq!(me.role, "hospital");
+        assert_eq!(me.zone, Zone::new(2, 3));
+        assert_eq!(me.listen_addr, "127.0.0.1:60001");
+    }
+
+    #[test]
+    fn client_built_in_code_matches_the_file() {
+        let me = ClientIdentity::new(10_001, "hospital", Zone::new(2, 3), "127.0.0.1:60001").unwrap();
+        assert_eq!(me, ClientIdentity::parse(ONE_CLIENT).unwrap());
+        assert!(ClientIdentity::new(FIRST_CLIENT_ID, "x", Zone::new(0, 0), "10.0.0.5:60000").is_ok()); // the lowest id is allowed
+    }
+
+    #[test]
+    fn shipped_client_example_is_valid() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../config/client.example.toml");
+        ClientIdentity::load(path).unwrap();
+    }
+
+    #[test]
+    fn client_mistakes_are_refused() {
+        for (from, to) in [
+            ("client_id = 10001", "client_id = 9999"),      // below FIRST_CLIENT_ID
+            ("client_id = 10001", "client_id = 2"),         // a node's id
+            ("role = \"hospital\"", "role = \"  \""),       // empty role
+            ("x = 2", "x = 5"),                             // off the grid
+            ("y = 3", "y = 9"),                             // off the grid
+            ("127.0.0.1:60001", "localhost:60001"),         // not ip:port
+            ("127.0.0.1:60001", "0.0.0.0:60001"),           // nobody can dial 0.0.0.0
+            ("127.0.0.1:60001", "127.0.0.1:0"),             // nobody can dial port 0
+            ("client_id = 10001", "client-id = 10001"),     // misspelt key
+        ] {
+            let text = ONE_CLIENT.replace(from, to);
+            assert!(ClientIdentity::parse(&text).is_err(), "should refuse: {to}");
+        }
+        assert!(ClientIdentity::parse("").is_err(), "no [client] table");
+        // Zone::new wraps onto the grid (5 becomes 0), so build an off-grid zone directly
+        let off_grid = Zone { x: 2, y: 5 };
+        assert!(ClientIdentity::new(10_001, "hospital", off_grid, "127.0.0.1:60001").is_err());
     }
 }
