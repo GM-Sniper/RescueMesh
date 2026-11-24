@@ -179,7 +179,7 @@ message CoordinatorAck {
 
 // =====================================================================
 // Phase 2 (v4). Field meanings and defaults: Phase 2 Contract.
-// Client IDs are u32 from 1000 up, so they never clash with node IDs 1 to 3.
+// Client IDs are u32 from 10000 up, so they never clash with node IDs 1 to 3.
 // Request, message, note and lease IDs are UUID strings made by the sender.
 // Durations travel as milliseconds; a lease is judged only on its owner's clock.
 // =====================================================================
