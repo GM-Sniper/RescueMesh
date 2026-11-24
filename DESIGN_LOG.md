@@ -44,8 +44,9 @@ Measurements were collected using the release build with `cargo run --release -p
 | 300 | 300 | 1 | 90,000 | 0.533878 |
 | 500 | 500 | 1 | 250,000 | 1.955595 |
 | 500 | 500 | 10 | 2,500,000 | 17.585792 |
+| 500 | 500 | 47 | 11,750,000 | 50.7293165 |
 
-The measurements show increasing planning time with larger workloads. The configuration of 500 incidents, 500 resources, and 10 iterations measured approximately 17.59 ms per call, near the example target of about 20 ms. Actual timings depend on the machine and build environment.
+The measurements show increasing planning time with larger workloads. For Step C calibration, the configuration of 500 incidents, 500 resources, and 47 iterations measured an average of approximately 50.73 ms per call across two runs (48.53 ms and 52.93 ms). This is close to the target of approximately 50 ms. Actual timings depend on the machine and build environment; calibration on the demo machines is still pending.
 
 **Benchmark limitation:** these timings include deterministic workload generation and scoring. The generated workload is used to add CPU cost; it is not a batch assignment of all generated incidents. The returned plan still concerns the original incoming incident.
 
@@ -304,6 +305,15 @@ Code: `crates/node/src/rejoin.rs`, called by the mute hook in `service.rs` when 
 | A node with no peers is ready once it can read the state | Wait for a heartbeat forever | Nobody could ever send it one. Only happens in single-node tests |
 
 Expected recovery time: up to one heartbeat interval (500 ms) plus one state read. Measured on the real machines in Step D.
+
+### P2 Fix 4 — Multiple resources per incident
+
+The planner now selects resources based on incident severity:
+- Severity 1–3: 1 resource.
+- Severity 4–7: 2 resources.
+- Severity 8–10: 3 resources.
+
+Resources are sorted by assignment score in descending order, with ties broken by ascending resource ID. The planner selects up to the requested number of free resources. If fewer resources are available, it selects all available resources; if none are available, it returns an empty assignment list.
 
 ## P5: Fault injector uses the election (Phase 1 Fix 3, Nov 20)
 
